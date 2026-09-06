@@ -46,6 +46,15 @@ reenabling actions does not silently restore that standing delegation.
 `;lab stop` stops the bridge. These settings are independent of which model
 or profile is selected.
 
+Direct shell questions (`labctl ask` and `labctl questions`) default to a
+per-request read-only restriction, independently enforced by the evidence session.
+This blocks INFO/SKILLS even with global actions enabled. Explicit `--allow-recon`
+removes only that per-request restriction; the existing action, approval,
+ownership, and generation gates still apply. It grants no arbitrary commands.
+Testing remains player-authorized and sends private context to the configured
+backend. Read-only refers to game-command authority, not zero model cost or an
+absence of local dialogue/results writes.
+
 ## Protected operations
 
 Treat equipped, registered, high-value, unique, and user-protected items as

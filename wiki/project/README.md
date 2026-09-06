@@ -8,6 +8,8 @@
 - [Frontend state](Frontend-State-Protocol.md): optional presentation adapter.
 - [Context system](Context-System.md): provenance, retrieval, and dialogue.
 - [Evidence gathering](Evidence-Gathering-Arc.md): bounded model-directed observations.
+- [Research workspace plan](Research-Workspace-Plan.md): approved search/read redesign and acceptance gates.
+- [Discovery ranking plan](Discovery-Ranking-Plan.md): bounded recall, explainable ranking, and relevance regressions.
 - [Developer testing](Developer-Testing.md): isolated tests and authorized live checks.
 - [Configuration and knowledge](Configuration-and-Knowledge-Arc.md): settings and providers.
 - [Reliability requirements](Developer-Reliability-Arc.md): failure-mode acceptance.

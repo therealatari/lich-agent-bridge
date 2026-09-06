@@ -62,6 +62,56 @@ Use direct perform/watch for long operations; it is not a general script runner.
 
 ## Diagnosing conversation and latency
 
+### Direct questions and private question corpora
+
+After the player logs in and authorizes testing that character, the shell can
+use the same authenticated `/v1/ask` path as in-game conversation:
+
+```text
+labctl ask Testmage "What evidence do you have about my training?"
+labctl questions Testmage /PRIVATE/PATH/questions.json --output /PRIVATE/PATH/results.json
+```
+
+Both commands default to server-enforced read-only questions, even if global
+actions are enabled. State, recorded character data, inventory records, and
+configured wiki retrieval remain available; INFO/SKILLS refresh does not.
+For separately authorized tests of that existing recon path, add `--allow-recon`.
+This does not enable actions or auto-approval, bypass ownership, or add arbitrary
+commands. It only permits the normal evidence loop to request fixed INFO/SKILLS
+through the existing gates.
+
+The CLI checks service compatibility and a fresh snapshot for the selected
+character. Questions bind to the observed session generation at server admission;
+a corpus keeps that same generation and stops on a session change or failure.
+It never logs in a character, retries ambiguous failures, or switches accounts.
+
+A corpus is a JSON object with one `cases` list, containing 1–20 unique case IDs
+and questions (maximum file size 64 KiB). For example, this synthetic corpus can
+be run separately against player-selected characters of different classes:
+
+```json
+{"cases":[
+  {"id":"training-evidence","question":"What evidence do you have about my training, and how current is it?"},
+  {"id":"follow-up","question":"Which of those observations would need refreshing?"}
+]}
+```
+
+Cases run sequentially and use normal temporary dialogue, including any existing
+conversation. No implicit forget/reset occurs. For a clean conversation, explicitly
+use `;lab forget` before starting; deliberately ordered follow-up cases can then
+exercise conversation continuity. Do not ask competing in-game questions during
+a test run. Each question may invoke the configured model and incur its normal
+cost, and references may use configured network fallbacks.
+
+Results include the question, answer, supplied sources, source diagnostics, elapsed
+time, and failures. Corpus output is created exclusively with owner-only file
+permissions; an existing file is never overwritten. Keep corpus files and results
+in private storage outside the checkout: answers may contain character details.
+A returned answer is **not** a correctness pass. Review its factual accuracy,
+provenance, uncertainty, and completeness; this runner is not a semantic grader.
+
+### Conversation diagnostics
+
 Conversation can request only advertised evidence tools; fixed character recon
 still passes the independent action and approval gates. It cannot supply
 arbitrary commands or launch scripts. `;lab sources` identifies evidence

@@ -153,8 +153,15 @@ instead of hard-coding availability:
 
 Questions use a bounded evidence loop, not a list of question keywords. The model
 can answer from the supplied context or request current state, character
-observations, recorded item facts, or configured wiki searches. LAB validates and
-executes those requests; the model cannot supply arbitrary commands.
+observations, recorded item facts, or configured wiki research. `knowledge.search`
+discovers compact source handles; `knowledge.read` reads a selected source or
+section with bounded continuations. Reference mechanics, selected-character
+notes, and development documentation have separate search scopes. LAB validates
+those requests; the model cannot supply arbitrary commands, paths, or URLs.
+
+Known limitation: multi-part questions can find the right page but miss the
+specific interaction-rule passage. Further passage-selection tuning is tracked
+in [issue #7](https://github.com/therealatari/lich-agent-bridge/issues/7).
 
 `character.read` reuses recent same-session INFO/SKILLS observations and can
 request missing or older-than-two-minute categories through the existing recon
@@ -171,8 +178,22 @@ deadline. `;lab forget` invalidates the question and revokes its pending recon;
 commands already dispatched cannot be unsent. `;lab sources` shows the supplied
 references and diagnostics.
 
+Developers can use `labctl ask CHARACTER "QUESTION"` to exercise that same
+pipeline from a shell, or `labctl questions CHARACTER CORPUS.json --output
+/PRIVATE/PATH/results.json` for sequential question cases. Both default to
+server-enforced read-only questions; explicit `--allow-recon` permits only the
+existing independently gated INFO/SKILLS path. They require a fresh selected
+session, do not log characters in, and preserve normal dialogue. Keep corpora and
+results private. See [question testing](wiki/project/Developer-Testing.md#direct-questions-and-private-question-corpora)
+for the format, safety boundary, and manual quality-review requirements.
+
 Evidence allowances are configurable per agent profile: defaults are 12,000
-characters per result and 36,000 across a question's evidence results. Larger
+characters per result and 36,000 in the evidence context supplied on each turn.
+A question-local workspace retains bounded results outside that context: later
+reads can displace earlier discovery results, and repeating a request reactivates
+cached evidence without repeating game commands. Source reporting distinguishes
+discovery snippets from read passages and lists only the final context's sources.
+Larger
 allowances can improve multi-source answers but increase model input and may
 send more private context to the configured backend. See
 [evidence settings](wiki/project/Setup-and-Operations.md#evidence-allowances).

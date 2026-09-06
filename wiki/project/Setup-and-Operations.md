@@ -100,6 +100,14 @@ and existing logs first. Status/source/timing queries do not require new game
 commands. Logins, script reloads, snapshots that issue commands, and live
 operations require the user's authorization. Keep raw diagnostic data private.
 
+After authorized login, `labctl ask CHARACTER "QUESTION"` uses the normal question
+pipeline from a shell. `labctl questions CHARACTER CORPUS.json --output
+/PRIVATE/PATH/results.json` runs bounded sequential cases and saves private results.
+Questions default to game-read-only; explicit `--allow-recon` permits existing
+INFO/SKILLS gates without changing global policy. Both commands use the selected
+settings and private token, and pin the admitted character session. See
+[developer question testing](Developer-Testing.md#direct-questions-and-private-question-corpora).
+
 ## Evidence allowances
 
 Edit the selected profile in the settings file reported by `labctl config path`:
@@ -117,6 +125,12 @@ use smaller allowances for a local model's limited context, or larger ones for
 multi-source questions. The per-result range is 3,000–100,000 characters; total
 must be at least per-result plus 2,400 characters for omission notices, and no
 more than 300,000. These are character counts, not model-token guarantees.
+
+The total is the working evidence context per model turn. Bounded results remain
+in a question-local workspace even when displaced from that context; cached
+reactivation does not repeat recon. Source text is read in bounded pages rather
+than increasing allowances until entire documents fit. Three rounds, four
+requests per batch, eight requests total, and the question deadline still apply.
 
 Higher limits may send more private observations to the selected backend and
 increase input cost, latency, and context usage. Keep the initial context,
