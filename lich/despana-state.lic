@@ -1,0 +1,78 @@
+=begin
+  DespanaFE structured-state adapter.
+
+  Start this only when DespanaFE is the attached frontend. LAB, other Lich
+  scripts, and other frontends do not depend on it.
+
+  version: 0.1.0
+     game: gs
+=end
+
+state_core = if defined?($script_dir) && $script_dir
+               File.join($script_dir, 'lich-state-core')
+             else
+               File.expand_path('lich-state-core', __dir__)
+             end
+adapter_core = if defined?($script_dir) && $script_dir
+                 File.join($script_dir, 'despana-state-core')
+               else
+                 File.expand_path('despana-state-core', __dir__)
+               end
+
+require state_core
+require adapter_core
+
+hide_me
+
+module DespanaStateBridge
+  UPSTREAM_HOOK = "despana-state-upstream-#{Script.current.object_id}"
+  REFRESH_COMMAND = /\A[;,]send\s+to\s+despana-state\s+refresh\z/i
+
+  @running = true
+  @publisher = DespanaFrontendState::Publisher.new(
+    source: LichState::LichSource.new,
+    output: proc { |frame| _respond(frame) }
+  )
+
+  def self.publish(force: false)
+    @publisher.publish(force: force)
+  rescue => error
+    Lich.log("despana-state publish failed: #{error.class}: #{error.message}")
+    []
+  end
+
+  def self.record_loot(objects, source:)
+    @publisher.record_loot(objects, source: source)
+  end
+
+  def self.handle_input(client_string)
+    command = client_string.sub(/\A<c>/, '').strip
+    return client_string unless command.match?(REFRESH_COMMAND)
+
+    publish(force: true)
+    nil
+  end
+
+  def self.stop
+    @running = false
+    UpstreamHook.remove(UPSTREAM_HOOK)
+  end
+
+  def self.run
+    publish(force: true)
+    while @running
+      sleep 0.25
+      publish
+    end
+  end
+end
+
+unless ENV['DESPANA_STATE_LIBRARY_ONLY'] == '1'
+  before_dying { DespanaStateBridge.stop }
+  UpstreamHook.add(
+    DespanaStateBridge::UPSTREAM_HOOK,
+    proc { |line| DespanaStateBridge.handle_input(line) },
+    persist: false
+  )
+  DespanaStateBridge.run
+end

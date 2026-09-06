@@ -1,0 +1,2047 @@
+=begin
+  Lich Agent Bridge: GemStone IV copilot bridge.
+
+  Start once with:  ;lab
+  Then ask with:    , what just happened?
+  Check status:     ;lab status
+  Disable actions:  ;lab actions off
+  Stop with:        ;lab stop
+
+  The bridge observes game text and talks only to a loopback sidecar. Its
+  command path and allowlisted auto-approval start enabled. The bridge
+  independently rechecks a small allowlist before sending one command at a
+  time.
+
+  project: https://github.com/therealatari/lich-agent-bridge
+  version: 0.3.0
+     game: gs
+=end
+
+require 'json'
+require 'net/http'
+require 'securerandom'
+require 'time'
+require 'uri'
+lich_state_core = if defined?($script_dir) && $script_dir
+                    File.join($script_dir, 'lich-state-core')
+                  else
+                    File.expand_path('lich-state-core', __dir__)
+                  end
+controller_registry_core = if defined?($script_dir) && $script_dir
+                             File.join($script_dir, 'lab-controller-registry')
+                           else
+                             File.expand_path('lab-controller-registry', __dir__)
+                           end
+require controller_registry_core
+if ENV['LAB_BRIDGE_LIBRARY_ONLY'] == '1'
+  require lich_state_core
+else
+  # Lich reloads this script inside one long-lived Ruby process. `require`
+  # would leave an older state extractor resident after `;lab stop` / `;lab`.
+  load "#{lich_state_core}.rb"
+end
+
+hide_me
+
+module LichAgentBridge
+  HOST = '127.0.0.1'
+  PORT = Integer(ENV.fetch('LAB_PORT', '18765'))
+  BASE_URI = URI("http://#{HOST}:#{PORT}")
+  UPSTREAM_HOOK = "lab-upstream-#{Script.current.object_id}"
+  DOWNSTREAM_HOOK = "lab-downstream-#{Script.current.object_id}"
+  MAX_PENDING = 500
+  MAX_BATCH = 50
+  MAX_LINE = 4_000
+  FAMILIAR_STREAM = 'familiar'
+  FAMILIAR_CLOSED_STYLE = 'watching'
+  XML_TEXT_ESCAPES = {
+    '&' => '&amp;',
+    '<' => '&lt;',
+    '>' => '&gt;',
+    '"' => '&quot;',
+    "'" => '&apos;'
+  }.freeze
+  ACTION_REGISTRATION_INTERVAL = 15
+  SNAPSHOT_HEARTBEAT_INTERVAL = 15
+  CONTROLLER_MANIFEST_PATH = ENV.fetch(
+    'LAB_CONTROLLER_MANIFEST',
+    if defined?($script_dir) && $script_dir
+      File.join($script_dir, 'lab-controllers.json')
+    else
+      File.expand_path('lab-controllers.json', __dir__)
+    end
+  )
+  CONTROLLER_REGISTRY = LabControllerRegistry::Registry.load(CONTROLLER_MANIFEST_PATH)
+  SPELL_STATE_MESSAGES = {
+    '401' => {
+      down: /\AThe silvery luminescence fades from around you\.\z/,
+      up: /\AA silvery luminescence surrounds you\.\z/
+    },
+    '414' => {
+      down: /\AThe brilliant luminescence fades from around you\.\z/,
+      up: /\AA brilliant luminescence surrounds you\.\z/
+    },
+    '430' => {
+      down: /\AThe tingling sensation and sense of security leaves you\.\z/,
+      up: /\AYour skin tingles for a moment and you feel more secure\.\z/
+    },
+    '716' => {
+      down: /\AYou exhale the last of a virulent green mist\.\z/,
+      up: /\AA cankerous ripple of vesicles temporarily disfigures your face and travels down your body, leaving a sickly green miasma as it disappears\.\z/
+    }
+  }.freeze
+  INFOMON_SPELL_ENDED = /\A\[\s*(\d+)\s+[^:]+:\s+Ended\s*\]\z/
+  ACTION_TOKEN_FILE = ENV.fetch(
+    'LAB_ACTION_TOKEN_FILE',
+    File.join(Dir.home, '.local', 'state', 'lich-agent-bridge', 'action-token')
+  )
+  SAFE_ACTIONS = [
+    /\A(?:armor info|armor list all|ascension info|bounty|cman info|encumbrance|exp|feat info|gld|health|info|inspect ready weapon links|inventory|look|mana|ready list|ready weapon set|resource|skills|shield info|society|spell active|spirit|stamina|stow list|weapon info)\z/i,
+    /\Aready weapon clear\z/i,
+    /\Aready weapon #[0-9]+\z/i,
+    /\Aready weapon set #[0-9]+\z/i,
+    /\A(?:mark|register) [^\r\n]{1,130}\z/i,
+    /\Aset (?:nomarkeddrop|saferdrop) on\z/i,
+    /\Ago2 getsilvers (?:on|off)\z/i,
+    /\Aeloot keep closed on\z/i,
+    /\Aeloot (?:loot|sell|stop)\z/i,
+    /\Aeherbs heal\z/i,
+    /\Abigshot (?:start|stop)\z/i,
+    /\Aebounty (?:start|stop)\z/i,
+    *CONTROLLER_REGISTRY.safe_patterns,
+    /\Abeseech teleport\z/i,
+    /\A(?:flag|stow set|store set) [^\r\n]{1,130}\z/i,
+    /\A(?:north|northeast|east|southeast|south|southwest|west|northwest|out|up|down|n|ne|e|se|s|sw|w|nw|u|d)\z/i,
+    /\A(?:go|climb|enter) [a-z0-9][a-z0-9 #'_-]{0,119}\z/i,
+    /\Ago2 [0-9]+\z/i,
+    /\A(?:say|whisper|tell|ask) [^\r\n]{1,140}\z/i,
+    /\Ainspect item exact [^\r\n]{1,120}\z/i,
+    /\Adiagnose item (?:405|735) exact [^\r\n]{1,120}\z/i,
+    /\A(?:look|read|inspect|analyze|assess|appraise|browse|shop)(?:\s+[^\r\n]{1,130})?\z/i,
+    /\A(?:get|take|remove|wear|stow|sheath|gird|open|close) [^\r\n]{1,130}\z/i,
+    /\Aput [^\r\n]{1,90} (?:in|into|on|under|behind) [^\r\n]{1,90}\z/i,
+    /\A(?:buy|order)\z/i,
+    /\A(?:buy|order|bid|deposit|withdraw|tip) [^\r\n]{1,130}\z/i,
+    /\Apour (?:#[0-9]+|my (?:[a-z0-9][a-z0-9 #'_-]{0,84} )?potion) on (?:#[0-9]+|my (?:[a-z0-9][a-z0-9 #'_-]{0,84} )?(?:stone|runestone))\z/i,
+    /\Adip (?:#[0-9]+|my (?:[a-z0-9][a-z0-9 #'_-]{0,84} )?brush) in (?:#[0-9]+|my (?:[a-z0-9][a-z0-9 #'_-]{0,84} )?(?:ink|cup))\z/i,
+    /\Adraw [a-z]{1,20}'[a-z]{1,20} rune\z/i,
+    /\Awave (?:#[0-9]+|my (?:[a-z0-9][a-z0-9 #'_-]{0,84} )?(?:stone|runestone)) at (?:#[0-9]+|my [a-z0-9][a-z0-9 #'_-]{0,110})\z/i,
+    /\A(?:prep|prepare) 714\z/i,
+    /\Ainfuse (?:#[0-9]+|my [a-z0-9][a-z0-9 #'_-]{0,110})\z/i,
+    /\A(?:attack|kill|berserk|mstrike|stance|retreat|advance|cman|warcry|sign|incant|cast|evoke|ambush|punch|kick|jab|grapple)(?:\s+[^\r\n]{1,130})?\z/i
+  ].freeze
+  FORBIDDEN_ACTIONS = [
+    /\A(?:drop|discard|trash|sell|give|offer|exchange|trade|mail|place|throw|hurl|empty|destroy|sacrifice)(?:\s|\z)/i,
+    /\A(?:unmark(?:\s|\z)|mark .+ remove\z)/i,
+    /\Aset (?:nomarkeddrop|saferdrop) off\z/i,
+    /\Aput .+ (?:on|in|into) (?:the )?(?:ground|floor|room)\z/i
+  ].freeze
+  MAX_SEQUENCE_COMMANDS = 12
+  MAX_SEQUENCE_LENGTH = 1200
+  SequenceOwnershipError = Class.new(StandardError)
+  SAFE_SEQUENCE_ACTIONS = [
+    /\A(?:info|skills)\z/i,
+    /\A(?:look|read|inspect)(?:\s+[^\r\n]{1,130})?\z/i,
+    /\A(?:get|take|remove|wear|stow|sheath|gird|open|close) [^\r\n]{1,130}\z/i,
+    /\Aput [^\r\n]{1,90} (?:in|into|on|under|behind) [^\r\n]{1,90}\z/i,
+    /\Apour (?:#[0-9]+|my (?:[a-z0-9][a-z0-9 #'_-]{0,84} )?potion) on (?:#[0-9]+|my (?:[a-z0-9][a-z0-9 #'_-]{0,84} )?(?:stone|runestone))\z/i,
+    /\Adip (?:#[0-9]+|my (?:[a-z0-9][a-z0-9 #'_-]{0,84} )?brush) in (?:#[0-9]+|my (?:[a-z0-9][a-z0-9 #'_-]{0,84} )?(?:ink|cup))\z/i,
+    /\Adraw [a-z]{1,20}'[a-z]{1,20} rune\z/i,
+    /\Awave (?:#[0-9]+|my (?:[a-z0-9][a-z0-9 #'_-]{0,84} )?(?:stone|runestone)) at (?:#[0-9]+|my [a-z0-9][a-z0-9 #'_-]{0,110})\z/i,
+    /\A(?:prep|prepare) 714\z/i,
+    /\Acast at #[0-9]+\z/i,
+    /\Ainfuse (?:#[0-9]+|my [a-z0-9][a-z0-9 #'_-]{0,110})\z/i
+  ].freeze
+  SEQUENCE_FAILURE = /(?:
+    What\s+were\s+you\s+referring\s+to\? |
+    Please\s+rephrase\s+that\s+command |
+    I\s+could\s+not\s+find |
+    You\s+(?:do\s+not|don't)\s+(?:have|seem\s+to\s+have) |
+    You\s+(?:aren't|are\s+not)\s+holding |
+    You\s+(?:can't|cannot|may\s+not|are\s+unable\s+to) |
+    That\s+is\s+closed
+  )/ix
+
+  @pending = []
+  @pending_mutex = Mutex.new
+  @running = true
+  @actions_enabled = true
+  @execution_mutex = Mutex.new
+  @sequence_response_mutex = Mutex.new
+  @sequence_response_cv = ConditionVariable.new
+  @sequence_prompt_counter = 0
+  @sequence_response_waiter = nil
+  @last_observe_error_at = Time.at(0)
+  @last_action_error_at = Time.at(0)
+  @last_action_registration_at = Time.at(0)
+  @last_action_registration_error_at = Time.at(0)
+  @pending_approval_id = nil
+  @auto_approve = true
+  @raw_capture_until = Time.at(0)
+  @raw_capture_path = nil
+  @session_generation = SecureRandom.hex(16)
+  @snapshot_sequence = 0
+  @last_snapshot_signature = nil
+  @last_snapshot_at = Time.at(0)
+  @snapshot_generation_rejected = false
+  @diagnostic_capture = nil
+  @diagnostic_capture_mutex = Mutex.new
+  @last_observation = nil
+  @script_status = {}
+  @script_status_mutex = Mutex.new
+  @observed_inactive_spells = {}
+  @spell_evidence_mutex = Mutex.new
+  @live_state_source = nil
+  @command_queue = Queue.new
+  @question_mutex = Mutex.new
+  @question_epoch = 0
+
+  def self.display(message)
+    message.to_s.each_line do |line|
+      text = "--- LAB: #{line.chomp}"
+      if defined?(_respond)
+        _respond(familiar_stream_frame(text))
+      else
+        respond(text)
+      end
+    end
+  end
+
+  def self.live_state_source
+    @live_state_source ||= LichState::LichSource.new
+  end
+
+  def self.familiar_stream_frame(text)
+    source = text.to_s
+    utf8_text = if source.encoding == Encoding::BINARY
+                  source.dup.force_encoding(Encoding::UTF_8).scrub("\uFFFD")
+                else
+                  source.encode(
+                    Encoding::UTF_8,
+                    invalid: :replace,
+                    undef: :replace,
+                    replace: "\uFFFD"
+                  )
+                end
+    escaped = utf8_text
+      .gsub(/[^\u0009\u000A\u000D\u0020-\uD7FF\uE000-\uFFFD\u{10000}-\u{10FFFF}]/, "\uFFFD")
+      .gsub(/[&<>"']/) { |character| XML_TEXT_ESCAPES.fetch(character) }
+    "<pushStream id=\"#{FAMILIAR_STREAM}\" ifClosedStyle=\"#{FAMILIAR_CLOSED_STYLE}\"/>#{escaped}\n<popStream/>\n"
+  end
+
+  def self.character_name
+    XMLData.name.to_s.empty? ? 'Unknown' : XMLData.name.to_s
+  end
+
+  def self.room_id
+    Map.current&.id&.to_s
+  rescue
+    nil
+  end
+
+  def self.room_fingerprint
+    room_id || 'unknown'
+  end
+
+  def self.session_generation
+    @session_generation
+  end
+
+  def self.record_spell_evidence(line)
+    spell_id = nil
+    state = nil
+    SPELL_STATE_MESSAGES.each do |candidate, messages|
+      if messages.fetch(:down).match?(line)
+        spell_id = candidate
+        state = :down
+        break
+      elsif messages.fetch(:up).match?(line)
+        spell_id = candidate
+        state = :up
+        break
+      end
+    end
+    if state.nil? && (match = INFOMON_SPELL_ENDED.match(line))
+      spell_id = match[1]
+      state = :down
+    end
+    return false unless spell_id
+
+    @spell_evidence_mutex.synchronize do
+      if state == :down
+        @observed_inactive_spells[spell_id] = Time.now
+      else
+        @observed_inactive_spells.delete(spell_id)
+      end
+    end
+    if state == :down && defined?(Spell) && Spell.respond_to?(:[])
+      spell = Spell[spell_id.to_i]
+      spell.putdown if spell && spell.respond_to?(:putdown) && spell.active?
+    end
+    true
+  rescue => error
+    Lich.log("lab bridge spell evidence error: #{error.class}: #{error.message}") if defined?(Lich)
+    false
+  end
+
+  def self.live_scripts
+    return [] unless defined?(Script) && Script.respond_to?(:running)
+
+    scripts = Array(Script.running)
+    scripts.concat(Array(Script.hidden)) if Script.respond_to?(:hidden)
+    scripts.filter_map { |script| script.respond_to?(:name) ? script.name.to_s : nil }
+           .reject(&:empty?).uniq.sort.first(100)
+  rescue
+    []
+  end
+
+  def self.script_owners(scripts)
+    folded = scripts.map(&:downcase)
+    movement_candidates = %w[go2 bigshot ebounty escortgo2 echild] + CONTROLLER_REGISTRY.controller_scripts_for_lane('movement')
+    combat_candidates = %w[bigshot] + CONTROLLER_REGISTRY.controller_scripts_for_lane('combat')
+    movement = movement_candidates.uniq.find { |name| folded.include?(name) }
+    combat = combat_candidates.uniq.find { |name| folded.include?(name) }
+    inventory = %w[eloot eherbs lab-inventory].find { |name| folded.include?(name) }
+    {
+      movement: movement,
+      combat: combat,
+      inventory: inventory,
+      communication: nil
+    }
+  end
+
+  def self.live_script_status(scripts)
+    running = scripts.map(&:downcase)
+    @script_status_mutex.synchronize do
+      controller_scripts = CONTROLLER_REGISTRY.controllers.map(&:script)
+      (%w[bigshot eloot go2] + controller_scripts).uniq.each do |name|
+        if running.include?(name)
+          @script_status[name] = 'running'
+        elsif @script_status[name] == 'running'
+          @script_status[name] = 'completed'
+        end
+      end
+      @script_status.dup
+    end
+  end
+
+  def self.set_script_status(name, status)
+    @script_status_mutex.synchronize { @script_status[name.to_s.downcase] = status }
+  end
+
+  def self.live_state_context
+    scripts = live_scripts
+    inactive_spell_ids = @spell_evidence_mutex.synchronize do
+      @observed_inactive_spells.keys.dup
+    end
+    {
+      generation: @session_generation,
+      inactive_spell_ids: inactive_spell_ids,
+      scripts: scripts,
+      owners: script_owners(scripts),
+      script_status: live_script_status(scripts)
+    }
+  end
+
+  def self.monitor_script_completion(
+    name,
+    execution_id:,
+    startup_timeout: 3,
+    completion_timeout: 20
+  )
+    Thread.new do
+      startup_deadline = Time.now + startup_timeout
+      completion_deadline = Time.now + completion_timeout
+      started = false
+      finished = false
+      loop do
+        running = Script.running?(name)
+        started ||= running
+        if started && !running
+          finished = true
+          break
+        end
+        break if !started && Time.now >= startup_deadline
+        break if Time.now >= completion_deadline
+
+        sleep 0.1
+      end
+      status = if finished
+                 'completed'
+               elsif started
+                 'timed_out'
+               else
+                 'failed'
+               end
+      set_script_status(name, "#{status}:#{execution_id}")
+      publish_snapshot(force: true)
+    rescue => error
+      set_script_status(name, 'failed')
+      Lich.log("lab bridge script monitor failed: #{error.class}: #{error.message}")
+    end
+  end
+
+  def self.controller_global_value(global_name)
+    TOPLEVEL_BINDING.eval(global_name)
+  rescue NameError
+    nil
+  end
+
+  def self.clear_controller_result(controller)
+    TOPLEVEL_BINDING.eval("#{controller.result_global} = nil")
+  end
+
+  def self.set_controller_signal(controller, value)
+    raise 'controller has no signal' unless controller.signal_global
+
+    literal = value ? 'true' : 'false'
+    TOPLEVEL_BINDING.eval("#{controller.signal_global} = #{literal}")
+  end
+
+  def self.controller_result(controller)
+    controller_global_value(controller.result_global)
+  end
+
+  def self.result_field(result, key)
+    return nil unless result.is_a?(Hash)
+    return result[key] if result.key?(key)
+
+    result[key.to_s]
+  end
+
+  def self.normalized_controller_result(controller, fallback_code: 'missing_result', fallback_message: nil)
+    result = controller_result(controller)
+    unless result.is_a?(Hash)
+      return {
+        ok: false,
+        code: fallback_code,
+        message: fallback_message || "#{controller.script} returned no structured result",
+        details: {}
+      }
+    end
+
+    details = result_field(result, :details)
+    details = {} unless details.is_a?(Hash)
+    details = JSON.parse(JSON.generate(details))
+    {
+      ok: result_field(result, :ok) == true,
+      code: result_field(result, :code).to_s[0, 128],
+      message: result_field(result, :message).to_s[0, 500],
+      details: details
+    }
+  rescue JSON::GeneratorError
+    {
+      ok: false,
+      code: 'malformed_result',
+      message: "#{controller.script} returned non-JSON result details",
+      details: {}
+    }
+  end
+
+  def self.publish_controller_result(controller, execution_id, result)
+    publish_event(
+      'controller_result',
+      "#{controller.name} controller #{result.fetch(:code)}",
+      {
+        controller: controller.name,
+        script: controller.script,
+        action_id: execution_id.to_s,
+        ok: result.fetch(:ok),
+        code: result.fetch(:code),
+        message: result.fetch(:message),
+        details: result.fetch(:details)
+      }
+    )
+  end
+
+  # A controller owns its lifetime. The monitor waits for observed script exit,
+  # publishes the post-state first, then emits one action-attributed result.
+  def self.monitor_controller(controller, execution_id:, startup_timeout: 3)
+    Thread.new do
+      startup_deadline = Time.now + startup_timeout
+      until Script.running?(controller.script) || controller_result(controller).is_a?(Hash) || Time.now >= startup_deadline
+        sleep 0.05
+      end
+      sleep 0.1 while Script.running?(controller.script)
+      result = normalized_controller_result(controller)
+      set_script_status(controller.script, "#{result.fetch(:code)}:#{execution_id}")
+      publish_snapshot(force: true)
+      publish_controller_result(controller, execution_id, result)
+    rescue => error
+      set_script_status(controller.script, "failed:#{execution_id}")
+      Lich.log("lab bridge #{controller.name} monitor failed: #{error.class}: #{error.message}")
+    end
+  end
+
+  def self.launch_bigshot(startup_timeout: 3)
+    return true if Script.running?('bigshot')
+
+    Thread.new do
+      Script.run('bigshot', nil, { quiet: true })
+    rescue => error
+      Lich.log("lab bridge Bigshot launch failed: #{error.class}: #{error.message}")
+    end
+    deadline = Time.now + startup_timeout
+    until Script.running?('bigshot') || Time.now >= deadline
+      sleep 0.05
+    end
+    Script.running?('bigshot')
+  end
+
+  def self.launch_controller(controller, controller_action, arguments, startup_timeout: 3)
+    return false if Script.running?(controller.script)
+
+    if controller_action.launch_mode == 'start'
+      return false unless Script.start(controller.script, arguments)
+    else
+      Thread.new do
+        Script.run(controller.script, arguments, { quiet: true })
+      rescue => error
+        Lich.log("lab bridge #{controller.name} launch failed: #{error.class}: #{error.message}")
+      end
+    end
+    deadline = Time.now + startup_timeout
+    until Script.running?(controller.script) || controller_result(controller).is_a?(Hash) || Time.now >= deadline
+      sleep 0.05
+    end
+    Script.running?(controller.script) || controller_result(controller).is_a?(Hash)
+  rescue => error
+    Lich.log("lab bridge #{controller.name} launch failed: #{error.class}: #{error.message}")
+    false
+  end
+
+  def self.snapshot_state(extracted: nil)
+    sample = extracted
+    unless sample&.hub
+      sample = live_state_source.extract(
+        projection_types: [],
+        hub_context: live_state_context
+      )
+    end
+    state = sample&.hub
+    raise 'coherent live state is unavailable' unless state
+
+    state
+  end
+
+  def self.snapshot_signature(state)
+    stable = state.dup
+    stable[:active_spells] = Array(state[:active_spells]).map { |spell| { id: spell[:id] } }
+    JSON.generate(stable)
+  end
+
+  def self.publish_snapshot(force: false, extracted: nil)
+    return false if @snapshot_generation_rejected
+    return false if character_name == 'Unknown'
+
+    state = snapshot_state(extracted: extracted)
+    signature = snapshot_signature(state)
+    heartbeat_due = Time.now - @last_snapshot_at >= SNAPSHOT_HEARTBEAT_INTERVAL
+    return false unless force || heartbeat_due || signature != @last_snapshot_signature
+
+    @snapshot_sequence += 1
+    payload = state.merge(
+      sequence: @snapshot_sequence,
+      observed_at: Time.now.utc.iso8601(6)
+    )
+    request(:post, '/v1/state', payload, authorized: true)
+    @last_snapshot_signature = signature
+    @last_snapshot_at = Time.now
+    true
+  rescue => error
+    if error.message.include?('409')
+      @snapshot_generation_rejected = true
+      @actions_enabled = false
+      @pending_approval_id = nil
+      Lich.log("lab bridge snapshot generation rejected; restart ;lab to establish a fresh session: #{error.message}")
+    end
+    raise error
+  end
+
+  def self.publish_event(kind, summary, data = {})
+    request(
+      :post,
+      '/v1/event',
+      {
+        character: character_name,
+        generation: @session_generation,
+        observed_at: Time.now.utc.iso8601(3),
+        kind: kind.to_s[0, 128],
+        summary: summary.to_s[0, MAX_LINE],
+        data: data
+      },
+      authorized: true
+    )
+    true
+  rescue => error
+    Lich.log("lab bridge event publish failed: #{error.class}: #{error.message}")
+    false
+  end
+
+  def self.diagnostic_evidence?(lines, item)
+    return false if lines.empty?
+
+    combined = lines.join(' ').downcase
+    failure = /\b(?:cannot|can't|unable|failed|nothing happens|not holding|do not have)\b/i
+    return false if failure.match?(combined)
+
+    candidates = [item.noun, item.name, item.full_name].compact.map do |value|
+      normalize_item_name(value).downcase
+    end.reject { |value| value.length < 3 }.uniq
+    candidates.any? { |value| combined.include?(value) }
+  rescue
+    false
+  end
+
+  def self.capture_diagnostic(method, object_id, action_id, item)
+    capture = {
+      method: method.to_s,
+      object_id: object_id.to_s,
+      lines: [],
+      last_line_at: Time.now
+    }
+    @diagnostic_capture_mutex.synchronize do
+      raise 'another diagnostic capture is active' if @diagnostic_capture
+
+      @diagnostic_capture = capture
+    end
+    yield
+    deadline = Time.now + 3
+    loop do
+      line_count, last_line_at = @diagnostic_capture_mutex.synchronize do
+        [capture[:lines].length, capture[:last_line_at]]
+      end
+      break if Time.now >= deadline
+      break if line_count.positive? && Time.now - last_line_at >= 0.25
+
+      sleep 0.05
+    end
+    lines = @diagnostic_capture_mutex.synchronize do
+      @diagnostic_capture = nil if @diagnostic_capture.equal?(capture)
+      capture[:lines].dup
+    end
+    attributable = diagnostic_evidence?(lines, item)
+    published = false
+    if attributable
+      published = publish_event(
+        'item_diagnostic',
+        "#{method} evidence for exact item ##{object_id}",
+        {
+          method: method.to_s,
+          object_id: object_id.to_s,
+          action_id: action_id.to_s,
+          success: true,
+          lines: lines,
+          line_count: lines.length
+        }
+      )
+    end
+    { lines: lines, published: published, attributable: attributable }
+  ensure
+    @diagnostic_capture_mutex.synchronize do
+      @diagnostic_capture = nil if defined?(capture) && @diagnostic_capture.equal?(capture)
+    end
+  end
+
+  def self.capture(server_string)
+    if @raw_capture_path && Time.now < @raw_capture_until
+      File.open(@raw_capture_path, 'a', encoding: 'UTF-8') do |stream|
+        stream.write(server_string)
+      end
+    end
+    text = strip_xml(server_string.dup, type: DOWNSTREAM_HOOK)
+    normalized_lines = []
+    text.to_s.split(/\r?\n/).each do |line|
+      normalized = line.gsub(/\s+/, ' ').strip
+      next if normalized.empty?
+      normalized_lines << normalized
+
+      record_spell_evidence(normalized)
+
+      @diagnostic_capture_mutex.synchronize do
+        if @diagnostic_capture
+          @diagnostic_capture[:lines] << normalized[0, MAX_LINE]
+          @diagnostic_capture[:lines].shift while @diagnostic_capture[:lines].length > 80
+          @diagnostic_capture[:last_line_at] = Time.now
+        end
+      end
+
+      event = {
+        timestamp: Time.now.utc.iso8601(3),
+        character: character_name,
+        game: XMLData.game.to_s,
+        room_id: room_id,
+        source: 'game',
+        text: normalized[0, MAX_LINE]
+      }
+      @last_observation = event
+      @pending_mutex.synchronize do
+        @pending.shift while @pending.length >= MAX_PENDING
+        @pending << event
+      end
+    end
+    live_state_source.observe_character_data(server_string, normalized_lines)
+    observe_sequence_response(server_string, normalized_lines)
+    server_string
+  rescue => error
+    Lich.log("lab bridge capture error: #{error.class}: #{error.message}")
+    server_string
+  end
+
+  def self.observe_sequence_response(server_string, normalized_lines)
+    prompt_received = server_string.to_s.match?(/<prompt(?:\s|>)/)
+    @sequence_response_mutex.synchronize do
+      if @sequence_response_waiter
+        Array(normalized_lines).each do |line|
+          if @sequence_response_waiter[:failure].nil? && SEQUENCE_FAILURE.match?(line.to_s)
+            @sequence_response_waiter[:failure] = line.to_s
+            @sequence_response_waiter[:acknowledged] = true
+          end
+        end
+        if sequence_command_acknowledged?(
+          @sequence_response_waiter[:command],
+          server_string,
+          normalized_lines
+        )
+          @sequence_response_waiter[:acknowledged] = true
+        end
+        if prompt_received && @sequence_response_waiter[:acknowledged]
+          @sequence_response_waiter[:complete] = true
+        end
+      end
+      if prompt_received
+        @sequence_prompt_counter += 1
+        @sequence_response_cv.broadcast
+      end
+    end
+  end
+
+  def self.sequence_command_acknowledged?(command, server_string, normalized_lines)
+    if %w[info skills].include?(command.to_s.downcase)
+      starting_revision = @sequence_response_waiter && @sequence_response_waiter[:recon_revision]
+      return starting_revision && live_state_source.character_recon_revision(command.to_s.downcase) > starting_revision
+    end
+    raw = server_string.to_s
+    exact_ids = command.to_s.scan(/#([0-9]+)/).flatten
+    return true if exact_ids.any? do |id|
+      raw.match?(/\bexist=(?:"#{Regexp.escape(id)}"|'#{Regexp.escape(id)}')/)
+    end
+
+    patterns = case command.to_s
+               when /\Aput\s/i
+                 [/\AYou (?:put|place|roll|slide|slip|stow|tuck|secure|buckle)\b/i]
+               when /\A(?:get|take)\s/i
+                 [/\AYou (?:get|take|remove|retrieve|slide|undo|unfasten|pull|draw)\b/i]
+               when /\Aremove\s/i
+                 [/\AYou (?:remove|take off|unfasten|undo|slip)\b/i]
+               when /\Awear\s/i
+                 [/\AYou (?:wear|put on|don|fasten|slip)\b/i]
+               when /\Aopen\s/i
+                 [/\AYou (?:open|unfasten|undo|pull|slide)\b/i]
+               when /\Aclose\s/i
+                 [/\AYou (?:close|fasten|buckle|seal|shut|roll)\b/i]
+               when /\A(?:look|inspect)\s/i
+                 [/\AYou (?:see|look|inspect|notice)\b/i]
+               when /\Aread\s/i
+                 [/\A(?:It takes you|On the\b|You (?:read|study|focus))\b/i]
+               when /\Awave\s/i
+                 [/\AYou wave\b/i]
+               when /\Apour\s/i
+                 [/\AYou pour\b/i]
+               when /\Adip\s/i
+                 [/\AYou dip\b/i]
+               when /\Adraw\s/i
+                 [/\AYou (?:draw|carefully draw|carefully trace out|begin drawing)\b/i]
+               when /\A(?:prep|prepare)\s+714\z/i
+                 [
+                   /\AYou (?:trace|gesture|prepare|begin preparing)\b/i,
+                   /\AYour spell is ready\.\z/i,
+                   /\AClawing its way violently up your throat\b/i
+                 ]
+               when /\Acast at #[0-9]+\z/i
+                 [/\AYou gesture at\b/i, /\AYou focus your thoughts upon\b/i]
+               when /\Ainfuse\s/i
+                 [/\AYou (?:infuse|channel|focus|reach|gesture)\b/i]
+               else
+                 []
+               end
+    Array(normalized_lines).any? do |line|
+      patterns.any? { |pattern| pattern.match?(line.to_s) }
+    end
+  end
+
+  # Send exactly once, then wait for the authoritative server prompt.  fput
+  # cannot provide this guarantee here because frontend state frames can be the
+  # first downstream line and make it return before the game handles the
+  # command.  That early return can overwrite the next inventory capture or
+  # advance a crafting sequence while cast roundtime is still being published.
+  def self.send_sequence_command(command, timeout: 20)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout.to_f
+    waiter = { command: command.to_s, failure: nil, acknowledged: false, complete: false }
+    if %w[info skills].include?(command.to_s.downcase)
+      waiter[:recon_revision] = live_state_source.character_recon_revision(command.to_s.downcase)
+    end
+    result = false
+
+    @sequence_response_mutex.synchronize do
+      starting_prompt = @sequence_prompt_counter
+      @sequence_response_waiter = waiter
+      begin
+        put(command)
+        while @running && !waiter[:complete]
+          remaining = deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          break if remaining <= 0
+          @sequence_response_cv.wait(@sequence_response_mutex, remaining)
+        end
+        if waiter[:complete] && @sequence_prompt_counter > starting_prompt
+          result = waiter[:failure] || true
+        end
+      ensure
+        @sequence_response_waiter = nil if @sequence_response_waiter.equal?(waiter)
+      end
+    end
+    result
+  rescue => error
+    Lich.log("lab bridge sequence command failed: #{error.class}: #{error.message}")
+    false
+  end
+
+  def self.take_batch
+    @pending_mutex.synchronize { @pending.shift(MAX_BATCH) }
+  end
+
+  def self.restore_batch(batch)
+    @pending_mutex.synchronize do
+      @pending = (batch + @pending).last(MAX_PENDING)
+    end
+  end
+
+  def self.request(method, path, payload = nil, read_timeout: 5, authorized: false)
+    uri = BASE_URI + path
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.open_timeout = 1
+    http.read_timeout = read_timeout
+    request = method == :get ? Net::HTTP::Get.new(uri) : Net::HTTP::Post.new(uri)
+    if authorized
+      token = File.read(ACTION_TOKEN_FILE, encoding: 'UTF-8').strip
+      raise 'action token is unavailable' unless token.match?(/\A[0-9a-f]{64}\z/)
+
+      request['Authorization'] = "Bearer #{token}"
+    end
+    if payload
+      request['Content-Type'] = 'application/json'
+      request.body = JSON.generate(payload)
+    end
+    response = http.request(request)
+    body = JSON.parse(response.body, symbolize_names: true)
+    unless response.is_a?(Net::HTTPSuccess)
+      raise "sidecar returned #{response.code}: #{body[:detail] || body[:error]}"
+    end
+    body
+  end
+
+  def self.action_request(path, payload)
+    request(:post, path, payload, authorized: true)
+  end
+
+  # One coherent frontend-independent extraction feeds the LAB state snapshot.
+  # Frontend adapters run in their own scripts and never participate here.
+  def self.publish_tick
+    extracted = live_state_source.extract(
+      projection_types: [],
+      hub_context: live_state_context
+    )
+    batch = take_batch
+    begin
+      request(:post, '/v1/observe', { events: batch }, authorized: true) unless batch.empty?
+      publish_snapshot(extracted: extracted)
+    rescue => error
+      restore_batch(batch) unless batch.empty?
+      if Time.now - @last_observe_error_at > 30
+        Lich.log("lab bridge publish paused: #{error.class}: #{error.message}")
+        @last_observe_error_at = Time.now
+      end
+      sleep 1
+    end
+  end
+
+  def self.publish_loop
+    while @running
+      sleep 0.25
+      publish_tick
+    end
+  end
+
+  def self.ask(question)
+    question_lock = @question_mutex.try_lock
+    unless question_lock
+      display('a question is already running for this character')
+      return
+    end
+    expected_character = character_name
+    expected_generation = session_generation
+    expected_epoch = @question_epoch
+    display('thinking...')
+    health = request(:get, '/health')
+    timeout = health[:ask_timeout_seconds]
+    timeout = 120 unless timeout.is_a?(Numeric) && timeout.finite? && timeout.positive? && timeout <= 600
+    return if expected_epoch != @question_epoch || expected_character != character_name || expected_generation != session_generation
+    body = request(
+      :post,
+      '/v1/ask',
+      { character: character_name, question: question },
+      read_timeout: timeout + 5,
+      authorized: true
+    )
+    display(body.fetch(:text)) if expected_epoch == @question_epoch && expected_character == character_name && expected_generation == session_generation
+  rescue => error
+    display("unavailable (#{error.message})")
+  ensure
+    @question_mutex.unlock if question_lock
+  end
+
+  def self.ensure_inventory_tracker
+    return true if Script.running?('lab-inventory')
+
+    !!Script.start('lab-inventory', { quiet: true })
+  end
+
+  # Management commands arrive through the short-lived lab.lic dispatcher.
+  # Creating a worker there would attach it to that dispatcher's Lich thread
+  # group, so Lich would kill the worker as soon as lab.lic exits.  Queue the
+  # work for this persistent script to launch instead.  Each command still gets
+  # its own worker so a slow model answer cannot block status or safety controls.
+  def self.run_command_async(&work)
+    @command_queue << work
+    nil
+  end
+
+  def self.command_loop
+    while @running
+      work = @command_queue.pop
+      break if work.nil? || !@running
+
+      Thread.new { work.call }
+    end
+  end
+
+  def self.status
+    body = request(:get, '/health')
+    unless body[:service] == 'lich-agent-bridge'
+      raise "port #{PORT} belongs to another local service"
+    end
+    model = body[:model_configured] ? 'model configured' : 'model unavailable'
+    actions = @actions_enabled ? 'actions enabled' : 'actions disabled'
+    auto = @auto_approve ? 'auto-approve enabled' : 'auto-approve disabled'
+    display("sidecar online, backend=#{body[:backend]}, #{model}, capability=#{body[:capability]}, #{actions}, #{auto}")
+  rescue => error
+    display("sidecar offline (#{error.message})")
+  end
+
+  def self.show_state
+    state = snapshot_state
+    room = state[:room]
+    room_text = room ? "#{room[:id] || '?'} #{room[:title]}".strip : 'unknown'
+    hands = state[:hands]
+    right = hands[:right] ? "##{hands[:right][:id]} #{hands[:right][:name]}" : 'empty'
+    left = hands[:left] ? "##{hands[:left][:id]} #{hands[:left][:name]}" : 'empty'
+    vitals = state[:vitals]
+    display(
+      "#{state[:character]} room=#{room_text}; " \
+      "health=#{vitals[:health][:current]}/#{vitals[:health][:max]} " \
+      "mana=#{vitals[:mana][:current]}/#{vitals[:mana][:max]} " \
+      "spirit=#{vitals[:spirit][:current]}/#{vitals[:spirit][:max]} " \
+      "stamina=#{vitals[:stamina][:current]}/#{vitals[:stamina][:max]}"
+    )
+    display(
+      "stance=#{state[:stance]} rt=#{state[:roundtime]} encumbrance=#{state[:encumbrance]}; " \
+      "right=#{right}; left=#{left}"
+    )
+    display("scripts=#{state[:scripts].empty? ? 'none' : state[:scripts].join(', ')}")
+  rescue => error
+    display("state unavailable (#{error.message})")
+  end
+
+  def self.show_scripts
+    scripts = live_scripts
+    display("scripts=#{scripts.empty? ? 'none' : scripts.join(', ')}")
+  end
+
+  def self.show_inventory
+    objects = inventory_objects
+    hands = snapshot_state[:hands]
+    right = hands[:right] ? "##{hands[:right][:id]} #{hands[:right][:name]}" : 'empty'
+    left = hands[:left] ? "##{hands[:left][:id]} #{hands[:left][:name]}" : 'empty'
+    display("inventory objects=#{objects.length}; right=#{right}; left=#{left}")
+  end
+
+  def self.show_last
+    event = @last_observation
+    if event
+      display("last [#{event[:timestamp]} room=#{event[:room_id] || '?'}]: #{event[:text]}")
+    else
+      display('no game observation captured yet')
+    end
+  end
+
+  def self.show_alerts
+    body = request(
+      :post,
+      '/v1/session/alerts',
+      { character: character_name },
+      authorized: true
+    )
+    alerts = Array(body[:items])
+    if alerts.empty?
+      display('no active watcher alerts')
+    else
+      alerts.each do |alert|
+        display("#{alert[:severity]} #{alert[:code]}: #{JSON.generate(alert[:evidence] || {})}")
+      end
+    end
+  rescue => error
+    display("alerts unavailable (#{error.message})")
+  end
+
+  def self.show_sources
+    body = request(
+      :post,
+      '/v1/session/sources',
+      { character: character_name },
+      authorized: true
+    )
+    unless body[:answer_available]
+      display('no answer provenance is available for this character yet')
+      return nil
+    end
+
+    sources = Array(body[:sources])
+    if sources.empty?
+      display('no local reference excerpts were supplied to the last answer')
+    else
+      sources.each do |source|
+        location = source[:url] || source[:source] || 'local reference'
+        revision = source[:revision_id] ? " revision=#{source[:revision_id]}" : ''
+        display("reference supplied: #{source[:title] || 'untitled'} [#{source[:authority] || 'reference'}] #{location}#{revision}")
+      end
+    end
+    Array(body[:diagnostics]).each do |diagnostic|
+      display("source status: #{diagnostic[:source]}=#{diagnostic[:status]} (#{diagnostic[:detail]})")
+    end
+  rescue => error
+    display("sources unavailable (#{error.message})")
+  end
+
+  def self.show_context
+    body = request(
+      :post,
+      '/v1/session/context',
+      { character: character_name },
+      authorized: true
+    )
+    categories = Array(body[:context_categories])
+    display(
+      "temporary dialogue turns=#{body[:dialogue_turns].to_i}; " \
+      "follow-up context=#{body[:follow_up_context_available] ? 'available' : 'none'}; " \
+      "categories=#{categories.empty? ? 'none' : categories.join(', ')}"
+    )
+  rescue => error
+    display("context unavailable (#{error.message})")
+  end
+
+  def self.forget_context
+    @question_epoch += 1
+    body = request(
+      :post,
+      '/v1/session/forget',
+      { character: character_name },
+      authorized: true
+    )
+    if body[:forgotten]
+      display('temporary dialogue and last-answer reference metadata cleared for this character')
+    else
+      display('no temporary dialogue was stored for this character')
+    end
+  rescue => error
+    display("forget unavailable (#{error.message})")
+  end
+
+  def self.start_capability(capability, arguments = {})
+    operation = request(
+      :post,
+      '/v1/session/perform',
+      {
+        character: character_name,
+        capability: capability,
+        args: arguments
+      },
+      authorized: true
+    )
+    operation_id = operation.fetch(:operation_id)
+    display("operation #{operation_id} #{operation[:status]}: #{capability}")
+    cursor = 0
+    loop do
+      page = request(
+        :post,
+        '/v1/session/operation/watch',
+        {
+          operation_id: operation_id,
+          cursor: cursor,
+          timeout_ms: 15_000
+        },
+        read_timeout: 17,
+        authorized: true
+      )
+      Array(page[:items]).each do |event|
+        display("operation #{operation_id} #{event[:status]}: #{event[:detail]}")
+      end
+      cursor = page[:cursor].to_i
+      operation = page.fetch(:operation)
+      break if %w[succeeded failed timed_out interrupted].include?(operation[:status].to_s)
+    end
+    display("operation #{operation_id} finished: #{operation[:status]} #{operation[:explanation]}")
+  rescue => error
+    display("operation unavailable (#{error.message})")
+  end
+
+  def self.stop_capability
+    body = request(
+      :post,
+      '/v1/session/operation/stop',
+      { character: character_name },
+      authorized: true
+    )
+    if body[:stopped]
+      display("interrupt requested for operation #{body[:operation_id]}")
+    else
+      display('no active operation to stop')
+    end
+  rescue => error
+    display("stop unavailable (#{error.message})")
+  end
+
+  def self.set_actions(enabled)
+    # This is the locally desired state.  Keep an explicit/default ON request
+    # across a temporary sidecar outage so the reconciliation loop can restore
+    # the sidecar's in-memory authorization when it becomes reachable.  An OFF
+    # request remains off locally even if notifying the sidecar fails.
+    if @snapshot_generation_rejected
+      @actions_enabled = false
+      @pending_approval_id = nil
+      display('action execution remains OFF: this bridge session generation was rejected') if enabled
+      return false
+    end
+    @actions_enabled = enabled
+    unless enabled
+      @pending_approval_id = nil
+      @auto_approve = false
+    end
+    body = action_request(
+      '/v1/actions/control',
+      { character: character_name, generation: session_generation, enabled: enabled }
+    )
+    @actions_enabled = body.fetch(:enabled)
+    @last_action_registration_at = Time.now if @actions_enabled
+    state = @actions_enabled ? 'ON' : 'OFF'
+    display("action execution #{state} for #{body.fetch(:character)}")
+  rescue => error
+    if enabled
+      display("could not register action execution (#{error.message}); local request remains ON and will retry")
+    else
+      display("could not notify sidecar (#{error.message}); actions are OFF locally")
+    end
+  end
+
+  # The sidecar keeps action authorization in memory.  Reconcile it while the
+  # local switch is on so a sidecar restart does not require restarting Lich.
+  # Do not change @actions_enabled here: only an explicit local command or the
+  # initial set_actions request is allowed to engage the local kill switch.
+  def self.reconcile_action_registration
+    return false unless @actions_enabled
+    if @snapshot_generation_rejected
+      @actions_enabled = false
+      @pending_approval_id = nil
+      return false
+    end
+    return false if Time.now - @last_action_registration_at < ACTION_REGISTRATION_INTERVAL
+
+    @last_action_registration_at = Time.now
+    action_request(
+      '/v1/actions/control',
+      { character: character_name, generation: session_generation, enabled: true }
+    )
+    true
+  rescue => error
+    if Time.now - @last_action_registration_error_at > 30
+      Lich.log("lab bridge action registration reconciliation failed: #{error.class}: #{error.message}")
+      @last_action_registration_error_at = Time.now
+    end
+    false
+  end
+
+  def self.approve_action(action_id, approval_mode = 'manual')
+    unless action_id.match?(/\A[0-9a-f]{16}\z/)
+      display('invalid action id')
+      return
+    end
+    body = action_request(
+      '/v1/actions/approve',
+      {
+        action_id: action_id,
+        character: character_name,
+        room_id: room_fingerprint,
+        generation: session_generation,
+        approval_mode: approval_mode
+      }
+    )
+    @pending_approval_id = nil if @pending_approval_id == action_id
+    display("approved (#{approval_mode}) #{body.fetch(:action_id)}: #{action_description(body)}")
+  rescue => error
+    display("approval failed (#{error.message})")
+  end
+
+  def self.safe_action_command?(command)
+    text = command.to_s
+    return false if FORBIDDEN_ACTIONS.any? { |pattern| pattern.match?(text) }
+
+    SAFE_ACTIONS.any? { |pattern| pattern.match?(text) }
+  end
+
+  def self.safe_sequence_command?(command)
+    text = command.to_s
+    safe_action_command?(text) && SAFE_SEQUENCE_ACTIONS.any? { |pattern| pattern.match?(text) }
+  end
+
+  # A sequence may move only objects that Lich can currently prove belong to
+  # the admitted character.  GameObj.containers also tracks inspected room and
+  # locker containers, so walking every published container would make an
+  # external object look like carried inventory.  Begin with the character's
+  # inventory and hands, then follow contents only beneath those owned roots.
+  def self.owned_inventory_snapshot
+    containers = GameObj.containers
+    objects = Array(GameObj.inv) + [GameObj.right_hand, GameObj.left_hand].compact
+    seen = {}
+    parents = Hash.new { |hash, key| hash[key] = [] }
+    queue = objects.dup
+
+    until queue.empty?
+      object = queue.shift
+      object_id = object.id.to_s
+      next if object_id.empty? || seen.key?(object_id)
+
+      seen[object_id] = object
+      nested = containers[object_id]
+      nested = containers[object.id] if nested.nil?
+      Array(nested).each do |child|
+        child_id = child.id.to_s
+        next if child_id.empty?
+
+        parents[child_id] << object_id unless parents[child_id].include?(object_id)
+        queue << child unless seen.key?(child_id)
+      end
+    end
+
+    { objects: seen.values, parents: parents }
+  end
+
+  def self.owned_inventory_objects
+    owned_inventory_snapshot.fetch(:objects)
+  end
+
+  def self.resolve_owned_items(reference, snapshot = owned_inventory_snapshot)
+    text = reference.to_s.strip.sub(/\Amy\s+/i, '')
+    if (id_match = text.match(/\A#([0-9]+)\z/))
+      return snapshot.fetch(:objects).select { |item| item.id.to_s == id_match[1] }
+    end
+
+    normalized = normalize_item_name(text)
+    return [] if normalized.empty?
+
+    snapshot.fetch(:objects).select do |item|
+      [item.noun, item.name, item.full_name].compact.any? do |candidate|
+        normalize_item_name(candidate) == normalized
+      end
+    end
+  end
+
+  def self.owned_item_id(reference, snapshot)
+    matches = resolve_owned_items(reference, snapshot)
+    if matches.empty?
+      raise SequenceOwnershipError, "no carried inventory match for #{reference}"
+    end
+    if matches.length > 1
+      raise SequenceOwnershipError, "ambiguous carried inventory match for #{reference}; use an item ID"
+    end
+
+    matches.first.id.to_s
+  end
+
+  def self.binary_owned_candidates(body, prepositions, snapshot)
+    pattern = /\s+(#{prepositions.map { |word| Regexp.escape(word) }.join('|')})\s+/i
+    candidates = []
+    body.to_enum(:scan, pattern).each do
+      match = Regexp.last_match
+      left = body[0...match.begin(0)]
+      right = body[match.end(0)..]
+      next unless explicit_owned_reference?(left) && explicit_owned_reference?(right)
+
+      begin
+        candidates << [
+          owned_item_id(left, snapshot),
+          match[1].downcase,
+          owned_item_id(right, snapshot)
+        ]
+      rescue SequenceOwnershipError
+        next
+      end
+    end
+    candidates.uniq
+  end
+
+  def self.explicit_owned_reference?(reference)
+    reference.to_s.strip.match?(/\A(?:#[0-9]+|my\s+\S)/i)
+  end
+
+  def self.validate_owned_sequence_command(command)
+    text = command.to_s
+    snapshot = owned_inventory_snapshot
+
+    if (put_match = text.match(/\Aput\s+(.+)\z/i))
+      candidates = binary_owned_candidates(
+        put_match[1],
+        %w[in into on under behind],
+        snapshot
+      ).reject { |item_id, _preposition, destination_id| item_id == destination_id }
+      unless candidates.length == 1
+        raise SequenceOwnershipError, 'put must identify one carried item and one carried destination'
+      end
+
+      return text
+    end
+
+    if (crafting_match = text.match(/\A(pour|dip|wave)\s+(.+)\z/i))
+      verb = crafting_match[1].downcase
+      preposition = { 'pour' => 'on', 'dip' => 'in', 'wave' => 'at' }.fetch(verb)
+      candidates = binary_owned_candidates(crafting_match[2], [preposition], snapshot)
+      unless candidates.length == 1
+        raise SequenceOwnershipError,
+              "#{verb} must identify one carried source and one carried target"
+      end
+
+      return text
+    end
+
+    if (cast_match = text.match(/\Acast\s+at\s+(.+)\z/i))
+      reference = cast_match[1]
+      unless explicit_owned_reference?(reference)
+        raise SequenceOwnershipError, 'cast at requires my ITEM or an exact item ID'
+      end
+      owned_item_id(reference, snapshot)
+      return text
+    end
+
+    if (infuse_match = text.match(/\Ainfuse\s+(.+)\z/i))
+      reference = infuse_match[1]
+      unless explicit_owned_reference?(reference)
+        raise SequenceOwnershipError, 'infuse requires my ITEM or an exact item ID'
+      end
+      owned_item_id(reference, snapshot)
+      return text
+    end
+
+    if (get_match = text.match(/\A(get|take)\s+(.+)\z/i))
+      body = get_match[2]
+      candidates = binary_owned_candidates(body, ['from'], snapshot).select do |item_id, _preposition, source_id|
+        snapshot.fetch(:parents).fetch(item_id, []).include?(source_id)
+      end
+      if candidates.length == 1
+        return text
+      end
+      raise SequenceOwnershipError, 'get/take source is not the carried parent' if body.match?(/\s+from\s+/i)
+
+      unless explicit_owned_reference?(body)
+        raise SequenceOwnershipError, 'get/take requires my ITEM or an exact item ID'
+      end
+      owned_item_id(body, snapshot)
+      return text
+    end
+
+    if (unary_match = text.match(/\A(remove|wear|stow|sheath|gird|open|close)\s+(.+)\z/i))
+      reference = unary_match[2]
+      unless explicit_owned_reference?(reference)
+        raise SequenceOwnershipError, "#{unary_match[1].downcase} requires my ITEM or an exact item ID"
+      end
+      owned_item_id(reference, snapshot)
+      return text
+    end
+
+    text
+  end
+
+  def self.action_commands(action)
+    if action.key?(:commands)
+      commands = action.fetch(:commands)
+      unless commands.is_a?(Array) && commands.length.between?(2, MAX_SEQUENCE_COMMANDS)
+        raise ArgumentError, "sequence must contain 2-#{MAX_SEQUENCE_COMMANDS} commands"
+      end
+      normalized = commands.map do |command|
+        text = command.to_s
+        if text.empty? || text.length > 160 || text.match?(/[\x00\r\n]/)
+          raise ArgumentError, 'sequence contains an invalid command'
+        end
+        text
+      end
+      if normalized.sum(&:length) > MAX_SEQUENCE_LENGTH
+        raise ArgumentError, "sequence exceeds #{MAX_SEQUENCE_LENGTH} characters"
+      end
+      normalized
+    else
+      [action.fetch(:command).to_s]
+    end
+  end
+
+  def self.action_description(action)
+    commands = action_commands(action)
+    return commands.first if commands.length == 1
+
+    commands.each_with_index.map { |command, index| "[#{index + 1}] #{command}" }.join(' -> ')
+  rescue
+    'invalid action payload'
+  end
+
+  def self.sequence_failure_response?(response)
+    response == false || SEQUENCE_FAILURE.match?(response.to_s)
+  end
+
+  def self.execute_action_sequence(action, commands)
+    expected_room = action[:expected_room_id]
+    commands.each_with_index do |command, index|
+      # Establish capture only after Lich's authoritative RT clocks clear.
+      # Otherwise fput may retry a command internally after an RT rejection,
+      # and that invisible retry bypasses the per-command inventory handoff.
+      waitrt?
+      waitcastrt?
+      step = index + 1
+      unless @actions_enabled
+        report_action(action, 'failed', "sequence stopped before step #{step}: local kill switch is off")
+        return
+      end
+      unless action.fetch(:character).casecmp?(character_name)
+        report_action(action, 'failed', "sequence stopped before step #{step}: character changed")
+        return
+      end
+      if commands.any? { |candidate| %w[info skills].include?(candidate.downcase) } &&
+         action[:generation] != session_generation
+        report_action(action, 'failed', "sequence stopped before step #{step}: session generation changed")
+        return
+      end
+      if Time.now.to_f >= action.fetch(:expires_at).to_f
+        report_action(action, 'failed', "sequence expired before step #{step}")
+        return
+      end
+      if expected_room && expected_room.to_s != room_fingerprint
+        report_action(action, 'failed', "sequence stopped before step #{step}: room changed")
+        return
+      end
+      unless safe_sequence_command?(command)
+        report_action(action, 'failed', "sequence step #{step} was rejected locally")
+        @actions_enabled = false
+        display('sequence rejected locally; kill switch engaged')
+        return
+      end
+      begin
+        executable_command = validate_owned_sequence_command(command)
+      rescue SequenceOwnershipError => error
+        report_action(action, 'failed', "sequence step #{step} ownership check failed: #{error.message}")
+        display("sequence ownership check failed at step #{step}/#{commands.length}")
+        return
+      end
+
+      prepare_inventory_capture(executable_command)
+      response = send_sequence_command(executable_command, timeout: 20)
+      if sequence_failure_response?(response)
+        detail = response == false ? 'no accepted game response' : response.to_s
+        report_action(action, 'failed', "sequence stopped at step #{step}: #{detail}")
+        display("sequence failed at step #{step}/#{commands.length}: #{command}")
+        return
+      end
+    end
+    publish_snapshot(force: true)
+    report_action(action, 'completed', "sequence sent #{commands.length}/#{commands.length} commands")
+    display("executed sequence [#{action.fetch(:action_id)}]: #{commands.length} commands")
+  end
+
+  def self.report_action(action, outcome, detail)
+    action_request(
+      '/v1/actions/result',
+      {
+        action_id: action.fetch(:action_id),
+        character: character_name,
+        generation: session_generation,
+        outcome: outcome,
+        detail: detail.to_s[0, 500]
+      }
+    )
+  rescue => error
+    Lich.log("lab bridge result report failed: #{error.class}: #{error.message}")
+  end
+
+  def self.inventory_objects
+    owned_inventory_objects
+  end
+
+  def self.normalize_item_name(name)
+    name.to_s.sub(/\A(?:a|an|some)\s+/i, '').gsub(/\s+/, ' ').strip.downcase
+  end
+
+  def self.resolve_exact_items(query)
+    if (id_match = query.to_s.strip.match(/\A#([0-9]+)\z/))
+      return inventory_objects.select { |item| item.id.to_s == id_match[1] }
+    end
+
+    normalized_query = normalize_item_name(query)
+    inventory_objects.select do |item|
+      [item.name, item.full_name].any? do |candidate|
+        normalize_item_name(candidate) == normalized_query
+      end
+    end
+  end
+
+  def self.inspect_exact_item(action, query)
+    matches = resolve_exact_items(query)
+    if matches.empty?
+      display("no exact inventory match for: #{query}")
+    else
+      matches.each do |item|
+        display("item match: id=##{item.id} noun=#{item.noun} name=#{item.name} full_name=#{item.full_name}")
+      end
+    end
+    report_action(action, 'completed', "exact item matches=#{matches.length}")
+    display("executed [#{action.fetch(:action_id)}]: inspect item exact")
+  end
+
+  def self.diagnose_exact_item(action, spell_number, query)
+    matches = resolve_exact_items(query)
+    unless matches.length == 1
+      detail = "expected one exact inventory match for #{query}, found #{matches.length}"
+      report_action(action, 'failed', detail)
+      display(detail)
+      return
+    end
+
+    item = matches.first
+    prepared = dothistimeout(
+      "prepare #{spell_number}",
+      5,
+      /Your spell is ready\.|already preparing|You (?:can't|cannot)|unable to prepare/i
+    )
+    unless prepared =~ /Your spell is ready\./i
+      detail = "could not prepare #{spell_number} for exact item ##{item.id}"
+      report_action(action, 'failed', detail)
+      display(detail)
+      return
+    end
+
+    diagnostic = capture_diagnostic(
+      spell_number.to_s,
+      item.id.to_s,
+      action.fetch(:action_id),
+      item
+    ) do
+      fput("cast at ##{item.id}")
+    end
+    outcome = diagnostic[:published] ? 'succeeded' : 'failed'
+    detail = if diagnostic[:published]
+               "captured #{spell_number} evidence for exact item ##{item.id}"
+             else
+               "cast #{spell_number} at exact item ##{item.id}; attributable evidence unavailable"
+             end
+    report_action(action, outcome, detail)
+    display("executed [#{action.fetch(:action_id)}]: diagnose item #{spell_number} exact #{query}")
+  end
+
+  def self.examine_exact_id(action, method, object_id)
+    matches = resolve_exact_items("##{object_id}")
+    unless matches.length == 1
+      detail = "expected one live inventory item ##{object_id}, found #{matches.length}"
+      report_action(action, 'failed', detail)
+      display(detail)
+      return
+    end
+
+    command = "#{method} ##{object_id}"
+    prepare_inventory_capture(command)
+    diagnostic = capture_diagnostic(
+      method,
+      object_id,
+      action.fetch(:action_id),
+      matches.first
+    ) { fput(command) }
+    outcome = diagnostic[:published] ? 'succeeded' : 'failed'
+    detail = if diagnostic[:published]
+               "captured #{method} evidence for exact item ##{object_id}"
+             else
+               "sent #{method} for exact item ##{object_id}; attributable evidence unavailable"
+             end
+    report_action(action, outcome, detail)
+    display("executed [#{action.fetch(:action_id)}]: #{command}")
+  end
+
+  def self.inspect_ready_weapon_links(action)
+    path = "/tmp/lab-ready-links-#{Process.pid}.xml"
+    File.delete(path) if File.exist?(path)
+    @raw_capture_path = path
+    @raw_capture_until = Time.now + 3
+    fput('ready weapon set')
+    sleep 1
+    @raw_capture_until = Time.at(0)
+    @raw_capture_path = nil
+    report_action(action, 'completed', "raw ready links captured at #{path}")
+    display('captured READY link metadata locally for inspection')
+    display("executed [#{action.fetch(:action_id)}]: inspect ready weapon links")
+  rescue => error
+    @raw_capture_until = Time.at(0)
+    @raw_capture_path = nil
+    raise error
+  end
+
+  # Commands sent with fput from this script do not traverse another script's
+  # UpstreamHook.  Explicitly notify the inventory knowledge seam before an
+  # item examination or Scroll Infusion operation so its downstream response
+  # can be attributed to the exact physical dossier, including duplicate-looking
+  # objects selected by ID.
+  def self.prepare_inventory_capture(command)
+    normalized = command.to_s
+    knowledge = normalized.match(
+      /\A(?:assess|inspect|analyze|look|read|appraise|recall)\s+(.+)\z/i
+    )
+    if knowledge
+      return false unless defined?(LabInventory) && LabInventory.respond_to?(:begin_capture)
+
+      LabInventory.begin_capture(normalized, knowledge[1])
+      return true
+    end
+
+    scroll_operation = normalized.match?(
+      /\A(?:wave\s+.+?\s+at\s+.+|infuse\s+.+)\z/i
+    )
+    return false unless scroll_operation
+    return false unless defined?(LabInventory) && LabInventory.respond_to?(:begin_scroll_operation_capture)
+
+    LabInventory.begin_scroll_operation_capture(normalized)
+    true
+  rescue => error
+    Lich.log("lab bridge inventory capture notification failed: #{error.class}: #{error.message}")
+    false
+  end
+
+  def self.execute_controller_action(broker_action, match)
+    controller = match.controller
+    controller_action = match.action
+    execution_id = broker_action.fetch(:action_id).to_s
+    unless controller.characters.any? { |name| name.casecmp?(character_name) }
+      report_action(
+        broker_action,
+        'failed',
+        "#{controller.name} controller is unavailable for #{character_name}"
+      )
+      return
+    end
+
+    case controller_action.kind
+    when 'launch'
+      owners = controller.owner_scripts.select { |name| Script.running?(name) }
+      unless owners.empty?
+        report_action(
+          broker_action,
+          'failed',
+          "another controller owner is already running: #{owners.join(', ')}"
+        )
+        return
+      end
+      clear_controller_result(controller)
+      set_controller_signal(controller, false) if controller.signal_global
+      set_script_status(controller.script, "starting:#{execution_id}")
+      unless launch_controller(controller, controller_action, match.script_args)
+        set_script_status(controller.script, "failed:#{execution_id}")
+        publish_snapshot(force: true)
+        report_action(broker_action, 'failed', "#{controller.script} did not start")
+        return
+      end
+      monitor_controller(controller, execution_id: execution_id)
+      publish_snapshot(force: true)
+      report_action(
+        broker_action,
+        'completed',
+        "#{controller.script} started; outcome requires attributed controller result"
+      )
+      display("#{controller.name} [#{execution_id}] started")
+    when 'stop'
+      Script.kill(controller.script) if Script.running?(controller.script)
+      set_script_status(controller.script, 'stopped')
+      publish_snapshot(force: true)
+      report_action(broker_action, 'completed', "#{controller.script} stopped")
+    when 'signal'
+      unless Script.running?(controller.script)
+        report_action(broker_action, 'failed', "no #{controller.script} is running")
+        return
+      end
+      set_controller_signal(controller, true)
+      set_script_status(controller.script, 'return_requested')
+      publish_snapshot(force: true)
+      report_action(
+        broker_action,
+        'completed',
+        "signal delivered; #{controller.script} retains ownership until safe handoff"
+      )
+    when 'status'
+      status = Script.running?(controller.script) ? 'running' : 'stopped'
+      result = normalized_controller_result(
+        controller,
+        fallback_code: 'no_result',
+        fallback_message: 'no completed controller result'
+      )
+      set_script_status(controller.script, status)
+      detail = "#{controller.script} #{status}: #{result.fetch(:message)}"
+      report_action(broker_action, 'completed', detail)
+      display(detail)
+    when 'sync'
+      if Script.running?(controller.script)
+        report_action(broker_action, 'failed', "#{controller.script} is already running")
+        return
+      end
+      clear_controller_result(controller)
+      Script.run(controller.script, match.script_args, { quiet: true })
+      result = normalized_controller_result(controller)
+      set_script_status(controller.script, result.fetch(:code))
+      publish_snapshot(force: true)
+      publish_controller_result(controller, execution_id, result)
+      outcome = result.fetch(:ok) ? 'completed' : 'failed'
+      report_action(broker_action, outcome, result.fetch(:message))
+      display("#{controller.name}: #{result.fetch(:message)}")
+    else
+      report_action(broker_action, 'failed', 'unsupported controller action kind')
+    end
+  end
+
+  def self.execute_action(action)
+    @execution_mutex.synchronize do
+      commands = action_commands(action)
+      command = commands.first
+      defer_snapshot = false
+      unless @actions_enabled
+        report_action(action, 'failed', 'local kill switch is off')
+        return
+      end
+      unless action.fetch(:character).casecmp?(character_name)
+        report_action(action, 'failed', 'character changed before execution')
+        return
+      end
+      unless commands.all? { |candidate| safe_action_command?(candidate) }
+        report_action(action, 'failed', 'Lich-side allowlist rejected command')
+        @actions_enabled = false
+        display('action rejected locally; kill switch engaged')
+        return
+      end
+      if Time.now.to_f >= action.fetch(:expires_at).to_f
+        report_action(action, 'failed', 'action expired before execution')
+        return
+      end
+      expected_room = action[:expected_room_id]
+      if expected_room && expected_room.to_s != room_fingerprint
+        report_action(action, 'failed', 'room changed before execution')
+        return
+      end
+
+      if commands.all? { |candidate| %w[info skills].include?(candidate.downcase) }
+        execute_action_sequence(action, commands)
+        return
+      end
+
+      if commands.length > 1
+        unless commands.all? { |candidate| safe_sequence_command?(candidate) }
+          report_action(action, 'failed', 'Lich-side sequence allowlist rejected command')
+          @actions_enabled = false
+          display('sequence rejected locally; kill switch engaged')
+          return
+        end
+        execute_action_sequence(action, commands)
+        return
+      end
+
+      if command.casecmp?('inspect ready weapon links')
+        inspect_ready_weapon_links(action)
+        return
+      elsif (inspection_match = command.match(/\Ainspect item exact (.+)\z/i))
+        inspect_exact_item(action, inspection_match[1])
+        return
+      elsif (diagnostic_match = command.match(/\Adiagnose item (405|735) exact (.+)\z/i))
+        diagnose_exact_item(action, diagnostic_match[1], diagnostic_match[2])
+        return
+      elsif (exact_examination = command.match(/\A(look|inspect) #([0-9]+)\z/i))
+        examine_exact_id(action, exact_examination[1].downcase, exact_examination[2])
+        return
+      elsif (go2_match = command.match(/\Ago2 ([0-9]+)\z/i))
+        destination = go2_match[1]
+        Script.run('go2', "#{destination} --disable-confirm", { quiet: true })
+      elsif (go2_setting = command.match(/\Ago2 getsilvers (on|off)\z/i))
+        Script.run('go2', "getsilvers=#{go2_setting[1].downcase}", { quiet: true })
+      elsif command.casecmp?('eloot keep closed on')
+        Script.run('eloot', 'settings keep_closed true', { quiet: true })
+      elsif command.casecmp?('eloot loot')
+        unless Script.running?('eloot')
+          execution_id = action.fetch(:action_id).to_s
+          set_script_status('eloot', "starting:#{execution_id}")
+          Script.run('eloot', nil, { quiet: true })
+          monitor = monitor_script_completion('eloot', execution_id: execution_id)
+          monitor.join(22)
+          status = @script_status_mutex.synchronize { @script_status['eloot'] }
+          unless status == "completed:#{execution_id}"
+            report_action(action, 'failed', "eloot did not complete: #{status}")
+            return
+          end
+          defer_snapshot = true
+        end
+      elsif command.casecmp?('eloot sell')
+        Script.run('eloot', 'sell', { quiet: true })
+      elsif command.casecmp?('eloot stop')
+        Script.kill('eloot') if Script.running?('eloot')
+        set_script_status('eloot', 'stopped')
+      elsif command.casecmp?('eherbs heal')
+        staunching = defined?(Spell) && Spell.respond_to?(:[]) && Spell[9909]&.active?
+        unless staunching
+          report_action(action, 'failed', 'Sign of Staunching is not active; refusing EHerbs recovery')
+          return
+        end
+        if Script.running?('eherbs')
+          report_action(action, 'failed', 'eherbs is already running')
+          return
+        end
+        execution_id = action.fetch(:action_id).to_s
+        set_script_status('eherbs', "starting:#{execution_id}")
+        Script.run('eherbs', '--buy=off --deposit=off --skipscars=on', { quiet: true })
+        monitor = monitor_script_completion(
+          'eherbs',
+          execution_id: execution_id,
+          completion_timeout: 90
+        )
+        monitor.join(92)
+        status = @script_status_mutex.synchronize { @script_status['eherbs'] }
+        unless status == "completed:#{execution_id}"
+          report_action(action, 'failed', "eherbs did not complete: #{status}")
+          return
+        end
+        defer_snapshot = true
+      elsif command.casecmp?('bigshot start')
+        unless launch_bigshot
+          report_action(action, 'failed', 'bigshot did not start')
+          return
+        end
+      elsif command.casecmp?('bigshot stop')
+        Script.kill('bigshot') if Script.running?('bigshot')
+      elsif command.casecmp?('ebounty start')
+        Script.run('ebounty', nil, { quiet: true }) unless Script.running?('ebounty')
+      elsif command.casecmp?('ebounty stop')
+        Script.kill('ebounty') if Script.running?('ebounty')
+      elsif (controller_match = CONTROLLER_REGISTRY.match(command))
+        execute_controller_action(action, controller_match)
+        return
+      else
+        prepare_inventory_capture(command)
+        fput(command)
+      end
+      publish_snapshot(force: true) unless defer_snapshot
+      report_action(action, 'completed', 'command sent')
+      display("executed [#{action.fetch(:action_id)}]: #{command}")
+    rescue => error
+      report_action(action, 'failed', "#{error.class}: #{error.message}")
+      display("action failed (#{error.message})")
+    end
+  end
+
+  def self.action_loop
+    while @running
+      break if @snapshot_generation_rejected
+      unless @actions_enabled
+        sleep 0.25
+        next
+      end
+
+      begin
+        reconcile_action_registration
+        body = request(
+          :post,
+          '/v1/actions/next',
+          {
+            character: character_name,
+            room_id: room_fingerprint,
+            generation: session_generation,
+            timeout_seconds: 15
+          },
+          read_timeout: 17,
+          authorized: true
+        )
+        action = body[:action]
+        next unless action
+
+        if action[:status] == 'confirmation_required'
+          @pending_approval_id = action.fetch(:action_id)
+          display("approval needed [#{action.fetch(:action_id)}]: #{action_description(action)}")
+          if @auto_approve
+            display('auto-approving allowlisted action')
+            approve_action(action.fetch(:action_id), 'auto')
+          else
+            display('use ;lab approve within a few seconds')
+          end
+        elsif action[:status] == 'execute'
+          execute_action(action)
+        else
+          Lich.log("lab bridge ignored unknown action status: #{action[:status].inspect}")
+        end
+      rescue => error
+        if Time.now - @last_action_error_at > 30
+          Lich.log("lab bridge action polling paused: #{error.class}: #{error.message}")
+          @last_action_error_at = Time.now
+        end
+        sleep 1
+      end
+    end
+  end
+
+  def self.handle_command(command)
+    request = command.to_s.strip
+    case request.downcase
+    when '', 'help'
+      display('usage: , QUESTION | ;lab status|state|scripts|inventory|last|alerts|sources|context|forget | ;lab do item audit #ID | ;lab do hunt prepare | ;lab do room loot | ;lab operation stop | ;lab actions on|off | ;lab approve [ID] | ;lab approve auto [off] | ;lab stop')
+    when 'status'
+      run_command_async { status }
+    when 'state'
+      show_state
+    when 'scripts'
+      show_scripts
+    when 'inventory'
+      show_inventory
+    when 'last'
+      show_last
+    when 'alerts'
+      run_command_async { show_alerts }
+    when 'sources'
+      run_command_async { show_sources }
+    when 'context'
+      run_command_async { show_context }
+    when 'forget'
+      run_command_async { forget_context }
+    when 'do hunt prepare'
+      run_command_async { start_capability('hunt.prepare') }
+    when 'do room loot'
+      run_command_async { start_capability('room.loot') }
+    when /\Ado item audit #?([0-9]+)(?:\s+(.+))?\z/
+      object_id = Regexp.last_match(1)
+      raw_methods = Regexp.last_match(2).to_s
+      methods = raw_methods.empty? ? %w[look inspect] : raw_methods.split(/[ ,]+/)
+      unless methods.all? { |method| %w[look inspect 405 735].include?(method) }
+        display('item audit methods must be look, inspect, 405, or 735')
+        return nil
+      end
+      run_command_async do
+        start_capability('item.audit', { item_id: object_id, methods: methods })
+      end
+    when 'operation stop'
+      run_command_async { stop_capability }
+    when 'actions on'
+      run_command_async { set_actions(true) }
+    when 'actions off'
+      @actions_enabled = false
+      @pending_approval_id = nil
+      @auto_approve = false
+      run_command_async { set_actions(false) }
+    when 'approve auto', 'approve auto on'
+      @auto_approve = true
+      display('auto-approve ON for allowlisted actions; use ;lab approve auto off to disable')
+    when 'approve auto off'
+      @auto_approve = false
+      display('auto-approve OFF')
+    when 'approve'
+      if @pending_approval_id
+        action_id = @pending_approval_id
+        run_command_async { approve_action(action_id) }
+      else
+        display('no pending action to approve')
+      end
+    when /\Aapprove\s+([0-9a-f]{16})\z/
+      action_id = Regexp.last_match(1)
+      run_command_async { approve_action(action_id) }
+    when /\Aask\s+(.+)\z/i
+      question = Regexp.last_match(1).strip
+      run_command_async { ask(question) }
+    when /\Ainventory\s+(.+)\z/i
+      if defined?(LabInventory) && LabInventory.respond_to?(:handle_request)
+        LabInventory.handle_request(Regexp.last_match(1))
+      else
+        display('inventory tracker is not ready')
+      end
+    else
+      display("unknown command '#{request}'; use ;lab help")
+    end
+    nil
+  rescue => error
+    Lich.log("LAB bridge command error: #{error.class}: #{error.message}")
+    display("command failed: #{error.message}")
+    nil
+  end
+
+  def self.handle_input(client_string)
+    command = client_string.sub(/\A<c>/, '').strip
+    if command.match?(/\A,sol(?:\s|\z)/i)
+      display('Sol was renamed; use ;lab for bridge commands or , QUESTION to talk')
+      return nil
+    end
+
+    match = command.match(/\A,\s*(.*)\z/m)
+    return client_string unless match
+
+    question = match[1].to_s.strip
+    if question.empty?
+      display('usage: , QUESTION')
+    else
+      Thread.new { ask(question) }
+    end
+    nil
+  rescue => error
+    Lich.log("LAB bridge input error: #{error.class}: #{error.message}")
+    display("question failed: #{error.message}")
+    nil
+  end
+
+  def self.stop
+    @running = false
+    @actions_enabled = false
+    @pending_approval_id = nil
+    @auto_approve = false
+    @command_queue << nil
+    @sequence_response_mutex.synchronize { @sequence_response_cv.broadcast }
+    UpstreamHook.remove(UPSTREAM_HOOK)
+    DownstreamHook.remove(DOWNSTREAM_HOOK)
+  end
+end
+
+unless ENV['LAB_BRIDGE_LIBRARY_ONLY'] == '1'
+  before_dying { LichAgentBridge.stop }
+  UpstreamHook.add(LichAgentBridge::UPSTREAM_HOOK, proc { |line| LichAgentBridge.handle_input(line) }, persist: false)
+  DownstreamHook.add(LichAgentBridge::DOWNSTREAM_HOOK, proc { |line| LichAgentBridge.capture(line) }, persist: false)
+  Thread.new { LichAgentBridge.command_loop }
+  Thread.new { LichAgentBridge.publish_loop }
+  Thread.new do
+    begin
+      LichAgentBridge.publish_snapshot(force: true)
+    rescue => error
+      Lich.log("LAB bridge initial snapshot unavailable: #{error.class}: #{error.message}")
+    end
+    LichAgentBridge.set_actions(true) unless LichAgentBridge.instance_variable_get(:@snapshot_generation_rejected)
+    LichAgentBridge.action_loop
+  end
+  LichAgentBridge.ensure_inventory_tracker
+
+  LichAgentBridge.display('agent bridge started; enabling actions and allowlisted auto-approval; use , QUESTION or ;lab status')
+  sleep while true
+end

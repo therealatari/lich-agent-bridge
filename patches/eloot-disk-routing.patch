@@ -1,0 +1,30 @@
+--- a/scripts/eloot.lic
++++ b/scripts/eloot.lic
+@@ -2540,9 +2540,11 @@
+   def self.disk_usage
+     return unless ELoot.data.settings[:use_disk]
+-    return if DownstreamHook.list.include?("eloot_diskintegration")
+
+-    # Initial check to see if the disk is in the room
++    # Each invocation must seed its own current disk reference before reusing
++    # the persistent integration hook.  Otherwise a later ELoot run can skip
++    # disk discovery merely because an earlier run installed the hook.
+     ELoot.data.disk = Disk.mine.nil? ? nil : GameObj[Disk.mine.id]
++    return if DownstreamHook.list.include?("eloot_diskintegration")
+
+     eloot_diskintegration = proc { |server|
+       case server
+@@ -7067,6 +7069,13 @@
+
+       Inventory.free_hands(both: true) unless [GameObj.right_hand, GameObj.left_hand].find { |hand| hand.type =~ /box/ }
+       ELoot.wait_for_disk
++
++      # The disk follows travel asynchronously.  It may have been absent when
++      # process_boxes built its first list and arrive only after go2 reaches
++      # the pool.  Refresh at the point of submission so those boxes cannot
++      # miss the pool phase and fall through to the town locksmith.
++      refreshed_boxes = ELoot.find_boxes
++      boxes = (refreshed_boxes + boxes).uniq { |box| box.id }
+
+       boxes.each do |box|
+         Inventory.drag(box) unless [GameObj.right_hand, GameObj.left_hand].find { |hand| hand.type =~ /box/ }

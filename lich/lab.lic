@@ -1,0 +1,67 @@
+=begin
+  Lich Agent Bridge command dispatcher.
+
+  Start:             ;lab
+  Ask:               , QUESTION
+  Commands:          ;lab help
+  Stop:              ;lab stop
+
+  The long-lived bridge runs as the hidden lab-bridge script. This dispatcher
+  stays short-lived so management commands continue to work while the bridge
+  is active.
+
+  project: https://github.com/therealatari/lich-agent-bridge
+  version: 0.1.0
+     game: gs
+=end
+
+def lab_dispatcher_display(message)
+  message.to_s.each_line { |line| respond("--- LAB: #{line.chomp}") }
+end
+
+def lab_dispatcher_help
+  lab_dispatcher_display(
+    "talk: , QUESTION\n" \
+    "start: ;lab or ;lab start\n" \
+    "inspect: ;lab status | state | scripts | inventory | last | alerts | sources | context\n" \
+    "capabilities: ;lab do item audit #ID | do hunt prepare | do room loot\n" \
+    "control: ;lab operation stop | actions on|off | approve [ID] | " \
+    "approve auto [off]\n" \
+    "memory: ;lab forget (clears this character's temporary dialogue only)\n" \
+    "explicit question: ;lab ask QUESTION\n" \
+    'stop: ;lab stop'
+  )
+end
+
+command = Script.current.vars[0].to_s.strip
+
+case command.downcase
+when '', 'start'
+  if Script.running?('lab-bridge')
+    lab_dispatcher_display('agent bridge is already running')
+  elsif Script.start('lab-bridge')
+    lab_dispatcher_display('starting agent bridge')
+  else
+    lab_dispatcher_display('could not start lab-bridge')
+  end
+when 'help'
+  lab_dispatcher_help
+when 'stop'
+  if Script.running?('lab-bridge')
+    Script.kill('lab-bridge')
+    lab_dispatcher_display('agent bridge stopped')
+  else
+    lab_dispatcher_display('agent bridge is not running')
+  end
+else
+  unless Script.running?('lab-bridge')
+    lab_dispatcher_display('agent bridge is not running; use ;lab start')
+    exit
+  end
+  unless defined?(LichAgentBridge) && LichAgentBridge.respond_to?(:handle_command)
+    lab_dispatcher_display('agent bridge is still initializing; try again')
+    exit
+  end
+
+  LichAgentBridge.handle_command(command)
+end

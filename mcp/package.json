@@ -1,0 +1,28 @@
+{
+  "name": "lich-agent-bridge-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "license": "GPL-3.0-only",
+  "type": "module",
+  "description": "Local Streamable HTTP MCP adapter for LAB SessionHub",
+  "scripts": {
+    "generate:sdk-types": "tsx scripts/generate-sdk-types.ts",
+    "check:sdk-types": "tsx scripts/check-sdk-types.ts",
+    "test": "tsx --test test/**/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json && cp src/executor-child.cjs dist/executor-child.cjs",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "express": "^5.2.1",
+    "isolated-vm": "^6.1.2",
+    "typescript": "^6.0.0",
+    "zod": "~4.3.6"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.0.0",
+    "tsx": "^4.20.6"
+  }
+}

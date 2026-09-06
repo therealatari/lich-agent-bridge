@@ -1,0 +1,1517 @@
+=begin
+  LAB Inventory: persistent live inventory state and item knowledge for Lich.
+
+  Run once per character session:
+    ;lab-inventory
+
+  Query from the game client through the LAB dispatcher:
+    ;lab inventory status
+    ;lab inventory count acantha
+    ;lab inventory show maul
+    ;lab inventory find stamina
+    ;lab inventory focus necklace
+    ;lab inventory focus off
+    ;lab inventory learn necklace | bard loresong by CHARACTER
+    ;lab inventory learn done
+    ;lab inventory note necklace | tested while worn: +5 CON bonus
+    ;lab inventory set necklace | effect = +5 Constitution bonus while worn
+    ;lab inventory scroll #12345 used
+    ;lab inventory scroll #12345
+
+  Other project scripts use the small LabInventory.query, .dose_for, and
+  .remember interface.  Session object IDs are never treated as durable item
+  identities.
+
+  Item-property adapters are informed by the community bodega.lic, assess.lic,
+  enhdetect.lic, enhancives.lic, ECTracker.lic, trix.lic, and elore.lic scripts.
+  Their authors and contributors retain credit for the mature game-output
+  knowledge that made this implementation practical.
+
+  project: https://github.com/therealatari/lich-agent-bridge
+  version: 0.1.0
+     game: gs
+=end
+
+require 'cgi'
+require 'digest'
+require 'fileutils'
+require 'json'
+require 'sqlite3'
+require 'time'
+
+module LabInventory
+  SCHEMA_VERSION = 3
+  LEGACY_COMMAND_PREFIX = /\A,sli(?:\s|\z)/i
+  KNOWLEDGE_COMMAND = /\A(?:assess|inspect|analyze|look|read|appraise|recall)\s+(.+)\z/i
+  SCROLL_WAVE_COMMAND = /\Awave\s+(.+?)\s+at\s+(.+)\z/i
+  SCROLL_INFUSE_COMMAND = /\Ainfuse\s+(.+)\z/i
+  SCROLL_DETECTION_LINE = /\A\((\d+)\)\s+(.+?)\s+with\s+(.+?)\s+charges?\s+remaining(?:\s+and\s+the\s+potential\s+to\s+add\s+(.+?)\s+charges?)?\.?\z/i
+  SCROLL_DETECTION_TIME_LINE = /\A\((\d+)\)\s+(.+?)\s+with\s+(.+?)\s+of\s+time\s+remaining\.?\z/i
+  MAX_FACTS = 100
+  MAX_OBSERVATIONS = 100
+  ITEM_PROPERTIES = {
+    'required_skill' => /requires skill in (.*?) to use effectively/i,
+    'enchant_bonus' => /imparts a bonus of \+(\d+) more than usual/i,
+    'weight_pounds' => /appears to weigh about (\d+) pounds?/i,
+    'material' => /(?:mainly crafted out of|predominantly crafted of) (.*?)(?:\.|,)/i,
+    'activation' => /could be activated by (\w+)ing it/i,
+    'embedded_spell' => /(?:currently imbedded with the|imbedded with the) (.*?) spell/i,
+    'remaining_charges_description' => /looks to have (.*?) charges remaining/i,
+    'flare' => /(?:been infused with|contains) (.*?flare.*?)\./i,
+    'td_bonus' => /protects against magical attacks with a bonus of (\d+)/i,
+    'sanctify_tier' => /has been sanctified (\d+) times?/i,
+    'ensorcell_tier' => /has been ensorcelled (\d+) times?/i,
+    'damage_padding' => /(somewhat|fairly|heavily|very heavily|masterfully) padded to lessen the damage/i,
+    'critical_padding' => /(somewhat|fairly|heavily|very heavily|masterfully) padded against critical blows/i,
+    'damage_weighting' => /(lightly|somewhat|fairly|heavily|very heavily|exceptionally|masterfully) weighted to inflict more damage/i,
+    'critical_weighting' => /(lightly|somewhat|fairly|heavily|very heavily|exceptionally|masterfully) weighted to inflict more (?:critical wounds|critical blows)/i,
+    'sighting' => /(somewhat|fairly|heavily|very heavily) sighted to assist in aiming/i
+  }.freeze
+  ITEM_FLAGS = {
+    'maximum_depth' => /pockets could not possibly get any deeper/i,
+    'maximum_lightening' => /as light as it can get/i,
+    'persists_when_depleted' => /will persist after its last (?:enhancive )?charge is depleted/i,
+    'crumbles_when_depleted' => /(?:crumble|disintegrate).*after its last (?:enhancive )?charge is depleted/i,
+    'imbeddable' => /magical item which could be imbedded with a spell/i,
+    'holy_item' => /It is a holy item/i,
+    'magic_resistant' => /It is magic resistant/i,
+    'scripted' => /Additional scripts have been applied|unknown \(scripted\) benefit|Custom.*script/i
+  }.freeze
+
+  @mutex = Mutex.new
+  @running = false
+  @dirty = false
+  @loaded = false
+  @dossiers = {}
+  @persisted_dossier_signatures = {}
+  @session_index = {}
+  @locations = {}
+  @container_seen_at = {}
+  @using_item_id = nil
+  @last_left_hand_id = nil
+  @capture = nil
+  @focused_local_id = nil
+  @transcript = nil
+  @session_id = nil
+
+  class << self
+    # Lich's live XML objects may expose byte strings (ASCII-8BIT) even when
+    # their contents are UTF-8. sqlite3 binds those as BLOB values, which makes
+    # visually identical character names and object IDs compare unequal to
+    # imported JSON TEXT. Canonicalize every live/persisted text boundary.
+    def utf8(value)
+      string = value.to_s
+      return string if string.encoding == Encoding::UTF_8 && string.valid_encoding?
+
+      if string.encoding == Encoding::ASCII_8BIT
+        return string.dup.force_encoding(Encoding::UTF_8).scrub
+      end
+
+      string.encode(Encoding::UTF_8, invalid: :replace, undef: :replace)
+    end
+
+    def display(message)
+      message.to_s.each_line { |line| respond("--- LAB Inventory: #{line.chomp}") }
+    end
+
+    def character_name
+      name = utf8(XMLData.name)
+      name.empty? ? 'Unknown' : name
+    end
+
+    def game_name
+      game = utf8(XMLData.game)
+      game.empty? ? 'Unknown' : game
+    end
+
+    def data_path
+      File.join(DATA_DIR, game_name, 'lab-inventory.sqlite3')
+    end
+
+    def legacy_data_path(character = character_name)
+      File.join(DATA_DIR, game_name, character, 'lab-inventory.json')
+    end
+
+    def now
+      Time.now.utc.iso8601(3)
+    end
+
+    def normalize(value)
+      utf8(value)
+           .sub(/\A(?:a|an|some)\s+/i, '')
+           .gsub(/\s+/, ' ')
+           .strip
+           .downcase
+    end
+
+    def object_identity(item)
+      {
+        'type' => (item.respond_to?(:type) ? utf8(item.type) : ''),
+        'noun' => utf8(item.noun),
+        'name' => utf8(item.name),
+        'full_name' => utf8(item.full_name)
+      }
+    end
+
+    def fingerprint(identity)
+      [identity['noun'], identity['name'], identity['full_name']].map { |part| normalize(part) }.join('|')
+    end
+
+    def new_local_id(identity)
+      seed = "#{character_name}|#{fingerprint(identity)}|#{Time.now.to_f}|#{rand}"
+      utf8("item-#{Digest::SHA256.hexdigest(seed)[0, 16]}")
+    end
+
+    def blank_dossier(local_id, identity)
+      canonical_identity = {
+        'type' => utf8(identity['type']), 'noun' => utf8(identity['noun']),
+        'name' => utf8(identity['name']), 'full_name' => utf8(identity['full_name'])
+      }
+      {
+        'id' => utf8(local_id),
+        'identity' => canonical_identity,
+        'fingerprint' => fingerprint(canonical_identity),
+        'facts' => [],
+        'observations' => [],
+        'created_at' => now,
+        'updated_at' => now
+      }
+    end
+
+    def database
+      return @database if @database
+
+      FileUtils.mkdir_p(File.dirname(data_path))
+      @database = SQLite3::Database.new(data_path)
+      @persisted_dossier_signatures = {}
+      @database.results_as_hash = true
+      @database.busy_timeout(5_000)
+      @database.execute('PRAGMA foreign_keys = ON')
+      @database.execute('PRAGMA journal_mode = WAL')
+      @database.execute_batch(<<~SQL)
+        CREATE TABLE IF NOT EXISTS schema_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS characters (
+          id INTEGER PRIMARY KEY, game TEXT NOT NULL, name TEXT NOT NULL,
+          UNIQUE(game, name COLLATE NOCASE)
+        );
+        CREATE TABLE IF NOT EXISTS dossiers (
+          id TEXT PRIMARY KEY, character_id INTEGER NOT NULL REFERENCES characters(id),
+          fingerprint TEXT NOT NULL, item_type TEXT, noun TEXT, name TEXT, full_name TEXT,
+          last_game_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_seen_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS dossiers_character_fingerprint ON dossiers(character_id, fingerprint);
+        CREATE TABLE IF NOT EXISTS facts (
+          id INTEGER PRIMARY KEY, dossier_id TEXT NOT NULL REFERENCES dossiers(id) ON DELETE CASCADE,
+          occurrence_key TEXT NOT NULL, ordinal INTEGER NOT NULL, field TEXT NOT NULL, value_json TEXT NOT NULL,
+          source TEXT NOT NULL, confidence TEXT NOT NULL, observed_at TEXT NOT NULL, evidence TEXT,
+          active INTEGER NOT NULL DEFAULT 1, UNIQUE(dossier_id, occurrence_key)
+        );
+        CREATE TABLE IF NOT EXISTS observations (
+          id INTEGER PRIMARY KEY, dossier_id TEXT NOT NULL REFERENCES dossiers(id) ON DELETE CASCADE,
+          occurrence_key TEXT NOT NULL, ordinal INTEGER NOT NULL, text TEXT NOT NULL, source TEXT NOT NULL, observed_at TEXT NOT NULL,
+          active INTEGER NOT NULL DEFAULT 1, UNIQUE(dossier_id, occurrence_key)
+        );
+        CREATE TABLE IF NOT EXISTS doses (
+          dossier_id TEXT PRIMARY KEY REFERENCES dossiers(id) ON DELETE CASCADE,
+          value INTEGER NOT NULL, precision TEXT NOT NULL, source TEXT NOT NULL, observed_at TEXT NOT NULL
+          , active INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS session_locations (
+          dossier_id TEXT NOT NULL REFERENCES dossiers(id) ON DELETE CASCADE, session_id TEXT NOT NULL,
+          kind TEXT NOT NULL, container_game_id TEXT, hand TEXT, game_id TEXT, observed_at TEXT NOT NULL,
+          PRIMARY KEY(dossier_id, session_id)
+        );
+        CREATE TABLE IF NOT EXISTS legacy_imports (
+          source_path TEXT NOT NULL, content_sha256 TEXT NOT NULL, status TEXT NOT NULL,
+          imported_at TEXT NOT NULL, error TEXT, PRIMARY KEY(source_path, content_sha256)
+        );
+        CREATE TABLE IF NOT EXISTS character_baselines (
+          id INTEGER PRIMARY KEY, character_id INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+          captured_at TEXT NOT NULL, source_log TEXT NOT NULL, content_sha256 TEXT NOT NULL,
+          snapshot_json TEXT NOT NULL, UNIQUE(character_id, content_sha256)
+        );
+        CREATE TABLE IF NOT EXISTS character_facts (
+          character_id INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+          field TEXT NOT NULL, value_json TEXT NOT NULL, source TEXT NOT NULL,
+          confidence TEXT NOT NULL, observed_at TEXT NOT NULL, evidence TEXT,
+          PRIMARY KEY(character_id, field)
+        );
+        CREATE TABLE IF NOT EXISTS character_observations (
+          baseline_id INTEGER NOT NULL REFERENCES character_baselines(id) ON DELETE CASCADE,
+          command TEXT NOT NULL, ordinal INTEGER NOT NULL, text TEXT NOT NULL,
+          PRIMARY KEY(baseline_id, command, ordinal)
+        );
+      SQL
+      @database.execute('INSERT OR REPLACE INTO schema_metadata(key, value) VALUES (?, ?)', ['schema_version', SCHEMA_VERSION.to_s])
+      @database
+    end
+
+    def close_database
+      current = @database
+      @database = nil
+      @loaded = false
+      current.close if current && !current.closed?
+    rescue => error
+      Lich.log("lab-inventory database close failed: #{error.class}: #{error.message}")
+    end
+
+    def character_id(name = character_name)
+      canonical_game = utf8(game_name)
+      canonical_name = utf8(name)
+      database.execute('INSERT OR IGNORE INTO characters(game, name) VALUES (?, ?)', [canonical_game, canonical_name])
+      database.get_first_value('SELECT id FROM characters WHERE game = ? AND name = ? COLLATE NOCASE', [canonical_game, canonical_name])
+    end
+
+    def occurrence_key(row, ordinal)
+      Digest::SHA256.hexdigest(JSON.generate(row) + "\u0000#{ordinal}")
+    end
+
+    def import_legacy_states
+      Dir.glob(File.join(DATA_DIR, game_name, '*', 'lab-inventory.json')).sort.each do |path|
+        begin
+          content = File.binread(path)
+          digest = Digest::SHA256.hexdigest(content)
+          parsed = JSON.parse(content)
+          raise 'unsupported legacy inventory schema' unless parsed['schema_version'].to_i == 1
+          owner = parsed['character'].to_s
+          raise 'legacy inventory has no character' if owner.empty?
+          raise 'legacy inventory game mismatch' unless parsed['game'].to_s.casecmp?(game_name)
+
+          # Recheck after acquiring the writer lock.  Two character processes
+          # may discover the same JSON at once; only one imports it and a BUSY
+          # loser must never overwrite the successful import status as failed.
+          database.execute('BEGIN IMMEDIATE')
+          begin
+            imported = database.get_first_value('SELECT 1 FROM legacy_imports WHERE source_path = ? AND content_sha256 = ? AND status = ?', [path, digest, 'imported'])
+            unless imported
+              owner_id = character_id(owner)
+              parsed.fetch('dossiers', {}).each_value do |dossier|
+                import_legacy_dossier(owner_id, dossier)
+              end
+              database.execute('INSERT OR REPLACE INTO legacy_imports(source_path, content_sha256, status, imported_at, error) VALUES (?, ?, ?, ?, NULL)', [path, digest, 'imported', now])
+            end
+            database.commit
+          rescue
+            database.rollback
+            raise
+          end
+        rescue => error
+          digest ||= "unreadable-#{Digest::SHA256.hexdigest(path)}"
+          imported = database.get_first_value('SELECT 1 FROM legacy_imports WHERE source_path = ? AND content_sha256 = ? AND status = ?', [path, digest, 'imported']) rescue nil
+          database.execute('INSERT OR IGNORE INTO legacy_imports(source_path, content_sha256, status, imported_at, error) VALUES (?, ?, ?, ?, ?)', [path, digest, 'failed', now, "#{error.class}: #{error.message}"[0, 500]]) unless imported
+          Lich.log("lab-inventory legacy import failed for #{path}: #{error.class}: #{error.message}")
+        end
+      end
+    end
+
+    def import_legacy_dossier(owner_id, dossier)
+      id = utf8(dossier.fetch('id'))
+      identity = dossier.fetch('identity', {})
+      database.execute(<<~SQL, [id, owner_id, utf8(dossier['fingerprint'] || fingerprint(identity)), utf8(identity['type']), utf8(identity['noun']), utf8(identity['name']), utf8(identity['full_name']), dossier['last_game_id'] && utf8(dossier['last_game_id']), utf8(dossier['created_at'] || now), utf8(dossier['updated_at'] || now), dossier['last_seen_at'] && utf8(dossier['last_seen_at'])])
+        INSERT OR IGNORE INTO dossiers(id, character_id, fingerprint, item_type, noun, name, full_name, last_game_id, created_at, updated_at, last_seen_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      SQL
+      return unless database.changes.positive?
+
+      # Earlier JSON snapshots de-duplicated facts by field/value.  READ output
+      # was retained as observations, however, so recover each numbered spell
+      # line as an occurrence without adding a second copy of the summary fact.
+      imported_dossier = dossier.merge('facts' => legacy_facts_with_spell_occurrences(dossier))
+      persist_dossier_rows(id, imported_dossier, runtime: false)
+    end
+
+    def legacy_facts_with_spell_occurrences(dossier)
+      facts = dossier.fetch('facts', []).map(&:dup)
+      existing = Hash.new(0)
+      facts.each { |fact| existing[[fact['field'], fact['value']]] += 1 }
+      recovered = Hash.new(0)
+      dossier.fetch('observations', []).each do |observation|
+        match = observation['text'].to_s.match(/\A\s*\((\d+)\)\s+(.+?)(?:\s+in vibrant ink)?\s*\z/i)
+        next unless match
+
+        field = "scroll.spell.#{match[1]}"
+        value = match[2].strip
+        recovered[[field, value]] += 1
+        next unless recovered[[field, value]] > existing[[field, value]]
+
+        facts << {
+          'field' => field, 'value' => value, 'source' => observation['source'].to_s,
+          'confidence' => 'observed', 'observed_at' => observation['observed_at'] || now,
+          'evidence' => observation['text'].to_s
+        }
+      end
+      facts
+    end
+
+    def persist_dossier_rows(id, dossier, runtime:)
+      canonical_id = utf8(id)
+      if runtime
+        database.execute('UPDATE facts SET active = 0 WHERE dossier_id = ?', [canonical_id])
+        database.execute('UPDATE observations SET active = 0 WHERE dossier_id = ?', [canonical_id])
+        database.execute('UPDATE doses SET active = 0 WHERE dossier_id = ?', [canonical_id])
+      end
+      fact_counts = Hash.new(0)
+      dossier.fetch('facts', []).each_with_index do |fact, index|
+        signature = [fact['field'], fact['value'], fact['source'], fact['confidence'], fact['evidence']]
+        ordinal = fact_counts[signature] += 1
+        key = occurrence_key(signature, ordinal)
+        database.execute(<<~SQL, [canonical_id, utf8(key), index, utf8(fact['field']), JSON.generate(fact['value']), utf8(fact['source']), utf8(fact['confidence']), utf8(fact['observed_at'] || now), fact['evidence'] && utf8(fact['evidence'])])
+          INSERT INTO facts(dossier_id, occurrence_key, ordinal, field, value_json, source, confidence, observed_at, evidence, active)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+          ON CONFLICT(dossier_id, occurrence_key) DO UPDATE SET ordinal = excluded.ordinal, field = excluded.field, value_json = excluded.value_json, source = excluded.source, confidence = excluded.confidence, observed_at = excluded.observed_at, evidence = excluded.evidence, active = 1
+        SQL
+      end
+      observation_counts = Hash.new(0)
+      dossier.fetch('observations', []).each_with_index do |observation, index|
+        signature = [observation['text'], observation['source']]
+        ordinal = observation_counts[signature] += 1
+        key = occurrence_key(signature, ordinal)
+        database.execute(<<~SQL, [canonical_id, utf8(key), index, utf8(observation['text']), utf8(observation['source']), utf8(observation['observed_at'] || now)])
+          INSERT INTO observations(dossier_id, occurrence_key, ordinal, text, source, observed_at, active)
+          VALUES (?, ?, ?, ?, ?, ?, 1)
+          ON CONFLICT(dossier_id, occurrence_key) DO UPDATE SET ordinal = excluded.ordinal, text = excluded.text, source = excluded.source, observed_at = excluded.observed_at, active = 1
+        SQL
+      end
+      measurement = dossier['dose_measurement']
+      if measurement
+        database.execute('INSERT INTO doses(dossier_id, value, precision, source, observed_at, active) VALUES (?, ?, ?, ?, ?, 1) ON CONFLICT(dossier_id) DO UPDATE SET value = excluded.value, precision = excluded.precision, source = excluded.source, observed_at = excluded.observed_at, active = 1', [canonical_id, measurement['value'].to_i, utf8(measurement['precision']), utf8(measurement['source']), utf8(measurement['observed_at'] || now)])
+      end
+    end
+
+    def load_dossiers_for_current_character
+      owner_id = character_id
+      @dossiers = {}
+      @persisted_dossier_signatures = {}
+      database.execute('SELECT * FROM dossiers WHERE character_id = ?', [owner_id]).each do |row|
+        dossier = blank_dossier(row['id'], {
+          'type' => row['item_type'].to_s, 'noun' => row['noun'].to_s,
+          'name' => row['name'].to_s, 'full_name' => row['full_name'].to_s
+        })
+        dossier['fingerprint'] = row['fingerprint']
+        dossier['last_game_id'] = row['last_game_id']
+        dossier['created_at'] = row['created_at']
+        dossier['updated_at'] = row['updated_at']
+        dossier['last_seen_at'] = row['last_seen_at']
+        dossier['facts'] = database.execute('SELECT * FROM facts WHERE dossier_id = ? AND active = 1 ORDER BY ordinal, id', [row['id']]).last(MAX_FACTS).map do |fact|
+          { 'field' => fact['field'], 'value' => JSON.parse(fact['value_json']), 'source' => fact['source'], 'confidence' => fact['confidence'], 'observed_at' => fact['observed_at'], 'evidence' => fact['evidence'] }.reject { |_key, value| value.nil? }
+        end
+        dossier['observations'] = database.execute('SELECT * FROM observations WHERE dossier_id = ? AND active = 1 ORDER BY ordinal, id', [row['id']]).last(MAX_OBSERVATIONS).map do |observation|
+          { 'text' => observation['text'], 'source' => observation['source'], 'observed_at' => observation['observed_at'] }
+        end
+        dose = database.get_first_row('SELECT * FROM doses WHERE dossier_id = ? AND active = 1', [row['id']])
+        dossier['dose_measurement'] = { 'value' => dose['value'], 'precision' => dose['precision'], 'source' => dose['source'], 'observed_at' => dose['observed_at'] } if dose
+        @dossiers[dossier['id']] = dossier
+      end
+    end
+
+    def load_state
+      return if @loaded
+
+      @loaded = true
+      database
+      import_legacy_states
+      load_dossiers_for_current_character
+    rescue => error
+      Lich.log("lab-inventory state load failed: #{error.class}: #{error.message}")
+      @dossiers = {}
+    end
+
+    def persist
+      @mutex.synchronize do
+        return unless @dirty
+
+        database.transaction
+        begin
+          owner_id = character_id
+          saved_signatures = {}
+          @dossiers.each_value do |dossier|
+            # Compare the entire record: doses and captured observations can
+            # change without advancing updated_at. Only committed signatures
+            # may suppress a write, so failed transactions remain retryable.
+            signature = Digest::SHA256.digest(JSON.generate(dossier))
+            next if @persisted_dossier_signatures[dossier['id']] == signature
+
+            identity = dossier.fetch('identity', {})
+            database.execute(<<~SQL, [utf8(dossier['id']), owner_id, utf8(dossier['fingerprint']), utf8(identity['type']), utf8(identity['noun']), utf8(identity['name']), utf8(identity['full_name']), dossier['last_game_id'] && utf8(dossier['last_game_id']), utf8(dossier['created_at']), utf8(dossier['updated_at']), dossier['last_seen_at'] && utf8(dossier['last_seen_at'])])
+              INSERT INTO dossiers(id, character_id, fingerprint, item_type, noun, name, full_name, last_game_id, created_at, updated_at, last_seen_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              ON CONFLICT(id) DO UPDATE SET fingerprint = excluded.fingerprint, item_type = excluded.item_type, noun = excluded.noun, name = excluded.name, full_name = excluded.full_name, last_game_id = excluded.last_game_id, updated_at = excluded.updated_at, last_seen_at = excluded.last_seen_at
+            SQL
+            persist_dossier_rows(dossier['id'], dossier, runtime: true)
+            saved_signatures[dossier['id']] = signature
+          end
+          database.execute('DELETE FROM session_locations WHERE session_id = ?', [utf8(@session_id)])
+          @locations.each do |local_id, location|
+            next unless location['session_id'] == @session_id
+            database.execute('INSERT INTO session_locations(dossier_id, session_id, kind, container_game_id, hand, game_id, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?)', [utf8(local_id), utf8(@session_id), utf8(location['kind']), location['container_game_id'] && utf8(location['container_game_id']), location['hand'] && utf8(location['hand']), location['game_id'] && utf8(location['game_id']), utf8(location['observed_at'])])
+          end
+          database.commit
+          @persisted_dossier_signatures.merge!(saved_signatures)
+          @dirty = false
+        rescue => error
+          database.rollback
+          @dirty = true
+          Lich.log("lab-inventory state save failed: #{error.class}: #{error.message}")
+        end
+      end
+    end
+
+    def link_object(item)
+      game_id = utf8(item.id)
+      return nil if game_id.empty? || game_id == '0'
+
+      existing = @session_index[game_id]
+      return existing if existing && @dossiers.key?(existing)
+
+      identity = object_identity(item)
+      item_fingerprint = fingerprint(identity)
+      linked_ids = @session_index.values
+      candidates = @dossiers.values.select do |dossier|
+        dossier['fingerprint'] == item_fingerprint && !linked_ids.include?(dossier['id'])
+      end
+
+      # Reusing the same game ID is strong evidence during a script reload.  A
+      # unique fingerprint is acceptable for distinctive gear.  Duplicate
+      # fingerprints remain separate because silently merging two identical
+      # herbs or necklaces would corrupt counts and item knowledge.
+      same_game_id = candidates.select { |dossier| dossier['last_game_id'].to_s == game_id }
+      dossier = if same_game_id.length == 1
+                  same_game_id.first
+                elsif candidates.length == 1
+                  candidates.first
+                end
+
+      unless dossier
+        local_id = new_local_id(identity)
+        dossier = blank_dossier(local_id, identity)
+        @dossiers[local_id] = dossier
+      end
+
+      dossier['identity'] = identity
+      dossier['fingerprint'] = item_fingerprint
+      dossier['last_game_id'] = game_id
+      dossier['last_seen_at'] = now
+      dossier['updated_at'] = now
+      @session_index[game_id] = dossier['id']
+      @dirty = true
+      dossier['id']
+    end
+
+    # Item mutations can replace the session object while leaving the item in
+    # the same hand.  The pre-command capture is stronger evidence than a name
+    # match, so preserve the dossier and rebind the observed post-command ID.
+    # A fingerprint fallback is accepted only when it identifies one object.
+    def reconcile_capture_identity
+      capture = @mutex.synchronize { @capture && @capture.dup }
+      return unless capture && capture['local_id'] && capture['target_game_id']
+
+      old_game_id = utf8(capture['target_game_id'])
+      return if live_objects.any? { |item| utf8(item.id) == old_game_id }
+
+      candidate = case capture['target_hand']
+                  when 'right' then GameObj.right_hand
+                  when 'left' then GameObj.left_hand
+                  end
+      unless candidate
+        matches = live_objects.select do |item|
+          fingerprint(object_identity(item)) == capture['target_fingerprint']
+        end
+        candidate = matches.first if matches.length == 1
+      end
+      return unless candidate
+
+      new_game_id = utf8(candidate.id)
+      return if new_game_id.empty? || new_game_id == '0'
+
+      @mutex.synchronize do
+        dossier = @dossiers[capture['local_id']]
+        next unless dossier
+
+        @session_index.delete_if { |_game_id, local_id| local_id == dossier['id'] }
+        @session_index.delete(new_game_id)
+        identity = object_identity(candidate)
+        dossier['identity'] = identity
+        dossier['fingerprint'] = fingerprint(identity)
+        dossier['last_game_id'] = new_game_id
+        dossier['last_seen_at'] = now
+        dossier['updated_at'] = now
+        @session_index[new_game_id] = dossier['id']
+        add_observation_unlocked(
+          dossier,
+          "session object id changed from ##{old_game_id} to ##{new_game_id} during #{capture['command']}",
+          'item mutation reconciliation'
+        )
+        @dirty = true
+      end
+    end
+
+    def live_objects
+      objects = []
+      objects.concat(Array(GameObj.inv))
+      GameObj.containers.each_value { |items| objects.concat(Array(items)) }
+      objects.concat([GameObj.right_hand, GameObj.left_hand].compact)
+      objects.reject { |item| utf8(item.id).empty? || utf8(item.id) == '0' }.uniq { |item| utf8(item.id) }
+    end
+
+    def sync_live_state
+      @mutex.synchronize do
+        load_state
+        observed_at = now
+
+        @locations.delete_if do |_local_id, location|
+          location['session_id'] == @session_id && %w[worn hand].include?(location['kind'])
+        end
+
+        Array(GameObj.inv).each do |item|
+          local_id = link_object(item)
+          @locations[local_id] = {
+            'kind' => 'worn', 'observed_at' => observed_at,
+            'session_id' => @session_id, 'game_id' => utf8(item.id)
+          } if local_id
+        end
+
+        GameObj.containers.each do |container_id, items|
+          @locations.delete_if do |_local_id, location|
+            location['session_id'] == @session_id &&
+              location['kind'] == 'container' &&
+              utf8(location['container_game_id']) == utf8(container_id)
+          end
+          @container_seen_at[utf8(container_id)] = observed_at
+          Array(items).each do |item|
+            local_id = link_object(item)
+            @locations[local_id] = {
+              'kind' => 'container', 'container_game_id' => utf8(container_id),
+              'observed_at' => observed_at, 'session_id' => @session_id,
+              'game_id' => utf8(item.id)
+            } if local_id
+          end
+        end
+
+        { 'right' => GameObj.right_hand, 'left' => GameObj.left_hand }.each do |hand, item|
+          next unless item && !utf8(item.id).empty? && utf8(item.id) != '0'
+
+          local_id = link_object(item)
+          @locations[local_id] = {
+            'kind' => 'hand', 'hand' => hand, 'observed_at' => observed_at,
+            'session_id' => @session_id, 'game_id' => utf8(item.id)
+          } if local_id
+        end
+      end
+    rescue => error
+      Lich.log("lab-inventory live sync failed: #{error.class}: #{error.message}")
+    end
+
+    def resolve(query, current_only: false)
+      normalized = normalize(query.to_s.gsub(/\A(?:my|the)\s+/i, '').sub(/\A#/, ''))
+      @mutex.synchronize do
+        load_state
+        current_ids = @locations.select { |_id, location| location['session_id'] == @session_id }.keys
+        @dossiers.values.select do |dossier|
+          next false if current_only && !current_ids.include?(dossier['id'])
+
+          # Match Lich's GameObj numeric selector contract: an exact game ID
+          # is not a name substring or a fragment of a random dossier digest.
+          # Otherwise READ #802 can become ambiguous when another local ID
+          # happens to contain "802", losing the targeted item's observation.
+          if normalized.match?(/\A-?\d+\z/)
+            next utf8(dossier['last_game_id']) == normalized
+          end
+
+          identity = dossier.fetch('identity', {})
+          # Session object IDs are valid selectors for a live examination even
+          # though they are never durable identity.  This matters for duplicate
+          # objects such as several identically named "aged scroll" items: a
+          # READ command can target one exact object without taking it out of
+          # its container, and the resulting knowledge must follow that one
+          # dossier.
+          candidates = [
+            dossier['id'], dossier['last_game_id'], identity['noun'],
+            identity['name'], identity['full_name']
+          ]
+          candidates.any? do |candidate|
+            normalized_candidate = normalize(candidate)
+            normalized_candidate == normalized || normalized_candidate.include?(normalized)
+          end
+        end
+      end
+    end
+
+    def search(query, current_only: false)
+      normalized = normalize(query)
+      @mutex.synchronize do
+        load_state
+        current_ids = @locations.select { |_id, location| location['session_id'] == @session_id }.keys
+        @dossiers.values.select do |dossier|
+          next false if current_only && !current_ids.include?(dossier['id'])
+
+          identity = dossier.fetch('identity', {})
+          identity_text = [dossier['id'], identity['noun'], identity['name'], identity['full_name']]
+          fact_text = dossier.fetch('facts', []).flat_map { |fact| [fact['field'], fact['value']] }
+          observation_text = dossier.fetch('observations', []).map { |observation| observation['text'] }
+          (identity_text + fact_text + observation_text).any? { |candidate| normalize(candidate).include?(normalized) }
+        end
+      end
+    end
+
+    def query(term, container: nil)
+      sync_live_state
+      dossiers = resolve(term, current_only: true)
+      @mutex.synchronize do
+        items = dossiers.filter_map do |dossier|
+          location = @locations[dossier['id']]
+          next if container && location['container_game_id'].to_s != container.to_s
+
+          measurement = dossier['dose_measurement']
+          {
+            'id' => dossier['id'],
+            'identity' => dossier['identity'],
+            'location' => location,
+            'doses' => measurement,
+            'facts' => dossier.fetch('facts', []).dup,
+            'scroll_infusion' => scroll_infusion_status(dossier)
+          }
+        end
+        exact = items.filter_map do |item|
+          measurement = item['doses']
+          measurement['value'].to_i if measurement && measurement['precision'] == 'exact'
+        end
+        estimated = items.filter_map do |item|
+          measurement = item['doses']
+          measurement['value'].to_i if measurement && measurement['precision'] == 'estimated'
+        end
+        {
+          'query' => term.to_s,
+          'item_count' => items.length,
+          'known_exact_doses' => exact.sum,
+          'estimated_doses' => estimated.sum,
+          'unmeasured_items' => items.count { |item| item['doses'].nil? },
+          'observed_at' => items.filter_map { |item| item.dig('location', 'observed_at') }.max,
+          'items' => items
+        }
+      end
+    end
+
+    def dose_for(item)
+      sync_live_state
+      @mutex.synchronize do
+        local_id = @session_index[utf8(item.id)] || link_object(item)
+        measurement = @dossiers.dig(local_id, 'dose_measurement')
+        return nil unless measurement && measurement['precision'] == 'exact'
+
+        measurement['value'].to_i
+      end
+    end
+
+    def record_dose(item_or_id, value, precision: 'exact', source: 'game measurement')
+      game_id = item_or_id.respond_to?(:id) ? utf8(item_or_id.id) : utf8(item_or_id).sub(/\A#/, '')
+      @mutex.synchronize do
+        item = live_objects.find { |candidate| utf8(candidate.id) == game_id }
+        local_id = @session_index[game_id]
+        local_id ||= link_object(item) if item
+        return false unless local_id && @dossiers[local_id]
+
+        @dossiers[local_id]['dose_measurement'] = {
+          'value' => value.to_i,
+          'precision' => utf8(precision),
+          'source' => utf8(source),
+          'observed_at' => now
+        }
+        @dossiers[local_id]['updated_at'] = now
+        @dirty = true
+      end
+      true
+    end
+
+    def adjust_dose(game_id, delta)
+      @mutex.synchronize do
+        local_id = @session_index[utf8(game_id)]
+        measurement = @dossiers.dig(local_id, 'dose_measurement')
+        return unless measurement && measurement['precision'] == 'exact'
+
+        measurement['value'] = [measurement['value'].to_i + delta.to_i, 0].max
+        measurement['observed_at'] = now
+        measurement['source'] = 'observed use or transfer'
+        @dirty = true
+      end
+    end
+
+    def invalidate_dose(game_id, reason)
+      @mutex.synchronize do
+        local_id = @session_index[utf8(game_id)]
+        dossier = @dossiers[local_id]
+        return unless dossier
+
+        dossier.delete('dose_measurement')
+        add_observation_unlocked(dossier, "dose count invalidated: #{reason}", 'inventory event')
+        @dirty = true
+      end
+    end
+
+    def invalidate_container_doses(container_id, reason: 'container composition changed')
+      sync_live_state
+      @mutex.synchronize do
+        affected = @locations.filter_map do |local_id, location|
+          local_id if utf8(location['container_game_id']) == utf8(container_id)
+        end
+        affected.each do |local_id|
+          dossier = @dossiers[local_id]
+          next unless dossier&.key?('dose_measurement')
+
+          dossier.delete('dose_measurement')
+          add_observation_unlocked(dossier, "dose count invalidated: #{reason}", 'inventory event')
+        end
+        @dirty = true if affected.any?
+        affected.length
+      end
+    end
+
+    def remember(item_or_query, field, value, source: 'manual', evidence: nil, confidence: 'observed')
+      sync_live_state
+      dossier = if item_or_query.respond_to?(:id)
+                  @mutex.synchronize do
+                    local_id = @session_index[utf8(item_or_query.id)] || link_object(item_or_query)
+                    @dossiers[local_id]
+                  end
+                else
+                  matches = resolve(item_or_query, current_only: false)
+                  matches.first if matches.length == 1
+                end
+      return false unless dossier
+
+      @mutex.synchronize do
+        fact = {
+          'field' => utf8(field),
+          'value' => value,
+          'source' => utf8(source),
+          'confidence' => utf8(confidence),
+          'observed_at' => now
+        }
+        fact['evidence'] = utf8(evidence)[0, 500] if evidence
+        # A numbered spell line is a physical slot, not merely a set member:
+        # a scroll may carry the same spell several times.  Other repeated
+        # observations replace the current value for that field in the
+        # in-memory view, so stale state cannot return after a reload.
+        unless fact['field'].start_with?('scroll.spell.')
+          dossier['facts'].reject! { |existing| existing['field'] == fact['field'] }
+        end
+        dossier['facts'] << fact
+        dossier['facts'] = dossier['facts'].last(MAX_FACTS)
+        dossier['updated_at'] = now
+        @dirty = true
+      end
+      true
+    end
+
+    def remember_game_id(game_id, field, value, source:, evidence: nil, confidence: 'observed')
+      canonical_game_id = utf8(game_id)
+      item = live_objects.find { |candidate| utf8(candidate.id) == canonical_game_id }
+      return false unless item
+
+      remember(item, field, value, source: source, evidence: evidence, confidence: confidence)
+    end
+
+    def current_fact_value(dossier, field)
+      fact = dossier.fetch('facts', []).reverse.find { |candidate| candidate['field'] == field }
+      fact && fact['value']
+    end
+
+    # One derived view hides the precedence rules from frontends, scripts, and
+    # agent callers.  Unknown is deliberate: a failed unlock animation alone
+    # does not prove whether the scroll was used, the rune was inadequate, or
+    # the skill check failed.
+    def scroll_infusion_status(dossier)
+      scroll_facts = dossier.fetch('facts', []).select { |fact| fact['field'].start_with?('scroll.') }
+      return nil if scroll_facts.empty?
+
+      freshness = current_fact_value(dossier, 'scroll.freshness')
+      unlocked = current_fact_value(dossier, 'scroll.infusion.unlocked') == true
+      assessment = current_fact_value(dossier, 'scroll.infusion.assessment')
+      slots = assessment.is_a?(Hash) ? Array(assessment['slots']) : []
+      potential_slots = slots.select { |slot| slot.is_a?(Hash) && slot.key?('potential') }
+      rechargeable = if unlocked && !potential_slots.empty?
+                       potential_slots.any? do |slot|
+                         !normalize(slot['potential']).match?(/\A(?:no|none|zero)\b/)
+                       end
+                     end
+      last_unlock_attempt = current_fact_value(dossier, 'scroll.infusion.last_unlock_attempt')
+
+      can_unlock = if unlocked || freshness == 'used'
+                     false
+                   elsif freshness == 'fresh'
+                     true
+                   end
+      can_recharge = unlocked ? rechargeable : false
+      state = if unlocked && rechargeable == true
+                'unlocked_rechargeable'
+              elsif unlocked && rechargeable == false
+                'unlocked_exhausted'
+              elsif unlocked
+                'unlocked_unassessed'
+              elsif freshness == 'used'
+                'used_not_unlockable'
+              elsif freshness == 'fresh'
+                'fresh_unlock_candidate'
+              elsif last_unlock_attempt == 'no_alteration'
+                'unlock_attempt_failed'
+              else
+                'unknown'
+              end
+      {
+        'state' => state,
+        'freshness' => freshness || 'unknown',
+        'can_unlock' => can_unlock,
+        'can_recharge' => can_recharge,
+        'assessment' => assessment,
+        'last_unlock_attempt' => last_unlock_attempt,
+        'last_game_id' => dossier['last_game_id']
+      }
+    end
+
+    def show_scroll_status(query)
+      matches = resolve(query, current_only: false)
+      unless matches.length == 1
+        display("scroll status requires one exact dossier match; found #{matches.length}")
+        return
+      end
+
+      status = scroll_infusion_status(matches.first)
+      unless status
+        display('no scroll knowledge has been recorded for that item')
+        return
+      end
+
+      unlock_text = status['can_unlock'].nil? ? 'unknown' : (status['can_unlock'] ? 'yes' : 'no')
+      recharge_text = status['can_recharge'].nil? ? 'unknown' : (status['can_recharge'] ? 'yes' : 'no')
+      display("scroll infusion: #{status['state']}; fresh=#{status['freshness']}; can unlock=#{unlock_text}; can recharge=#{recharge_text}; current id=##{status['last_game_id']}")
+      assessment = status['assessment']
+      return unless assessment.is_a?(Hash)
+
+      Array(assessment['slots']).each do |slot|
+        potential = slot.key?('potential') ? "; potential #{slot['potential']}" : ''
+        remaining = if slot.key?('duration')
+                      "#{slot['duration']} of spell-knowledge time"
+                    else
+                      "#{slot['charges']} charges"
+                    end
+        display("  slot #{slot['ordinal']}: (#{slot['spell_number']}) #{slot['spell_name']} — #{remaining}#{potential}")
+      end
+    end
+
+    def mark_scroll_freshness(query, freshness)
+      matches = resolve(query, current_only: true)
+      unless matches.length == 1
+        display("scroll marking requires one live item ID match; found #{matches.length}")
+        return false
+      end
+
+      dossier = matches.first
+      evidence = "player marked ##{dossier['last_game_id']} as #{freshness}"
+      remember(
+        dossier['id'], 'scroll.freshness', freshness,
+        source: 'player scroll classification', evidence: evidence,
+        confidence: 'player-reported'
+      )
+      show_scroll_status(dossier['id'])
+      true
+    end
+
+    def add_observation_unlocked(dossier, text, source)
+      dossier['observations'] ||= []
+      dossier['observations'] << {
+        'text' => utf8(text)[0, 1_000], 'source' => utf8(source), 'observed_at' => now
+      }
+      dossier['observations'] = dossier['observations'].last(MAX_OBSERVATIONS)
+      dossier['updated_at'] = now
+    end
+
+    def relevant_knowledge_line?(line)
+      line.match?(
+        /base strength|base durability|current integrity|weighted|padded|combat effectiveness rating|requires skill|crafted|special flare|as light as it can get|enchanter's glyph|necrotic haze|provides? a boost|enhancive|bonus of \+?\d+|activated by|harmonics|resonates|loresong|imbedded|charges remaining|sanctified|ensorcelled|scripts have been applied|\(\d+\)\s+.+/i
+      )
+    end
+
+    def queue_or_remember_scroll_slot(dossier, spell_number, spell_name, vibrant_ink, source, evidence)
+      queued = @mutex.synchronize do
+        capture = @capture
+        next false unless capture && capture['local_id'] == dossier['id'] && capture['command'].match?(/\Aread\b/i)
+
+        capture['scroll_slots'] ||= []
+        capture['scroll_slots'] << {
+          'spell_number' => spell_number, 'spell_name' => spell_name,
+          'vibrant_ink' => vibrant_ink, 'source' => source, 'evidence' => evidence
+        }
+        true
+      end
+      return if queued
+
+      remember(dossier['id'], "scroll.spell.#{spell_number}", spell_name, source: source, evidence: evidence)
+      remember(dossier['id'], "scroll.vibrant_ink.#{spell_number}", true, source: source, evidence: evidence) if vibrant_ink
+    end
+
+    def commit_scroll_capture
+      @mutex.synchronize do
+        capture = @capture
+        return unless capture && capture['command'].match?(/\Aread\b/i)
+
+        slots = capture['scroll_slots'] || []
+        return if slots.empty? # Failed/empty reads never erase prior knowledge.
+
+        dossier = @dossiers[capture['local_id']]
+        return unless dossier
+
+        dossier['facts'].reject! do |fact|
+          fact['field'].start_with?('scroll.spell.') || fact['field'].start_with?('scroll.vibrant_ink.')
+        end
+        slots.each do |slot|
+          dossier['facts'] << {
+            'field' => "scroll.spell.#{slot['spell_number']}", 'value' => slot['spell_name'],
+            'source' => slot['source'].to_s, 'confidence' => 'observed',
+            'observed_at' => now, 'evidence' => slot['evidence'].to_s[0, 500]
+          }
+          next unless slot['vibrant_ink']
+
+          dossier['facts'] << {
+            'field' => "scroll.vibrant_ink.#{slot['spell_number']}", 'value' => true,
+            'source' => slot['source'].to_s, 'confidence' => 'observed',
+            'observed_at' => now, 'evidence' => slot['evidence'].to_s[0, 500]
+          }
+        end
+        dossier['facts'] = dossier['facts'].last(MAX_FACTS)
+        dossier['updated_at'] = now
+        @dirty = true
+      end
+    end
+
+    def observe_scroll_operation_line(line)
+      @mutex.synchronize do
+        capture = @capture
+        return unless capture && capture['kind'] == 'scroll_operation'
+
+        capture['lines'] ||= []
+        capture['lines'] << line unless line.empty?
+        capture['lines'] = capture['lines'].last(30)
+        if (match = line.match(SCROLL_DETECTION_LINE))
+          capture['detection_slots'] ||= []
+          slot = {
+            'ordinal' => capture['detection_slots'].length + 1,
+            'spell_number' => match[1].to_i,
+            'spell_name' => match[2].strip,
+            'charges' => match[3].strip
+          }
+          slot['potential'] = match[4].strip if match[4]
+          capture['detection_slots'] << slot
+        elsif (match = line.match(SCROLL_DETECTION_TIME_LINE))
+          capture['detection_slots'] ||= []
+          capture['detection_slots'] << {
+            'ordinal' => capture['detection_slots'].length + 1,
+            'spell_number' => match[1].to_i,
+            'spell_name' => match[2].strip,
+            'duration' => match[3].strip
+          }
+        end
+        capture['unlock_succeeded'] = true if line.match?(/vibrates and begins to glow.*scroll has somehow been altered/i)
+        capture['unlock_no_alteration'] = true if line.match?(/shakes slightly, but nothing happens/i)
+        capture['charge_succeeded'] = true if line.match?(/infusion of mana leaps .* to .*scroll.*glows/i)
+      end
+    end
+
+    def commit_scroll_operation_capture
+      capture = @mutex.synchronize { @capture && @capture.dup }
+      return unless capture && capture['kind'] == 'scroll_operation'
+
+      evidence = Array(capture['lines']).join(' ')[0, 500]
+      source = capture['command']
+      local_id = capture['local_id']
+      slots = Array(capture['detection_slots'])
+      unless slots.empty?
+        remember(
+          local_id, 'scroll.infusion.assessment',
+          { 'slots' => slots, 'observed_at' => now },
+          source: source, evidence: evidence
+        )
+        if slots.any? { |slot| slot.key?('potential') }
+          remember(local_id, 'scroll.infusion.unlocked', true, source: source, evidence: evidence)
+        end
+      end
+      if capture['unlock_succeeded']
+        remember(local_id, 'scroll.infusion.unlocked', true, source: source, evidence: evidence)
+        remember(local_id, 'scroll.infusion.last_unlock_attempt', 'altered', source: source, evidence: evidence)
+      elsif capture['unlock_no_alteration']
+        remember(local_id, 'scroll.infusion.last_unlock_attempt', 'no_alteration', source: source, evidence: evidence)
+      end
+      if capture['charge_succeeded']
+        remember(local_id, 'scroll.infusion.unlocked', true, source: source, evidence: evidence)
+        remember(local_id, 'scroll.infusion.last_charge_result', 'charge_added', source: source, evidence: evidence)
+      end
+    end
+
+    def learn_line(dossier, line, source, retain: false)
+      relevant = relevant_knowledge_line?(line)
+      return unless relevant || retain
+
+      @mutex.synchronize do
+        add_observation_unlocked(dossier, line, source)
+        @dirty = true
+      end
+      return unless relevant
+
+      if line =~ /\((\d+)\)\s+(.+?)(\s+in vibrant ink)?\s*\z/i
+        spell_number = Regexp.last_match(1).to_i
+        spell_name = Regexp.last_match(2).strip
+        vibrant_ink = !Regexp.last_match(3).nil?
+        queue_or_remember_scroll_slot(dossier, spell_number, spell_name, vibrant_ink, source, line)
+        remember(
+          dossier['id'], 'item_role', 'spell-bearing readable object',
+          source: source, evidence: line
+        )
+        remember(
+          dossier['id'], 'restriction', 'never auto-sell',
+          source: source, evidence: line
+        )
+        if vibrant_ink
+          remember(
+            dossier['id'], 'scroll.spell_knowledge', true,
+            source: source, evidence: line
+          )
+        end
+      end
+
+      if line =~ /base strength of (\d+) and a base durability of (\d+).*?integrity .*?([\d.]+)%/i
+        remember(dossier['id'], 'base_strength', Regexp.last_match(1).to_i, source: source, evidence: line)
+        remember(dossier['id'], 'base_durability', Regexp.last_match(2).to_i, source: source, evidence: line)
+        remember(dossier['id'], 'integrity_percent', Regexp.last_match(3).to_f, source: source, evidence: line)
+      end
+      line.scan(/combat effectiveness rating of (\d+) points? of (Damage|Critical) (?:weighting|padding)/i).each do |points, kind|
+        remember(dossier['id'], "#{kind.downcase}_cer", points.to_i, source: source, evidence: line)
+      end
+      line.scan(/combat effectiveness rating of \d+ points? of (Damage|Critical) (?:weighting|padding).*?It has (\d+) of (\d+) services towards the next full rank/i).each do |kind, partial, needed|
+        remember(dossier['id'], "#{kind.downcase}_cer_services", "#{partial}/#{needed}", source: source, evidence: line)
+      end
+      if line =~ /provides? a boost of ([+-]?\d+) to ([^.]+)\.?/i
+        boost = Regexp.last_match(1).to_i
+        property = Regexp.last_match(2)
+        field = "enhancive.#{normalize(property).gsub(/[^a-z0-9]+/, '_')}"
+        remember(dossier['id'], field, boost, source: source, evidence: line)
+      end
+      if line =~ /enhancement may not be used by adventurers who have not trained (\d+) times/i
+        remember(dossier['id'], 'enhancive_level_requirement', Regexp.last_match(1).to_i, source: source, evidence: line)
+      end
+      ITEM_PROPERTIES.each do |field, pattern|
+        match = line.match(pattern)
+        next unless match
+
+        value = match.captures.compact.first
+        value = value.to_i if value.to_s.match?(/\A\d+\z/)
+        if field == 'activation'
+          value = {
+            'rubb' => 'RUB', 'rub' => 'RUB', 'tapp' => 'TAP', 'tap' => 'TAP',
+            'wav' => 'WAVE', 'rais' => 'RAISE'
+          }.fetch(value.to_s.downcase, value.to_s.upcase)
+        end
+        remember(dossier['id'], field, value, source: source, evidence: line)
+      end
+      ITEM_FLAGS.each do |field, pattern|
+        remember(dossier['id'], field, true, source: source, evidence: line) if line.match?(pattern)
+      end
+      remember(dossier['id'], 'ensorcell_evidence', 'necrotic haze', source: source, evidence: line) if line.match?(/necrotic haze/i)
+    end
+
+    def plain_text(raw)
+      stripped = if respond_to?(:strip_xml, true)
+                   strip_xml(raw.to_s.dup, type: 'lab-inventory')
+                 else
+                   raw.to_s.gsub(/<[^>]+>/, ' ')
+                 end
+      utf8(CGI.unescapeHTML(stripped.to_s).gsub(/\s+/, ' ').strip)
+    rescue
+      utf8(raw.to_s.gsub(/<[^>]+>/, ' ').gsub(/\s+/, ' ').strip)
+    end
+
+    # MARK STATUS and REGISTER INFO/INSPECT replies identify their subject with
+    # an XML object anchor.  Do not fall back to a capture or a name match here:
+    # protection state is safety-critical, and a response with no single anchor
+    # must not be attributed to a similarly named item.
+    def uniquely_anchored_game_id(raw)
+      ids = raw.to_s.scan(/<a\b[^>]*\bexist=["'](\d+)["']/i).flatten.uniq
+      ids.first if ids.length == 1
+    end
+
+    def remember_protection_fact(game_id, field, value, source, evidence)
+      return unless game_id
+
+      remember_game_id(game_id, field, value, source: source, evidence: evidence)
+    end
+
+    def observe_protection_status(raw_text, text)
+      game_id = uniquely_anchored_game_id(raw_text)
+      return unless game_id
+
+      if text.match?(/\b(?:mark status|marked|unmarked)\b/i)
+        if text.match?(/\b(?:not marked|unmarked)(?:\s+as\s+unsellable)?\b/i)
+          remember_protection_fact(game_id, 'marked_unsellable', false, 'MARK STATUS', text)
+        elsif text.match?(/\bmarked\s+(?:as\s+)?unsellable\b/i)
+          remember_protection_fact(game_id, 'marked_unsellable', true, 'MARK STATUS', text)
+        end
+      end
+
+      return unless text.match?(/\b(?:registered|registration)\b/i)
+
+      if text.match?(/\bno recorded (?:registration )?information\b|\bnot registered\b/i)
+        remember_protection_fact(game_id, 'registered', false, 'REGISTER INFO/INSPECT', text)
+        return
+      end
+
+      owner = text.match(/\b(?:currently |last )?registered(?:\s+owner)?\s+to\s+([^.,;!]+)|\bregistered owner\s*:\s*([^.,;!]+)/i)
+      if owner
+        owner_name = owner.captures.compact.first.strip
+        owner_name = character_name if owner_name.casecmp?('you')
+        remember_protection_fact(game_id, 'registered', true, 'REGISTER INFO/INSPECT', text)
+        remember_protection_fact(game_id, 'registered_owner', owner_name, 'REGISTER INFO/INSPECT', text)
+      elsif text.match?(/\b(?:is|was|has been)\s+(?:last\s+)?registered\b|\byou registered this item\b/i)
+        remember_protection_fact(game_id, 'registered', true, 'REGISTER INFO/INSPECT', text)
+      end
+
+      age = text.match(
+        /\b(?:was|has been)\s+(?:last\s+)?registered\s+(?:for|since|on)\s+(.+?)(?:[.!]|\z)|\byou registered this item\s+(.+?ago)(?:[.!]|\z)/i
+      )
+      if age
+        remember_protection_fact(game_id, 'registration_age', age.captures.compact.first.strip, 'REGISTER INFO/INSPECT', text)
+      end
+    end
+
+    def observe(raw)
+      raw_text = raw.to_s
+      @last_left_hand_id = Regexp.last_match(1) if raw_text =~ /<left exist=["']([0-9]+)["']/
+
+      raw_text.scan(%r{<a exist=["']([0-9]+)["'][^>]*>([^<]+)</a>.*?\((?:<pushBold/>)?(\d+)(?:<popBold/>)?/(\d+) charges\)}i).each do |game_id, _name, current, maximum|
+        remember_game_id(game_id, 'enhancive_charges_current', current.to_i, source: 'INVENTORY ENHANCIVE LIST', evidence: plain_text(raw_text))
+        remember_game_id(game_id, 'enhancive_charges_maximum', maximum.to_i, source: 'INVENTORY ENHANCIVE LIST', evidence: plain_text(raw_text))
+      end
+      raw_text.scan(%r{<a exist=["']([0-9]+)["'][^>]*>([^<]+)</a>.*?\(charged until (.*?)\)}i).each do |game_id, _name, expiry|
+        remember_game_id(game_id, 'enhancive_charged_until', expiry.strip, source: 'INVENTORY ENHANCIVE LIST', evidence: plain_text(raw_text))
+      end
+
+      if raw_text =~ /The .*? exist=["']([0-9]+)["'].*?(?:has|have|looks like it has) (\d+) (?:doses?|bites?) left/i
+        record_dose(Regexp.last_match(1), Regexp.last_match(2), precision: 'exact')
+      elsif raw_text =~ /The .*? exist=["']([0-9]+)["'].*?(?:has|have|looks like it has) (?:one|1) (?:dose|bite) left/i
+        record_dose(Regexp.last_match(1), 1, precision: 'exact')
+      elsif raw_text =~ /The .*? exist=["']([0-9]+)["'].*?(?:several doses|several bites) left/i
+        record_dose(Regexp.last_match(1), 7, precision: 'estimated')
+      elsif raw_text =~ /The .*? exist=["']([0-9]+)["'].*?(?:a few doses|a few bites) left/i
+        record_dose(Regexp.last_match(1), 4, precision: 'estimated')
+      elsif raw_text =~ /You take a (?:drink from|bite of) your .*? exist=["']([0-9]+)["']/i
+        @using_item_id = Regexp.last_match(1)
+      elsif raw_text =~ /You carefully pour a little bit from your .*? exist=["']([0-9]+)["'].*?into .*? exist=["']([0-9]+)["']/i
+        adjust_dose(Regexp.last_match(1), -1)
+        adjust_dose(Regexp.last_match(2), 1)
+      elsif raw_text =~ /You carefully remove one dose from your .*? exist=["']([0-9]+)["']/i
+        adjust_dose(Regexp.last_match(1), -1)
+        record_dose(@last_left_hand_id, 1, precision: 'exact', source: 'split dose') if @last_left_hand_id
+      elsif raw_text =~ /Carefully, you combine all your/i
+        invalidate_dose(@last_left_hand_id, 'bundle composition changed') if @last_left_hand_id
+      end
+
+      if @using_item_id
+        text = plain_text(raw_text)
+        if text =~ /You have (?:only about |about )?(\d+) (?:quaffs|doses|bites) left/i
+          record_dose(@using_item_id, Regexp.last_match(1), precision: 'exact', source: 'remaining after use')
+        elsif text =~ /You (?:only )?have one (?:bite|dose|quaff) left/i
+          record_dose(@using_item_id, 1, precision: 'exact', source: 'remaining after use')
+        elsif text =~ /That was the last (?:drop|of it)/i
+          record_dose(@using_item_id, 0, precision: 'exact', source: 'consumed last dose')
+        end
+      end
+
+      text = plain_text(raw_text.gsub(/<prompt\b[^>]*>/, ''))
+      observe_protection_status(raw_text, text)
+      dossier = nil
+      source = nil
+      retain = false
+      @mutex.synchronize do
+        if @transcript
+          dossier = @dossiers[@transcript['local_id']]
+          source = @transcript['source']
+          retain = true
+        elsif @capture
+          dossier = @dossiers[@capture['local_id']]
+          source = @capture['command']
+          retain = true
+        elsif @focused_local_id
+          dossier = @dossiers[@focused_local_id]
+          source = 'focused observation'
+        end
+      end
+      if dossier && !text.empty?
+        capture_kind = @mutex.synchronize { @capture && @capture['kind'] }
+        if capture_kind == 'scroll_operation'
+          observe_scroll_operation_line(text)
+        else
+          learn_line(dossier, text, source, retain: retain)
+        end
+      end
+
+      if raw_text.include?('<prompt')
+        @using_item_id = nil
+        reconcile_capture_identity
+        commit_scroll_capture
+        commit_scroll_operation_capture
+        @capture = nil
+        sync_live_state
+      end
+
+      raw
+    rescue => error
+      Lich.log("lab-inventory observation failed: #{error.class}: #{error.message}")
+      raw
+    end
+
+    def begin_capture(command, target, kind: 'knowledge')
+      matches = resolve(target, current_only: true)
+      return unless matches.length == 1
+
+      @mutex.synchronize do
+        dossier = matches.first
+        location = @locations[dossier['id']]
+        @capture = {
+          'kind' => kind,
+          'local_id' => dossier['id'],
+          'command' => command,
+          'started_at' => now,
+          'target_game_id' => dossier['last_game_id'],
+          'target_fingerprint' => dossier['fingerprint'],
+          'target_hand' => location && location['kind'] == 'hand' ? location['hand'] : nil
+        }
+      end
+    end
+
+    def begin_scroll_operation_capture(command)
+      if (wave = command.match(SCROLL_WAVE_COMMAND))
+        begin_capture(command, wave[2], kind: 'scroll_operation')
+      elsif (infuse = command.match(SCROLL_INFUSE_COMMAND))
+        begin_capture(command, infuse[1], kind: 'scroll_operation')
+      end
+    end
+
+    def show_count(term)
+      result = query(term)
+      if result['item_count'].zero?
+        display("no currently tracked inventory items match '#{term}'")
+        return
+      end
+
+      dose_text = if result['unmeasured_items'].zero?
+                    "#{result['known_exact_doses']} exact doses"
+                  else
+                    "#{result['known_exact_doses']} exact doses; #{result['unmeasured_items']} unmeasured item(s)"
+                  end
+      dose_text += "; #{result['estimated_doses']} estimated doses" if result['estimated_doses'].positive?
+      display("#{term}: #{result['item_count']} item(s), #{dose_text}; observed #{result['observed_at'] || 'unknown'}")
+    end
+
+    def show_item(term)
+      matches = resolve(term, current_only: false)
+      if matches.empty?
+        display("no item dossier matches '#{term}'")
+        return
+      end
+
+      matches.first(10).each do |dossier|
+        identity = dossier.fetch('identity', {})
+        location = @mutex.synchronize { @locations[dossier['id']] }
+        live = location && location['session_id'] == @session_id
+        display("#{dossier['id']}: #{identity['full_name'].to_s.empty? ? identity['name'] : identity['full_name']} (#{live ? location['kind'] : 'not currently observed'})")
+        measurement = dossier['dose_measurement']
+        display("  doses: #{measurement['value']} (#{measurement['precision']}, #{measurement['observed_at']})") if measurement
+        status = scroll_infusion_status(dossier)
+        display("  scroll infusion: #{status['state']} (fresh=#{status['freshness']}, id=##{status['last_game_id']})") if status
+        dossier.fetch('facts', []).last(20).each do |fact|
+          display("  #{fact['field']}: #{fact['value']} [#{fact['source']}, #{fact['observed_at']}]")
+        end
+      end
+      display("showing first 10 of #{matches.length} matching dossiers") if matches.length > 10
+    end
+
+    def find_items(term)
+      sync_live_state
+      matches = search(term, current_only: false)
+      if matches.empty?
+        display("no item names, facts, or observations match '#{term}'")
+        return
+      end
+
+      matches.first(20).each do |dossier|
+        identity = dossier.fetch('identity', {})
+        location = @mutex.synchronize { @locations[dossier['id']] }
+        state = location && location['session_id'] == @session_id ? location['kind'] : 'historical'
+        display("#{dossier['id']}: #{identity['full_name'].to_s.empty? ? identity['name'] : identity['full_name']} (#{state})")
+        dossier.fetch('facts', []).select do |fact|
+          normalize(fact['field']).include?(normalize(term)) || normalize(fact['value']).include?(normalize(term))
+        end.last(5).each do |fact|
+          display("  #{fact['field']}: #{fact['value']} [#{fact['source']}]")
+        end
+      end
+      display("showing first 20 of #{matches.length} matches") if matches.length > 20
+    end
+
+    def show_enhancive_totals(refresh: false)
+      unless defined?(Lich::Gemstone::Enhancive)
+        display('this Lich build does not expose the Enhancive interface')
+        return
+      end
+
+      enhancive = Lich::Gemstone::Enhancive
+      enhancive.refresh(silent: true, quiet: true) if refresh
+      stats = enhancive::STATS.filter_map do |stat|
+        value = enhancive.public_send(stat).value
+        "#{stat}=#{value}" if value.positive?
+      end
+      skills = enhancive::BONUS_SKILLS.filter_map do |skill|
+        value = enhancive.public_send(skill)
+        "#{skill}=#{value.ranks} ranks/#{value.bonus} bonus" if value.ranks.positive? || value.bonus.positive?
+      end
+      resources = enhancive::RESOURCES.filter_map do |resource|
+        value = enhancive.public_send(resource).value
+        "#{resource}=#{value}" if value.positive?
+      end
+      display("aggregate enhancives: #{enhancive.item_count} item(s), #{enhancive.property_count} properties; refreshed #{enhancive.last_updated || 'never'}")
+      display("  stats: #{stats.empty? ? 'none' : stats.join(', ')}")
+      display("  skills: #{skills.empty? ? 'none' : skills.join(', ')}")
+      display("  resources: #{resources.empty? ? 'none' : resources.join(', ')}")
+      display("  self-knowledge spells: #{enhancive.spells.empty? ? 'none' : enhancive.spells.join(', ')}")
+    end
+
+    def handle_request(request)
+      request = utf8(request).strip
+      case request
+      when '', 'help'
+        display('usage: ;lab inventory status | count/show/find QUERY | scroll #ITEMID [used|fresh|unknown] | enhancives [refresh] | charges refresh | focus QUERY|off | learn QUERY | SOURCE | learn done | note QUERY | TEXT | set QUERY | FIELD = VALUE')
+      when 'status'
+        sync_live_state
+        current = @mutex.synchronize { @locations.count { |_id, location| location['session_id'] == @session_id } }
+        display("tracking #{current} live item(s) and #{@dossiers.length} durable dossier(s); data: #{data_path}")
+      when /\Acount\s+(.+)\z/i
+        show_count(Regexp.last_match(1))
+      when /\Ashow\s+(.+)\z/i
+        show_item(Regexp.last_match(1))
+      when /\Afind\s+(.+)\z/i
+        find_items(Regexp.last_match(1))
+      when /\Ascroll\s+(#\d+)\z/i
+        show_scroll_status(Regexp.last_match(1))
+      when /\Ascroll\s+(#\d+)\s+(used|fresh|unknown)\z/i
+        mark_scroll_freshness(Regexp.last_match(1), Regexp.last_match(2).downcase)
+      when 'enhancives'
+        show_enhancive_totals
+      when 'enhancives refresh'
+        show_enhancive_totals(refresh: true)
+      when 'charges refresh'
+        fput('inventory enhancive list')
+        display('requested a fresh per-item enhancive charge list; results will update matching dossiers')
+      when /\Afocus\s+off\z/i
+        @mutex.synchronize { @focused_local_id = nil }
+        display('durable observation focus cleared')
+      when /\Afocus\s+(.+)\z/i
+        matches = resolve(Regexp.last_match(1), current_only: true)
+        if matches.length == 1
+          @mutex.synchronize { @focused_local_id = matches.first['id'] }
+          display("focused #{matches.first['id']}; relevant assessment and loresong lines will be retained")
+        else
+          display("focus requires one live match; found #{matches.length}")
+        end
+      when /\Alearn\s+done\z/i
+        transcript = @mutex.synchronize do
+          current = @transcript
+          @transcript = nil
+          current
+        end
+        display(transcript ? 'bounded item transcript saved' : 'no item transcript was active')
+      when /\Alearn\s+(.+?)(?:\s*\|\s*(.+))?\z/i
+        item_query = Regexp.last_match(1)
+        declared_source = Regexp.last_match(2).to_s.strip
+        matches = resolve(item_query, current_only: true)
+        if matches.length == 1
+          source = declared_source.empty? ? 'bounded item examination transcript' : declared_source
+          @mutex.synchronize do
+            @transcript = { 'local_id' => matches.first['id'], 'source' => source, 'started_at' => now }
+          end
+          display("learning #{matches.first['id']} from #{source}; use ;lab inventory learn done when the examination ends")
+        else
+          display("learn requires one live match; found #{matches.length}")
+        end
+      when /\Anote\s+(.+?)\s*\|\s*(.+)\z/i
+        if remember(Regexp.last_match(1), 'manual_note', Regexp.last_match(2), source: 'player note', confidence: 'player-reported')
+          display('note saved to the unique matching dossier')
+        else
+          display('note requires one unambiguous item dossier match')
+        end
+      when /\Aset\s+(.+?)\s*\|\s*([a-zA-Z][a-zA-Z0-9_. -]*)\s*=\s*(.+)\z/i
+        item_query = Regexp.last_match(1)
+        field = normalize(Regexp.last_match(2)).gsub(/[^a-z0-9.]+/, '_')
+        value = Regexp.last_match(3).strip
+        if remember(item_query, field, value, source: 'player item knowledge', confidence: 'player-reported')
+          display("saved #{field} to the unique matching dossier")
+        else
+          display('set requires one unambiguous item dossier match')
+        end
+      else
+        display('usage: ;lab inventory status | count/show/find QUERY | scroll #ITEMID [used|fresh|unknown] | enhancives [refresh] | charges refresh | focus QUERY|off | learn QUERY | SOURCE | learn done | note QUERY | TEXT | set QUERY | FIELD = VALUE')
+      end
+      nil
+    rescue => error
+      Lich.log("lab-inventory request failed: #{error.class}: #{error.message}")
+      display("command failed: #{error.message}")
+      nil
+    end
+
+    def handle_input(client_string)
+      command = utf8(client_string.sub(/\A<c>/, '').strip)
+      if command.match?(LEGACY_COMMAND_PREFIX)
+        display('Sli commands moved; use ;lab inventory help')
+        return nil
+      end
+
+      knowledge = command.match(KNOWLEDGE_COMMAND)
+      begin_capture(command, knowledge[1]) if knowledge
+      begin_scroll_operation_capture(command) unless knowledge
+      client_string
+    rescue => error
+      Lich.log("lab-inventory input capture failed: #{error.class}: #{error.message}")
+      client_string
+    end
+
+    def start
+      return if @running
+
+      @session_id = "#{game_name}-#{character_name}-#{Process.pid}-#{Time.now.to_i}"
+      load_state
+      sync_live_state
+      @running = true
+      script_id = Script.current.object_id
+      @upstream_hook = "lab-inventory-upstream-#{script_id}"
+      @downstream_hook = "lab-inventory-downstream-#{script_id}"
+      UpstreamHook.add(@upstream_hook, proc { |line| handle_input(line) }, persist: false)
+      DownstreamHook.add(@downstream_hook, proc { |line| observe(line) }, persist: false)
+      Thread.new do
+        while @running
+          sleep 2
+          persist
+        end
+      end
+    end
+
+    def stop
+      @running = false
+      UpstreamHook.remove(@upstream_hook) if @upstream_hook
+      DownstreamHook.remove(@downstream_hook) if @downstream_hook
+      persist
+      close_database
+    end
+  end
+end
+
+unless ENV['LAB_INVENTORY_LIBRARY_ONLY'] == '1'
+  hide_me
+  LabInventory.start
+  before_dying { LabInventory.stop }
+  LabInventory.display('background inventory and item-knowledge tracker started; use ;lab inventory help')
+  sleep while true
+end

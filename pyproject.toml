@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lich-agent-bridge"
+version = "0.2.0"
+description = "Permission-aware agent bridge for Lich 5"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "ATARI" }]
+classifiers = ["License :: OSI Approved :: GNU General Public License v3 (GPLv3)"]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/therealatari/lich-agent-bridge"
+Repository = "https://github.com/therealatari/lich-agent-bridge"
+Issues = "https://github.com/therealatari/lich-agent-bridge/issues"
+
+[project.scripts]
+lich-agent-bridge = "lich_agent_bridge.server:main"
+lab-replay = "lich_agent_bridge.replay:main"
+lab-action = "lich_agent_bridge.action_cli:main"
+lab-gswiki = "lich_agent_bridge.gswiki:main"
+labctl = "lich_agent_bridge.labctl:main"
+lab-character-baseline = "lich_agent_bridge.character_baseline:main"
+lab-lich-corpus = "lich_agent_bridge.lich_corpus:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

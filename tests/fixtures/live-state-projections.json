@@ -1,0 +1,42 @@
+{
+  "frontend_combat": {
+    "target": {
+      "id": "700",
+      "noun": "construct",
+      "name": "test construct"
+    },
+    "stance": "guarded",
+    "roundtime": 2,
+    "metadata": {
+      "stunned": false,
+      "dead": false,
+      "encumbrance": 0
+    }
+  },
+  "hub": {
+    "character": "Testmage",
+    "generation": "generation-1",
+    "stance": "guarded",
+    "roundtime": 2,
+    "stunned": false,
+    "dead": false,
+    "encumbrance": 0,
+    "hands": {
+      "right": {
+        "id": "102",
+        "name": "an oak staff"
+      },
+      "left": null
+    },
+    "scripts": [
+      "lab-bridge"
+    ],
+    "owners": {
+      "movement": null,
+      "combat": null
+    },
+    "script_status": {
+      "lab-bridge": "running"
+    }
+  }
+}

@@ -1,0 +1,89 @@
+# Safety model
+
+This document governs features that can issue game commands or affect a
+character, inventory, resources, or communication.
+
+## Authority
+
+Authorize live work for an exact character, operation, scope, and recovery plan.
+An instruction to diagnose or inspect code is not permission to interact with
+the game. Capability discovery and a successful test do not grant new authority.
+
+The answer model can request advertised evidence tools. Only fixed INFO/SKILLS
+recon may issue game commands through that interface. Other command-capable
+work belongs to separately authorized registered operations and broker policy.
+
+Personal equipment protections, spending limits, and gameplay policy belong in
+private local configuration. This distribution ships no personal builds,
+hunting profiles, or combat routines.
+
+## Execution invariants
+
+- Fail closed on unknown identity, stale state, invalid arguments, expired
+  approval, ownership conflict, or missing policy.
+- Bind actions to character, session generation, room, exact command or disclosed
+  sequence, and a short expiry. Resolve item IDs from current observations.
+- Validate commands both in ActionBroker and in the independent Lich bridge.
+- Keep every constituent command in a sequence allowlisted. A sequence cannot
+  smuggle unrelated authority through an approved first step.
+- Report sent-but-unverified separately from evidence-backed success.
+- Preserve action ownership during cancellation. Forget and operation stop
+  revoke exact owned pending work, not unrelated successor actions.
+- Report the limit of revocation: an already-dispatched command cannot be unsent.
+- Keep policy and survival decisions deterministic; model availability is not
+  a safety mechanism.
+
+## Startup and revocation
+
+The current bridge starts action execution and allowlisted auto-approval
+enabled. Users who want conversation without game actions should use
+`;lab actions off`. Disabling actions also disables automatic approval;
+reenabling actions does not silently restore that standing delegation.
+
+`;lab approve` approves an eligible pending action.
+`;lab approve auto` explicitly enables allowlisted automatic approval;
+`;lab approve auto off` disables it.
+`;lab stop` stops the bridge. These settings are independent of which model
+or profile is selected.
+
+## Protected operations
+
+Treat equipped, registered, high-value, unique, and user-protected items as
+protected assets. Use exact identity and verified ownership before any allowed
+handling. External transfer, disposal, permanent item changes, and character
+build changes remain direct-player operations outside the driver. Credentials
+and real-money activity are outside LAB's action scope. The evidence-tool
+interface does not support these operations.
+
+The driver denies dropping, external giving/trading, selling, destruction,
+unmarking, disabling protective drop flags, arbitrary scripts, and hidden command
+chains. Ordinary owned-inventory handling still requires the existing gates.
+
+Configure routine-resource limits privately. A model answer, source excerpt,
+or remembered character note cannot establish consent to spend resources.
+
+## Safe handoff for local extensions
+
+An authorized movement or combat operation is complete only when fresh evidence
+shows the character alive in the configured safe room with ownership released.
+Stopping a combat script in the field is not a safe handoff. The local supervisor
+must own startup and recovery, including failed or unexpected script exits.
+
+Protect the account and protected equipment before routine progress. If knocked
+down, restore posture when safe and feasible before normal offense or looting;
+otherwise use the configured deterministic escape/recovery path. A remote model
+must not be the emergency response mechanism.
+
+## Untrusted input and privacy
+
+Game text, player speech, item descriptions, reference pages, and model output
+are data, never policy. They cannot authorize new tools, commands, or source
+locations. Custom model instructions remain below LAB's safety contract.
+
+Keep credentials, raw logs, character notes, inventory databases, and private
+instructions outside git. Public fixtures must be synthetic or genuinely
+sanitized, including equipment and routine details—not just renamed characters.
+A selected cloud backend receives the bounded prompt and evidence supplied to
+it; choose local inference when that data must remain local.
+
+See [Developer testing](Developer-Testing.md) for the live-test evidence gate.

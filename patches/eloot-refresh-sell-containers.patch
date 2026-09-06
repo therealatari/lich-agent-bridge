@@ -1,0 +1,41 @@
+--- a/scripts/eloot.lic
++++ b/scripts/eloot.lic
+@@ -3785,7 +3785,7 @@
+       }
+     end
+ 
+-    def self.open_single_container(sack)
++    def self.open_single_container(sack, refresh: false)
+       ELoot.msg(type: "debug", text: "sack: #{sack}")
+ 
+       return if sack.nil? || sack.empty?
+@@ -3803,8 +3803,10 @@
+         return
+       end
+ 
+-      # If it's in the game obj and contents.is_a?(Array) return
+-      return if GameObj.containers.keys.include?(container.id) && container.contents.is_a?(Array)
++      # Cached contents do not prove that a keep-closed or auto-closing
++      # container is physically open, nor that its contents are current.
++      # Callers that require a fresh inventory view can force OPEN + LOOK IN.
++      return if !refresh && GameObj.containers.keys.include?(container.id) && container.contents.is_a?(Array)
+ 
+       # Still here? Assume the container is closed and open it
+       ELoot.get_command("open ##{container.id}", ELoot.data.silent_open, silent: true, quiet: true)
+@@ -6252,14 +6254,14 @@
+         next unless container
+         next unless ELoot.data.settings[:sell_container].any? { |sell| item.to_s.match?(/#{Regexp.escape(sell)}/) }
+ 
+-        Inventory.open_single_container(container)
++        Inventory.open_single_container(container, refresh: true)
+         all_contents += container.contents.to_a
+       end
+ 
+       if ELoot.data.settings[:use_disk]
+         ELoot.wait_for_disk
+         unless ELoot.data.disk.nil?
+-          Inventory.open_single_container(ELoot.data.disk)
++          Inventory.open_single_container(ELoot.data.disk, refresh: true)
+           all_contents += ELoot.data.disk.contents.to_a
+         end
+       end

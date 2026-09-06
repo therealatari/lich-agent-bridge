@@ -1,0 +1,153 @@
+{
+  "version": 1,
+  "controllers": [
+    {
+      "name": "engage",
+      "script": "lab-test-engage",
+      "summary": "Engage one exact target with a registered local combat profile.",
+      "characters": ["Testknight"],
+      "result_global": "$lab_engage_result",
+      "lanes": ["combat"],
+      "owner_scripts": ["bigshot", "lab-test-owner", "lab-test-engage", "lab-test-room", "lab-test-hunt", "lab-test-rift"],
+      "safe_handoff": {"kind": "owners_released"},
+      "capability_action": "start",
+      "actions": [
+        {
+          "name": "start",
+          "kind": "launch",
+          "command_template": "lab-test-engage {profile} #{target_id}{loot}",
+          "script_args_template": "{profile} #{target_id}{loot}",
+          "launch_mode": "start",
+          "policy": {"category": "combat", "confirmation_required": true},
+          "parameters": [
+            {"name": "profile", "type": "enum", "values": ["test-living"]},
+            {"name": "target_id", "type": "numeric"},
+            {"name": "loot", "type": "flag_suffix", "true_value": " loot", "default": false}
+          ]
+        },
+        {
+          "name": "stop",
+          "kind": "stop",
+          "command_template": "lab-test-engage stop",
+          "script_args_template": "",
+          "policy": {"category": "configuration", "confirmation_required": true},
+          "parameters": []
+        }
+      ]
+    },
+    {
+      "name": "room",
+      "script": "lab-test-room",
+      "summary": "Resolve the current room with a registered local combat profile.",
+      "characters": ["Testknight"],
+      "result_global": "$lab_room_result",
+      "lanes": ["combat"],
+      "owner_scripts": ["bigshot", "lab-test-owner", "lab-test-engage", "lab-test-room", "lab-test-hunt", "lab-test-rift"],
+      "safe_handoff": {"kind": "owners_released"},
+      "capability_action": "start",
+      "actions": [
+        {
+          "name": "start",
+          "kind": "launch",
+          "command_template": "lab-test-room start {profile}",
+          "script_args_template": "{profile}",
+          "launch_mode": "run",
+          "policy": {"category": "combat", "confirmation_required": true},
+          "parameters": [
+            {"name": "profile", "type": "enum", "values": ["test-living"]}
+          ]
+        },
+        {
+          "name": "stop",
+          "kind": "stop",
+          "command_template": "lab-test-room stop",
+          "script_args_template": "",
+          "policy": {"category": "configuration", "confirmation_required": true},
+          "parameters": []
+        }
+      ]
+    },
+    {
+      "name": "hunt",
+      "script": "lab-test-hunt",
+      "summary": "Run one supervised Bigshot hunt and verify safe return with owners released.",
+      "characters": ["Testknight"],
+      "result_global": "$lab_hunt_result",
+      "signal_global": "$lab_hunt_return_requested",
+      "lanes": ["movement", "combat"],
+      "owner_scripts": ["bigshot", "lab-test-owner", "lab-test-engage", "lab-test-room", "lab-test-hunt", "lab-test-rift"],
+      "safe_handoff": {
+        "kind": "profile_room",
+        "rooms": {
+          "test-hunt": "1000",
+          "test-probe": "1000"
+        }
+      },
+      "capability_action": "start",
+      "actions": [
+        {
+          "name": "start",
+          "kind": "launch",
+          "command_template": "lab-test-hunt start {profile}",
+          "script_args_template": "{profile}",
+          "launch_mode": "run",
+          "policy": {"category": "combat", "confirmation_required": true},
+          "parameters": [
+            {"name": "profile", "type": "enum", "values": ["test-hunt", "test-probe"]}
+          ]
+        },
+        {
+          "name": "return",
+          "kind": "signal",
+          "command_template": "lab-test-hunt return",
+          "script_args_template": "",
+          "policy": {"category": "configuration", "confirmation_required": true},
+          "parameters": []
+        },
+        {
+          "name": "status",
+          "kind": "status",
+          "command_template": "lab-test-hunt status",
+          "script_args_template": "",
+          "policy": {"category": "inspection", "confirmation_required": false},
+          "parameters": []
+        }
+      ]
+    },
+    {
+      "name": "rift",
+      "script": "lab-test-rift",
+      "summary": "Run one bounded Rift operation and verify return to the Cavern of Ages.",
+      "characters": ["Testknight"],
+      "result_global": "$lab_rift_result",
+      "lanes": ["movement", "combat"],
+      "owner_scripts": ["bigshot", "lab-test-owner", "lab-test-engage", "lab-test-room", "lab-test-hunt", "lab-test-rift", "ebounty", "go2"],
+      "safe_handoff": {"kind": "room", "room_id": "1002"},
+      "capability_action": "operate",
+      "actions": [
+        {
+          "name": "operate",
+          "kind": "launch",
+          "command_template": "lab-test-rift {operation}",
+          "script_args_template": "{operation}",
+          "launch_mode": "run",
+          "policy": {"category": "movement", "confirmation_required": true},
+          "parameters": [
+            {"name": "operation", "type": "enum", "values": ["extract", "drill", "probe", "patrol", "hunt"]}
+          ]
+        },
+        {
+          "name": "inspect",
+          "kind": "sync",
+          "command_template": "lab-test-rift {inspection}",
+          "script_args_template": "{inspection}",
+          "launch_mode": "run",
+          "policy": {"category": "inspection", "confirmation_required": false},
+          "parameters": [
+            {"name": "inspection", "type": "enum", "values": ["status", "preflight"]}
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+# LAB MCP adapter
+
+This package is a loopback-only Streamable HTTP MCP adapter over Python `SessionHub`. It contains no game logic and cannot access Lich, files, terminals, raw sockets, or the network from agent-supplied code. All state, capability admission, policy, and verified outcomes remain owned by `SessionHub`.
+
+## Configuration
+
+- `LAB_SESSION_HUB_URL` — loopback HTTP URL, default `http://127.0.0.1:18765`
+- `LAB_SESSION_HUB_TOKEN` — required bearer token used only for adapter-to-hub requests
+- `LAB_MCP_PORT` — MCP listener port, default `18766`; listener host is fixed to `127.0.0.1`
+- `LAB_MCP_EXECUTOR_CHILD` — optional on-disk executor child override for packaging
+
+The centralized SessionHub route mapping is in `src/routes.ts`. Direct
+`lab.perform` starts an asynchronous SessionHub operation and follows its
+private operation-watch route until it can return a terminal, verified outcome.
+
+## Development
+
+```sh
+npm install
+npm run generate:sdk-types
+npm test
+npm run typecheck
+npm run build
+```
+
+The generated declarations come from the same Zod objects registered as direct MCP tool inputs. `npm run check:sdk-types` is the non-mutating drift gate.
+
+`lab.execute_code` accepts a TypeScript function body and returns one compact JSON-serializable result. It is limited to 20 KiB source, 10 seconds, 8 MiB isolate heap, 20 inner calls, two concurrent executions per local connection, one `lab.perform`, and one-second watches. Use direct `lab.watch` for blocking watches.

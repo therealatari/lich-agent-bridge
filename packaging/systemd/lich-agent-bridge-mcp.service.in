@@ -1,0 +1,16 @@
+[Unit]
+Description=Lich Agent Bridge local MCP adapter
+After=lich-agent-bridge.service
+Requires=lich-agent-bridge.service
+
+[Service]
+Type=simple
+WorkingDirectory=@WORKING_DIRECTORY@
+Environment="PATH=@EXEC_PATH@"
+Environment="LAB_CONFIG=@CONFIG_FILE@"
+ExecStart="@PROJECT_DIR@/scripts/run-mcp.sh"
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,26 @@
+--- a/scripts/eloot.lic
++++ b/scripts/eloot.lic
+@@ -6192,6 +6192,14 @@
+         if sack.contents.any? { |obj| obj.name.match?(ELoot.data.sell_exclude_regex) && obj.sellable =~ /gemshop/ }
+           bulk_sell = false
+         end
+
++        # Anything configured for value appraisal must be handled one item at a
++        # time.  Otherwise SELL <sack> can bypass the keep-over-limit policy for
++        # jewelry or other valuable items sharing a gem pouch.
++        appraise_types = ELoot.data.settings[:sell_appraise_types]
++        if sack.contents.any? { |obj| obj.type.to_s.split(',').any? { |item_type| appraise_types.include?(item_type) } }
++          bulk_sell = false
++        end
++
+         # Bulk sell sack if it has gems and no exclusions
+         if bulk_sell
+           Inventory.drag(sack) if [checkleft, checkright].index(sack.noun).nil?
+@@ -6698,6 +6706,7 @@
+         # Bulk sell sack if it has gems and no exclusions
+         if sack.contents.any? { |obj| obj.type =~ /gem/ } &&
+            sack.contents.none? { |obj| obj.type =~ /gem/ && obj.name.match?(ELoot.data.sell_exclude_regex) } &&
++           sack.contents.none? { |obj| obj.type.to_s.split(',').any? { |item_type| ELoot.data.settings[:sell_appraise_types].include?(item_type) } } &&
+            ELoot.data.settings[:sell_loot_types].include?("gem") && !ELoot.data.alchemy_mode
+           if type.nil? || type.include?('gem')
+             Inventory.drag(sack) if [checkleft, checkright].index(sack.noun).nil?
