@@ -27,6 +27,38 @@ class SettingsTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_evidence_allowances_default_and_round_trip_per_profile(self) -> None:
+        settings = Settings.load(self.config, environment=self.environment)
+        self.assertEqual(settings.selected_profile.evidence_result_chars, 12_000)
+        self.assertEqual(settings.selected_profile.evidence_total_chars, 36_000)
+        updated = Settings.load(self.config, environment=self.environment, overrides={
+            "profiles": {"default": {
+                "evidence_result_chars": 16_000,
+                "evidence_total_chars": 48_000,
+            }},
+        })
+        updated.write()
+        restored = Settings.load(self.config, environment=self.environment)
+        self.assertEqual(restored.selected_profile.evidence_result_chars, 16_000)
+        self.assertEqual(restored.selected_profile.evidence_total_chars, 48_000)
+        self.assertEqual(restored.redacted()["profiles"]["default"]["evidence_total_chars"], 48_000)
+
+    def test_evidence_allowances_reject_invalid_values_and_impossible_envelopes(self) -> None:
+        cases = [
+            {"evidence_result_chars": True},
+            {"evidence_result_chars": 3000.5},
+            {"evidence_result_chars": 0},
+            {"evidence_result_chars": 100_001},
+            {"evidence_total_chars": "36000"},
+            {"evidence_total_chars": 300_001},
+            {"evidence_result_chars": 12_000, "evidence_total_chars": 12_000},
+        ]
+        for values in cases:
+            with self.subTest(values=values), self.assertRaisesRegex(ConfigurationError, "evidence_"):
+                Settings.load(self.config, environment=self.environment, overrides={
+                    "profiles": {"default": values},
+                })
+
     def write_config(self, text: str) -> None:
         self.config.parent.mkdir(parents=True, exist_ok=True)
         self.config.write_text(text, encoding="utf-8")

@@ -25,6 +25,16 @@ advertised [evidence tools](Evidence-Gathering-Arc.md); they cannot supply
 arbitrary commands. `GET /health` identifies the service and its capabilities
 so clients can reject an incompatible listener.
 
+Question payloads require `character` and `question`. Optional `read_only: true`
+disables game-command recon for this request server-side, without changing global
+action controls. It still permits state/record/reference reads and returns
+`capability: "read_only"`. Omitting the flag preserves normal in-game behavior;
+`false` does not bypass existing action gates. Only JSON booleans are accepted.
+Optional `expected_generation` must be a nonblank generation string and is checked
+under the question-admission lock. An unknown/replaced generation fails with
+HTTP 409 `question_invalidated` before inference. Session replacement during a
+question still invalidates it through the existing cancellation fence.
+
 ## SessionHub interface
 
 Authenticated JSON POST routes provide the shared CLI/MCP facade:

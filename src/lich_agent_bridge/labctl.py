@@ -16,9 +16,10 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
-from .errors import ConfigurationError
+from .errors import ConfigurationError, ValidationError
 from .gswiki import DEFAULT_NAMESPACES, sync
 from .local_connection import read_action_token
+from .question_tests import QuestionSession, load_corpus, run_corpus, validate_question
 from .settings import GeneralWebProvider, ProviderKind, Settings
 from .timings import timing_report
 from .world_state import MAX_WATCH_TIMEOUT_SECONDS
@@ -63,6 +64,30 @@ def parser() -> argparse.ArgumentParser:
 
     state = commands.add_parser("state", help="show the current character snapshot")
     state.add_argument("character")
+
+    ask = commands.add_parser(
+        "ask", help="ask one question using current state (read-only by default)"
+    )
+    ask.add_argument("character")
+    ask.add_argument("question")
+    ask.add_argument(
+        "--allow-recon", action="store_true",
+        help="allow fixed INFO/SKILLS recon through existing action and approval gates",
+    )
+
+    questions = commands.add_parser(
+        "questions", help="record a private sequential corpus (read-only by default)"
+    )
+    questions.add_argument("character")
+    questions.add_argument("corpus", type=Path)
+    questions.add_argument(
+        "--output", type=Path, required=True,
+        help="new private result JSON file (never overwritten)",
+    )
+    questions.add_argument(
+        "--allow-recon", action="store_true",
+        help="allow fixed INFO/SKILLS recon through existing action and approval gates",
+    )
 
     watch = commands.add_parser("watch", help="stream meaningful character events")
     watch.add_argument("character")
@@ -138,13 +163,13 @@ def _request(
     except HTTPError as error:
         try:
             body = json.loads(error.read())
-            detail = body.get("detail", body.get("error", error.reason))
-        except (json.JSONDecodeError, UnicodeError):
+            detail = body.get("detail", body.get("error", error.reason)) if isinstance(body, dict) else error.reason
+        except (json.JSONDecodeError, UnicodeError, RecursionError):
             detail = error.reason
         raise SystemExit(f"LAB request failed ({error.code}): {detail}") from error
     except URLError as error:
         raise SystemExit(f"sidecar unavailable: {error.reason}") from error
-    except (json.JSONDecodeError, UnicodeError) as error:
+    except (json.JSONDecodeError, UnicodeError, RecursionError) as error:
         raise SystemExit("sidecar returned invalid JSON") from error
 
 
@@ -173,13 +198,13 @@ def _post(
     except HTTPError as error:
         try:
             body = json.loads(error.read())
-            detail = body.get("detail", body.get("error", error.reason))
-        except (json.JSONDecodeError, UnicodeError):
+            detail = body.get("detail", body.get("error", error.reason)) if isinstance(body, dict) else error.reason
+        except (json.JSONDecodeError, UnicodeError, RecursionError):
             detail = error.reason
         raise SystemExit(f"LAB request failed ({error.code}): {detail}") from error
     except URLError as error:
         raise SystemExit(f"sidecar unavailable: {error.reason}") from error
-    except (json.JSONDecodeError, UnicodeError) as error:
+    except (json.JSONDecodeError, UnicodeError, RecursionError) as error:
         raise SystemExit("sidecar returned invalid JSON") from error
 
 
@@ -776,6 +801,39 @@ def main(argv: list[str] | None = None) -> None:
                 settings, namespaces=args.namespaces, delay=args.delay
             )
         )
+        return
+
+    if args.command in {"ask", "questions"}:
+        try:
+            if args.command == "ask":
+                validate_question(args.character, args.question)
+                cases = []
+            else:
+                cases = load_corpus(args.corpus, args.character)
+            token = _token(settings)
+            session = QuestionSession(
+                args.character,
+                lambda path: _request(path, settings=settings, token=token),
+                lambda payload, timeout: _post(
+                    "/v1/ask", payload, settings=settings, token=token, timeout=timeout
+                ),
+                allow_recon=args.allow_recon,
+            )
+            if args.command == "ask":
+                result = session.answer(args.question)
+                _dump(result)
+                if result["status"] != "answered":
+                    raise SystemExit(1)
+            else:
+                report = run_corpus(session, cases, args.output)
+                _dump({
+                    "status": report["status"], "output": str(args.output),
+                    "cases": len(cases), "quality_review": "required",
+                })
+                if report["status"] != "completed":
+                    raise SystemExit(1)
+        except (ValidationError, OSError) as error:
+            raise SystemExit(f"cannot run questions: {error}") from error
         return
 
     token = _token(settings)

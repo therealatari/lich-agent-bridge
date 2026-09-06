@@ -18,6 +18,7 @@ from urllib.request import Request, urlopen
 
 from .gswiki import DEFAULT_API_URL, USER_AGENT, wikitext_to_text
 from .settings import GeneralWebProvider, OnlineFallbackPolicy
+from .discovery import source_kind
 
 if TYPE_CHECKING:
     from .settings import Settings
@@ -25,6 +26,10 @@ if TYPE_CHECKING:
 
 _WORD = re.compile(r"[a-z0-9][a-z0-9'-]+")
 _HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+_CONTEXT_LABEL = re.compile(
+    r"^(?:Previous player question|Clarification|Previous answer context \(unverified\)|Previous reference titles):[ \t]*",
+    re.MULTILINE | re.IGNORECASE,
+)
 _REDIRECT = re.compile(r"^\s*#redirect\s*\[\[([^\]|]+)", re.IGNORECASE)
 _CHARACTER_PAGE_BONUS = 30
 _TITLE_TERM_BONUS = 20
@@ -39,6 +44,7 @@ _LIVE_RESPONSE_MAX_BYTES = 524_288
 _LIVE_TIMEOUT_SECONDS = 5.0
 _BRAVE_SEARCH_API_URL = "https://api.search.brave.com/res/v1/web/search"
 _ONLINE_QUERY_NOISE = frozenset({"change", "changes", "mechanics", "updated"})
+_CURATED_QUERY_NOISE = _ONLINE_QUERY_NOISE | {"tell", "explain", "describe", "show"}
 _DEVELOPMENT_TERMS = frozenset({
     "lab", "lich", "api", "code", "coding", "script", "scripts", "scripting",
     "developer", "development", "architecture", "implementation", "implement",
@@ -168,6 +174,7 @@ class LiveGSWikiSource:
         self._now = now or (lambda: datetime.now(UTC))
         self._monotonic = monotonic
         self._last_request_at: float | None = None
+        self._memory_cache: dict[str, Mapping[str, Any]] = {}
 
     def search(
         self, question: str, terms: tuple[str, ...]
@@ -206,7 +213,7 @@ class LiveGSWikiSource:
         self._last_request_at = self._monotonic()
         try:
             payload = self._request(query)
-            excerpts = self._excerpts(payload, terms=terms, retrieved_at=current)
+            excerpts = self._excerpts(payload, terms=terms, retrieved_at=current, preserve_headings=True)
         except HTTPError as error:
             status = "rate_limited" if error.code == 429 else "unavailable"
             return [], KnowledgeSourceDiagnostic(
@@ -249,6 +256,9 @@ class LiveGSWikiSource:
             "format": "json",
             "formatversion": "2",
         }
+        return self._request_parameters(parameters)
+
+    def _request_parameters(self, parameters: Mapping[str, str]) -> Mapping[str, Any]:
         request = Request(
             f"{self._api_url}?{urlencode(parameters)}",
             headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
@@ -262,9 +272,46 @@ class LiveGSWikiSource:
             raise ValueError("GSWiki response is invalid")
         return payload
 
+    def read(self, title: str) -> tuple[KnowledgeExcerpt | None, KnowledgeSourceDiagnostic]:
+        """Read one application-selected page identity, never an arbitrary URL."""
+        # Exact-page snapshots are distinct from query results. Preserve title
+        # case: MediaWiki page names can differ beyond their first character.
+        key = "page:" + title.replace("_", " ").strip()
+        current = self._now()
+        cached = self._read_cache().get(key)
+        if cached is not None and _cache_is_fresh(
+            cached, now=current, ttl_seconds=self._cache_ttl_seconds
+        ):
+            excerpts = _cached_excerpts(cached)
+            if excerpts:
+                return excerpts[0], KnowledgeSourceDiagnostic(
+                    "live_gswiki", "success", "selected page cache hit; original retrieval time retained"
+                )
+        if self._last_request_at is not None and (
+            self._monotonic() - self._last_request_at < self._min_request_interval_seconds
+        ):
+            return None, KnowledgeSourceDiagnostic("live_gswiki", "rate_limited", "exact-page refresh is locally rate limited")
+        self._last_request_at = self._monotonic()
+        try:
+            payload = self._request_parameters({
+                "action": "query", "titles": title, "redirects": "1",
+                "prop": "revisions", "rvprop": "ids|timestamp|content",
+                "rvslots": "main", "format": "json", "formatversion": "2",
+            })
+            excerpts = self._excerpts(payload, terms=(), retrieved_at=current, preserve_headings=True)
+        except HTTPError as error:
+            return None, KnowledgeSourceDiagnostic("live_gswiki", "rate_limited" if error.code == 429 else "unavailable", "exact-page refresh failed")
+        except (URLError, OSError, TimeoutError, ValueError, TypeError, UnicodeError):
+            return None, KnowledgeSourceDiagnostic("live_gswiki", "unavailable", "exact-page refresh unavailable")
+        if not excerpts:
+            return None, KnowledgeSourceDiagnostic("live_gswiki", "empty", "selected page was not returned")
+        self._write_cache(key, excerpts[:1], retrieved_at=current)
+        return excerpts[0], KnowledgeSourceDiagnostic("live_gswiki", "success", "selected page revision retrieved")
+
     @staticmethod
     def _excerpts(
-        payload: Mapping[str, Any], *, terms: tuple[str, ...], retrieved_at: datetime
+        payload: Mapping[str, Any], *, terms: tuple[str, ...], retrieved_at: datetime,
+        preserve_headings: bool = False,
     ) -> list[KnowledgeExcerpt]:
         pages = payload.get("query", {}).get("pages", [])
         if not isinstance(pages, list):
@@ -288,7 +335,7 @@ class LiveGSWikiSource:
                 continue
             if not _usable_page(content, terms):
                 continue
-            text = wikitext_to_text(content)
+            text = _research_text(content) if preserve_headings else wikitext_to_text(content)
             if not text:
                 continue
             url = f"https://gswiki.play.net/{quote(title.replace(' ', '_'), safe='/:()')}"
@@ -318,27 +365,26 @@ class LiveGSWikiSource:
 
     def _read_cache(self) -> dict[str, Mapping[str, Any]]:
         if self._cache_path is None:
-            return {}
+            return dict(self._memory_cache)
         try:
             raw = json.loads(self._cache_path.read_text(encoding="utf-8"))
         except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
-            return {}
+            return dict(self._memory_cache)
         if not isinstance(raw, Mapping):
-            return {}
+            return dict(self._memory_cache)
         entries = raw.get("entries", {})
         if not isinstance(entries, Mapping):
-            return {}
-        return {
-            str(key): value
-            for key, value in entries.items()
-            if isinstance(value, Mapping)
-        }
+            return dict(self._memory_cache)
+        merged = {str(key): value for key, value in entries.items() if isinstance(value, Mapping)}
+        for key, value in self._memory_cache.items():
+            disk = merged.get(key)
+            if disk is None or str(value.get("retrieved_at", "")) > str(disk.get("retrieved_at", "")):
+                merged[key] = value
+        return merged
 
     def _write_cache(
         self, key: str, excerpts: Sequence[KnowledgeExcerpt], *, retrieved_at: datetime
     ) -> None:
-        if self._cache_path is None:
-            return
         entries = self._read_cache()
         entries[key] = {
             "retrieved_at": retrieved_at.astimezone(UTC).isoformat(),
@@ -359,7 +405,10 @@ class LiveGSWikiSource:
             key=lambda item: str(item[1].get("retrieved_at", "")),
             reverse=True,
         )[:_LIVE_CACHE_MAX_ENTRIES]
-        document = {"entries": dict(selected)}
+        self._memory_cache = dict(selected)
+        if self._cache_path is None:
+            return
+        document = {"entries": self._memory_cache}
         try:
             self._cache_path.parent.mkdir(parents=True, exist_ok=True)
             descriptor, temporary = tempfile.mkstemp(
@@ -559,6 +608,12 @@ class KnowledgeBase:
                 else None
             ),
         )
+
+    def open_research(self, *, character: str, max_chars: int = 6000):
+        """Create an isolated source registry for one admitted question."""
+        from .research import ResearchSession
+
+        return ResearchSession(self, character=character, max_chars=max_chars)
 
     def search(self, *, character: str, question: str) -> KnowledgeSearch:
         """Return bounded excerpts and truthful diagnostics for each local source."""
@@ -760,7 +815,11 @@ class KnowledgeBase:
                     character_candidates.append(
                         (score + _CHARACTER_PAGE_BONUS, excerpt)
                     )
-                elif score > 0:
+                elif score > 0 and (
+                    development_query
+                    or build_score
+                    or _curated_gameplay_match(heading, text, terms)
+                ):
                     ranked.append((score, excerpt))
         if character_candidates:
             ranked.append(
@@ -793,7 +852,7 @@ class KnowledgeBase:
         return excerpts, diagnostic
 
     def _search_gswiki(
-        self, *, terms: tuple[str, ...]
+        self, *, terms: tuple[str, ...], full_documents: bool = False
     ) -> tuple[list[KnowledgeExcerpt], KnowledgeSourceDiagnostic]:
         database = self._gswiki_database
         if database is None or not database.exists():
@@ -834,6 +893,7 @@ class KnowledgeBase:
             row = connection.execute(
                 "SELECT value FROM metadata WHERE key = 'last_sync'"
             ).fetchone()
+            mirror_sync = None if row is None else str(row[0])
             rows = connection.execute(
                 """
                 SELECT p.page_id, p.title, p.plain_text, p.wikitext, p.url,
@@ -850,22 +910,42 @@ class KnowledgeBase:
             ).fetchall()
             seen_ids = {int(item["page_id"]) for item in rows}
             numbers = [term for term in terms if term.isdecimal()][:4]
-            if numbers:
+            if numbers or full_documents:
                 # Body matches can fill the general FTS shortlist. A separate
-                # indexed title lookup keeps explicit spell pages in contention.
-                title_query = " OR ".join(f'title : "{number}"' for number in numbers)
+                # indexed title lookup keeps named research pages in contention.
+                # Legacy excerpt callers keep their numeric-only lookup.
+                title_query = " OR ".join(f'title : "{term}"' for term in (terms[:10] if full_documents else numbers))
+                title_rank = 'bm25(pages_fts, 8.0, 1.0)' if full_documents else '0.0'
+                title_order = 'ORDER BY rank, p.title, p.page_id' if full_documents else ''
                 title_rows = connection.execute(
-                    """
+                    f"""
                     SELECT p.page_id, p.title, p.plain_text, p.wikitext, p.url,
-                           p.revision_id, p.namespace, 0.0 AS rank
+                           p.revision_id, p.namespace, {title_rank} AS rank
                       FROM pages_fts
                       JOIN pages AS p ON p.page_id = pages_fts.rowid
                      WHERE pages_fts MATCH ? AND p.namespace IN (0, 4)
-                     LIMIT 12
+                     {title_order} LIMIT 12
                     """, (title_query,),
                 ).fetchall()
                 rows.extend(item for item in title_rows if int(item["page_id"]) not in seen_ids)
                 seen_ids.update(int(item["page_id"]) for item in title_rows)
+            if full_documents:
+                # A body match in a general rules page must remain in contention
+                # even when catalogs fill both the general and title shortlists.
+                # This is an indexed FTS lane, not an unbounded document scan.
+                connection.create_function('discovery_kind', 1, source_kind, deterministic=True)
+                reference_rows = connection.execute(
+                    """
+                    SELECT p.page_id, p.title, p.plain_text, p.wikitext, p.url,
+                           p.revision_id, p.namespace, bm25(pages_fts, 8.0, 1.0) AS rank
+                      FROM pages_fts JOIN pages AS p ON p.page_id = pages_fts.rowid
+                     WHERE pages_fts MATCH ? AND p.namespace IN (0, 4)
+                       AND discovery_kind(p.title) != 'catalog'
+                     ORDER BY rank, p.title, p.page_id LIMIT 12
+                    """, (query,),
+                ).fetchall()
+                rows.extend(item for item in reference_rows if int(item['page_id']) not in seen_ids)
+                seen_ids.update(int(item['page_id']) for item in reference_rows)
             canonical_rows = []
             for item in rows:
                 target = _redirect_target(str(item["wikitext"]))
@@ -889,7 +969,7 @@ class KnowledgeBase:
                     seen_ids.add(int(canonical["page_id"]))
             rows = [*rows, *canonical_rows]
             mirror_diagnostic = _mirror_diagnostic(
-                None if row is None else str(row[0]),
+                mirror_sync,
                 self._mirror_max_age_hours,
                 self._now(),
             )
@@ -921,7 +1001,10 @@ class KnowledgeBase:
         for row in rows:
             if not _usable_page(str(row["wikitext"]), terms):
                 continue
-            text = _best_text_window(row["plain_text"], terms)
+            text = (
+                _research_text(str(row["wikitext"])) or str(row["plain_text"])
+                if full_documents else _best_text_window(row["plain_text"], terms)
+            )
             score = (
                 _score(text.casefold(), terms)
                 + _phrase_bonus(text, terms)
@@ -943,6 +1026,7 @@ class KnowledgeBase:
                         source=row["url"],
                         url=row["url"],
                         revision_id=row["revision_id"],
+                        retrieved_at=mirror_sync if full_documents else None,
                     ),
                 )
             )
@@ -957,6 +1041,25 @@ class KnowledgeBase:
                 source="local_gswiki", status="success", detail=f"matched {len(excerpts)} excerpt(s)"
             )
         return excerpts, diagnostic
+
+
+def _research_text(wikitext: str) -> str:
+    """Retain headings and table structure; this is not a MediaWiki renderer."""
+    tables = []
+    def retain_table(match):
+        tables.append(match[0])
+        return f"LABRESEARCHTABLE{len(tables) - 1}END"
+
+    wikitext = re.sub(r"^\{\|.*?^\|\}[^\n]*", retain_table, wikitext, flags=re.MULTILINE | re.DOTALL)
+    marked = re.sub(
+        r"^(={1,6})[ \t]*(.*?)[ \t]*\1[ \t]*$",
+        lambda match: "#" * len(match[1]) + " " + match[2],
+        wikitext, flags=re.MULTILINE,
+    )
+    text = wikitext_to_text(marked)
+    for index, table in enumerate(tables):
+        text = text.replace(f"LABRESEARCHTABLE{index}END", table)
+    return text
 
 
 def _cache_is_fresh(
@@ -1110,6 +1213,9 @@ def _live_query(terms: tuple[str, ...]) -> str:
 
 
 def _terms(text: str) -> tuple[str, ...]:
+    # Follow-up labels describe the prompt structure, not the requested topic.
+    # Keep the actual prior question/answer text available for disambiguation.
+    text = _CONTEXT_LABEL.sub("", text)
     return tuple(
         dict.fromkeys(
             word
@@ -1117,6 +1223,23 @@ def _terms(text: str) -> tuple[str, ...]:
             if len(word) > 2 and word not in _STOP_WORDS
         )
     )
+
+
+def _curated_gameplay_match(heading: str, text: str, terms: tuple[str, ...]) -> bool:
+    """Do not fill gameplay evidence with one incidental body mention.
+
+    A topic heading can establish relevance on its own. Otherwise require two
+    distinct query terms, not repeated occurrences of the same word. Single-
+    term lookups still work; development and recorded-build routing stay separate.
+    """
+    # Request wording is not a second topic in e.g. "Explain badge".
+    meaningful = tuple(term for term in terms if term not in _CURATED_QUERY_NOISE) or terms
+    if not meaningful:
+        return False
+    if _title_score(heading, meaningful):
+        return True
+    lowered = text.casefold()
+    return sum(term in lowered for term in meaningful) >= min(2, len(meaningful))
 
 
 def _score(text: str, terms: tuple[str, ...]) -> int:
