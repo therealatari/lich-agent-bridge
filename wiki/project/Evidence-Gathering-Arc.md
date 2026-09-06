@@ -21,9 +21,25 @@ before any member runs.
 A direct answer uses one model call. Evidence gathering allows at most three
 rounds, four requests per batch, and eight total requests under one existing
 question deadline. Identical requests reuse their first result rather than
-repeating commands. Individual and aggregate result budgets omit whole records
-with an explicit unknown/omitted status; truncated source fragments must not
-be reported as complete evidence.
+repeating commands. The selected agent profile sets `evidence_result_chars`
+(default 12,000) and `evidence_total_chars` (default 36,000). These are serialized
+character allowances, not token counts, and do not change tool permissions,
+request counts, or the question deadline. Tool payload packing follows the
+per-result allowance while reserving 1,500 characters for its envelope.
+
+Different knowledge queries returning the exact same result envelope can refer
+back to the earlier rendered record rather than repeat its text. Changed
+content, timestamps, revisions, or status remain separate evidence. Omitted
+results are never reused as though their contents were supplied.
+
+Individual and aggregate result budgets omit whole records with an explicit
+unknown/omitted status; truncated source fragments must not be reported as
+complete evidence. Raising an allowance does not force every source to return
+more results or make an incomplete reference complete. Initial context retains
+its separate bound. See [setup](Setup-and-Operations.md#evidence-allowances) for
+configuration and privacy/performance tradeoffs.
+If tool packing omits matching items, the result is `partial`, not `not_found`;
+source diagnostics distinguish budget omissions from genuinely empty results.
 
 All model adapters consume the same answer-or-request contract. Source text,
 tool output, room descriptions, and item descriptions remain untrusted data.

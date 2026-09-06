@@ -27,6 +27,8 @@ SCHEMA_VERSION = 1
 DEFAULT_PORT = 18_765
 DEFAULT_MCP_PORT = 18_766
 DEFAULT_OPENAI_MODEL = "gpt-5.6"
+DEFAULT_EVIDENCE_RESULT_CHARS = 12_000
+DEFAULT_EVIDENCE_TOTAL_CHARS = 36_000
 _MAX_CONFIG_BYTES = 1_048_576
 _NAME = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,63}\Z")
 _ENVIRONMENT_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
@@ -78,6 +80,8 @@ _PROFILE_KEYS = frozenset(
         "timeout_seconds",
         "instructions_file",
         "web_search",
+        "evidence_result_chars",
+        "evidence_total_chars",
     }
 )
 
@@ -165,6 +169,8 @@ class AgentProfile:
     timeout_seconds: float
     instructions_file: Path | None
     web_search: bool
+    evidence_result_chars: int = DEFAULT_EVIDENCE_RESULT_CHARS
+    evidence_total_chars: int = DEFAULT_EVIDENCE_TOTAL_CHARS
 
 
 @dataclass(frozen=True, slots=True)
@@ -293,6 +299,8 @@ class Settings:
                     "timeout_seconds": profile.timeout_seconds,
                     "instructions_file": _path_text(profile.instructions_file),
                     "web_search": profile.web_search,
+                    "evidence_result_chars": profile.evidence_result_chars,
+                    "evidence_total_chars": profile.evidence_total_chars,
                 }
                 for name, profile in self.profiles.items()
             },
@@ -427,6 +435,8 @@ def _default_mapping(*, environment: Mapping[str, str]) -> dict[str, Any]:
                 "timeout_seconds": 120.0,
                 "instructions_file": None,
                 "web_search": False,
+                "evidence_result_chars": DEFAULT_EVIDENCE_RESULT_CHARS,
+                "evidence_total_chars": DEFAULT_EVIDENCE_TOTAL_CHARS,
             }
         },
     }
@@ -769,6 +779,25 @@ def _build_settings(
         web_search = _boolean(
             profile_raw.get("web_search"), f"profiles.{name}.web_search"
         )
+        evidence_result = _integer(
+            profile_raw.get("evidence_result_chars", DEFAULT_EVIDENCE_RESULT_CHARS),
+            f"profiles.{name}.evidence_result_chars",
+        )
+        evidence_total = _integer(
+            profile_raw.get("evidence_total_chars", DEFAULT_EVIDENCE_TOTAL_CHARS),
+            f"profiles.{name}.evidence_total_chars",
+        )
+        if not 3_000 <= evidence_result <= 100_000:
+            raise ConfigurationError(
+                f"profiles.{name}.evidence_result_chars must be between 3000 and 100000"
+            )
+        # Reserve omission notices for all eight evidence requests, even when a
+        # single result uses the full per-result allowance.
+        if not evidence_result + 2_400 <= evidence_total <= 300_000:
+            raise ConfigurationError(
+                f"profiles.{name}.evidence_total_chars must be at least "
+                "evidence_result_chars + 2400 and at most 300000"
+            )
         if providers[provider].kind is ProviderKind.OPENAI and model is None:
             model = DEFAULT_OPENAI_MODEL
         if (
@@ -785,6 +814,8 @@ def _build_settings(
             timeout_seconds=timeout,
             instructions_file=instructions_file,
             web_search=web_search,
+            evidence_result_chars=evidence_result,
+            evidence_total_chars=evidence_total,
         )
 
     selected_profile = _nonblank(raw["selected_profile"], "selected_profile")

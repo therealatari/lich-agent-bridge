@@ -137,6 +137,7 @@ class Copilot:
         max_concurrent_questions: int = 4,
         question_timeout_seconds: float | None = None,
         evidence_tools=None,
+        evidence_loop: EvidenceLoop | None = None,
     ):
         self._model = model
         self._context = context or ContextBuffer()
@@ -148,6 +149,7 @@ class Copilot:
             custom_instructions, evidence_enabled=evidence_tools is not None,
         )
         self._evidence_tools = evidence_tools
+        self._evidence_loop = evidence_loop or EvidenceLoop()
         self._dialogue = _DialogueMemory()
         self._answer_sources: OrderedDict[str, _AnswerSources] = OrderedDict()
         self._state_lock = RLock()
@@ -320,7 +322,7 @@ class Copilot:
         try:
             if self._evidence_tools is not None:
                 session = self._evidence_tools.open(request.character, control)
-                gathered = EvidenceLoop().run(
+                gathered = self._evidence_loop.run(
                     model=self._model, instructions=self._instructions,
                     input_text=rendered, control=control, session=session,
                 )

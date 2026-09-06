@@ -25,6 +25,10 @@ if TYPE_CHECKING:
 
 _WORD = re.compile(r"[a-z0-9][a-z0-9'-]+")
 _HEADING = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+_CONTEXT_LABEL = re.compile(
+    r"^(?:Previous player question|Clarification|Previous answer context \(unverified\)|Previous reference titles):[ \t]*",
+    re.MULTILINE | re.IGNORECASE,
+)
 _REDIRECT = re.compile(r"^\s*#redirect\s*\[\[([^\]|]+)", re.IGNORECASE)
 _CHARACTER_PAGE_BONUS = 30
 _TITLE_TERM_BONUS = 20
@@ -39,6 +43,7 @@ _LIVE_RESPONSE_MAX_BYTES = 524_288
 _LIVE_TIMEOUT_SECONDS = 5.0
 _BRAVE_SEARCH_API_URL = "https://api.search.brave.com/res/v1/web/search"
 _ONLINE_QUERY_NOISE = frozenset({"change", "changes", "mechanics", "updated"})
+_CURATED_QUERY_NOISE = _ONLINE_QUERY_NOISE | {"tell", "explain", "describe", "show"}
 _DEVELOPMENT_TERMS = frozenset({
     "lab", "lich", "api", "code", "coding", "script", "scripts", "scripting",
     "developer", "development", "architecture", "implementation", "implement",
@@ -760,7 +765,11 @@ class KnowledgeBase:
                     character_candidates.append(
                         (score + _CHARACTER_PAGE_BONUS, excerpt)
                     )
-                elif score > 0:
+                elif score > 0 and (
+                    development_query
+                    or build_score
+                    or _curated_gameplay_match(heading, text, terms)
+                ):
                     ranked.append((score, excerpt))
         if character_candidates:
             ranked.append(
@@ -1110,6 +1119,9 @@ def _live_query(terms: tuple[str, ...]) -> str:
 
 
 def _terms(text: str) -> tuple[str, ...]:
+    # Follow-up labels describe the prompt structure, not the requested topic.
+    # Keep the actual prior question/answer text available for disambiguation.
+    text = _CONTEXT_LABEL.sub("", text)
     return tuple(
         dict.fromkeys(
             word
@@ -1117,6 +1129,23 @@ def _terms(text: str) -> tuple[str, ...]:
             if len(word) > 2 and word not in _STOP_WORDS
         )
     )
+
+
+def _curated_gameplay_match(heading: str, text: str, terms: tuple[str, ...]) -> bool:
+    """Do not fill gameplay evidence with one incidental body mention.
+
+    A topic heading can establish relevance on its own. Otherwise require two
+    distinct query terms, not repeated occurrences of the same word. Single-
+    term lookups still work; development and recorded-build routing stay separate.
+    """
+    # Request wording is not a second topic in e.g. "Explain badge".
+    meaningful = tuple(term for term in terms if term not in _CURATED_QUERY_NOISE) or terms
+    if not meaningful:
+        return False
+    if _title_score(heading, meaningful):
+        return True
+    lowered = text.casefold()
+    return sum(term in lowered for term in meaningful) >= min(2, len(meaningful))
 
 
 def _score(text: str, terms: tuple[str, ...]) -> int:

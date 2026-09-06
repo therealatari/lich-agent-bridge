@@ -9,6 +9,7 @@ from typing import Any, Mapping, Protocol
 
 from .errors import ModelError, ValidationError
 from .question import QuestionControl
+from .settings import DEFAULT_EVIDENCE_RESULT_CHARS, DEFAULT_EVIDENCE_TOTAL_CHARS
 
 
 class EvidenceSession(Protocol):
@@ -50,6 +51,8 @@ observation succeeded unless its returned evidence confirms that. You may
 request dependent evidence in a later round. Never repeat an identical request
 to retry a failure: identical requests reuse the first result in this question.
 Do not invent a formula, fact or tool when evidence is missing; explain the gap.
+A reused result refers to the identical complete result at the given zero-based
+evidence array index; use that earlier record's status, content and provenance.
 """
 
 _FINAL_CONTRACT = """
@@ -71,10 +74,20 @@ class EvidenceLoop:
     MAX_ROUNDS = 3
     MAX_BATCH = 4
     MAX_REQUESTS = 8
-    MAX_RESULT_CHARS = 6_000
-    MAX_EVIDENCE_CHARS = 12_000
+    MAX_RESULT_CHARS = DEFAULT_EVIDENCE_RESULT_CHARS
+    MAX_EVIDENCE_CHARS = DEFAULT_EVIDENCE_TOTAL_CHARS
     MAX_TURN_CHARS = 32_000
     MAX_ARGUMENT_CHARS = 2_000
+
+    def __init__(self, *, max_result_chars: int = DEFAULT_EVIDENCE_RESULT_CHARS,
+                 max_evidence_chars: int = DEFAULT_EVIDENCE_TOTAL_CHARS):
+        if type(max_result_chars) is not int or not 3_000 <= max_result_chars <= 100_000:
+            raise ValueError("max_result_chars must be an integer between 3000 and 100000")
+        if (type(max_evidence_chars) is not int
+                or not max_result_chars + 2_400 <= max_evidence_chars <= 300_000):
+            raise ValueError("max_evidence_chars must be an integer between max_result_chars + 2400 and 300000")
+        self.max_result_chars = max_result_chars
+        self.max_evidence_chars = max_evidence_chars
 
     def run(self, *, model, instructions: str, input_text: str,
             control: QuestionControl, session: EvidenceSession) -> EvidenceAnswer:
@@ -84,6 +97,7 @@ class EvidenceLoop:
         contract = instructions + _TURN_CONTRACT + "\nEVIDENCE TOOL CATALOG:\n" + _json(catalog)
         evidence: list[dict[str, Any]] = []
         cached: dict[str, dict[str, Any]] = {}
+        rendered_knowledge: dict[str, int] = {}
         sources: list[Mapping[str, Any]] = []
         diagnostics: list[Mapping[str, Any]] = []
         calls = rounds = requests_used = evidence_chars = 0
@@ -141,30 +155,45 @@ class EvidenceLoop:
                     for item in result.get('diagnostics', ())
                 ]}
                 record = {"request": request, "result": result}
+                # Distinct searches can return exactly the same whole envelope.
+                # Reuse only already-rendered knowledge, including its original
+                # status and provenance; changed revisions are different keys.
+                knowledge_key = _json(result) if request["tool"] == "knowledge.search" else None
+                reused = knowledge_key in rendered_knowledge if knowledge_key is not None else False
+                if reused:
+                    record = {"request": request, "result": {
+                        "status": "reused",
+                        "data": {"same_as_evidence_index": rendered_knowledge[knowledge_key]},
+                    }}
                 serialized = _json(record)
                 # Reserve enough space to truthfully report every possible
                 # omitted result within the same aggregate output budget.
-                available = self.MAX_EVIDENCE_CHARS - (self.MAX_REQUESTS - len(cached)) * 300
-                if len(serialized) > self.MAX_RESULT_CHARS or evidence_chars + len(serialized) + 2 > available:
+                available = self.max_evidence_chars - (self.MAX_REQUESTS - len(cached)) * 300
+                if len(serialized) > self.max_result_chars or evidence_chars + len(serialized) + 2 > available:
                     # Do not cut a source away from its excerpt or report sources
                     # for evidence the model did not actually receive.
                     record = {"request": {"tool": request["tool"]}, "result": {
                         "status": "omitted", "data": None,
                         "detail": "Entire result omitted because it exceeded the evidence output budget; contents are unknown.",
                     }}
-                    limit = 'per_result' if len(serialized) > self.MAX_RESULT_CHARS else 'aggregate'
+                    limit = 'per_result' if len(serialized) > self.max_result_chars else 'aggregate'
                     diagnostics.append({
                         **_diagnostic('result_omitted',
                                       f"{request['tool']} result omitted: {limit} evidence budget exceeded."),
                         'tool': request['tool'], 'limit': limit,
+                        'configured_limit_chars': self.max_result_chars if limit == 'per_result' else self.max_evidence_chars,
+                        'result_chars': len(serialized),
+                        'remaining_chars': max(0, available - evidence_chars - 2),
                     })
                     serialized = _json(record)
                 else:
                     _extend_unique(sources, result.get("sources", ()))
                     _extend_unique(diagnostics, result.get("diagnostics", ()))
+                    if knowledge_key is not None and not reused:
+                        rendered_knowledge[knowledge_key] = len(evidence)
                 cached[key] = record
                 # The reservation above keeps even omission notices bounded.
-                if evidence_chars + len(serialized) + 2 <= self.MAX_EVIDENCE_CHARS:
+                if evidence_chars + len(serialized) + 2 <= self.max_evidence_chars:
                     evidence.append(record)
                     evidence_chars += len(serialized) + 2
                 else:

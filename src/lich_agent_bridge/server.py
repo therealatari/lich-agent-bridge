@@ -35,6 +35,7 @@ from .errors import (ConfigurationError, ModelError, ValidationError, QuestionBu
 from .inventory import InventoryKnowledge
 from .character_knowledge import CharacterKnowledge
 from .evidence_tools import EvidenceTools
+from .evidence_loop import EvidenceLoop
 from .knowledge import KnowledgeBase
 from .model import OpenAICompatibleChatModel, OpenAIResponsesModel
 from .protocol import (
@@ -414,7 +415,14 @@ def build_server(
         context_assembler=assembler,
         timing=timings,
         custom_instructions=custom_instructions_from_settings(resolved),
-        evidence_tools=EvidenceTools(hub, character_knowledge=selected_character_knowledge),
+        evidence_tools=EvidenceTools(
+            hub, character_knowledge=selected_character_knowledge,
+            max_result_chars=resolved.selected_profile.evidence_result_chars,
+        ),
+        evidence_loop=EvidenceLoop(
+            max_result_chars=resolved.selected_profile.evidence_result_chars,
+            max_evidence_chars=resolved.selected_profile.evidence_total_chars,
+        ),
     )
     return LabHTTPServer(
         (selected.host, selected.port),

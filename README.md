@@ -171,6 +171,12 @@ deadline. `;lab forget` invalidates the question and revokes its pending recon;
 commands already dispatched cannot be unsent. `;lab sources` shows the supplied
 references and diagnostics.
 
+Evidence allowances are configurable per agent profile: defaults are 12,000
+characters per result and 36,000 across a question's evidence results. Larger
+allowances can improve multi-source answers but increase model input and may
+send more private context to the configured backend. See
+[evidence settings](wiki/project/Setup-and-Operations.md#evidence-allowances).
+
 ## Shell interface
 
 After installing the package, use the `labctl` entry point:

@@ -22,6 +22,10 @@ The Markdown adapter reads only the configured root. Selected-character pages
 and associated topic pages may be used from a private knowledge directory;
 other characters' notes are excluded. Gameplay questions avoid project
 implementation plans, while development questions can retrieve technical docs.
+Curated gameplay passages must match a topic heading or multiple distinct query
+terms rather than qualify through one incidental body word. Single-term
+lookups and selected-character build records retain their existing routing.
+Follow-up prompt labels are not treated as search topics.
 
 Explicit spell questions prioritize canonical spell evidence over incidental
 mentions. Current-spell queries exclude deprecated pages and unresolved

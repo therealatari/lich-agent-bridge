@@ -15,10 +15,13 @@ from typing import Any, Mapping
 
 from .character_knowledge import category_freshness
 from .errors import QuestionInvalidated, QuestionTimeout, ValidationError
+from .settings import DEFAULT_EVIDENCE_RESULT_CHARS
 
 
-# Leave room for status, provenance and the loop's request wrapper (<6k total).
-MAX_EVIDENCE_CHARS = 4_500
+# The loop enforces the final serialized record limit. Reserve envelope space
+# here while selecting whole data records; never trim their provenance away.
+_ENVELOPE_RESERVE_CHARS = 1_500
+MAX_EVIDENCE_CHARS = DEFAULT_EVIDENCE_RESULT_CHARS - _ENVELOPE_RESERVE_CHARS
 STATE_SECTIONS = {
     "room": ("room", "nearby"),
     "vitals": ("vitals", "stance", "roundtime", "stunned", "dead", "mind", "encumbrance"),
@@ -49,22 +52,27 @@ CATALOG = [
 
 
 class EvidenceTools:
-    def __init__(self, hub, character_knowledge=None):
+    def __init__(self, hub, character_knowledge=None, *, max_result_chars=DEFAULT_EVIDENCE_RESULT_CHARS):
+        if type(max_result_chars) is not int or not 3_000 <= max_result_chars <= 100_000:
+            raise ValueError("max_result_chars must be an integer between 3000 and 100000")
         self.hub = hub
         self.character_knowledge = character_knowledge
+        self.max_result_chars = max_result_chars
 
     def open(self, character, control):
         control.remaining()
-        session = EvidenceSession(self.hub, character, self.character_knowledge)
+        session = EvidenceSession(self.hub, character, self.character_knowledge,
+                                  max_evidence_chars=self.max_result_chars - _ENVELOPE_RESERVE_CHARS)
         control.remaining()
         return session
 
 
 class EvidenceSession:
-    def __init__(self, hub, character, character_knowledge):
+    def __init__(self, hub, character, character_knowledge, *, max_evidence_chars=MAX_EVIDENCE_CHARS):
         self._hub = hub
         self._character = character
         self._knowledge = character_knowledge
+        self._max_evidence_chars = max_evidence_chars
         self._pending: set[str] = set()
         self._closed = False
         snapshot = self._read_snapshot()
@@ -151,7 +159,7 @@ class EvidenceSession:
         for key in fields:
             if snapshot.get(key) is None:
                 missing.append(key)
-            elif len(json.dumps({**result, key: snapshot[key]}, ensure_ascii=False)) > MAX_EVIDENCE_CHARS:
+            elif len(json.dumps({**result, key: snapshot[key]}, ensure_ascii=False)) > self._max_evidence_chars:
                 omitted.append(key)
             else:
                 result[key] = deepcopy(snapshot[key])
@@ -198,7 +206,7 @@ class EvidenceSession:
         bounded = {}
         sources = []
         for category, record in records.items():
-            if len(json.dumps({**bounded, category: record}, ensure_ascii=False)) > MAX_EVIDENCE_CHARS:
+            if len(json.dumps({**bounded, category: record}, ensure_ascii=False)) > self._max_evidence_chars:
                 diagnostics.append({"reason": "output_budget", "omitted_category": category})
                 status = "partial"
                 continue
@@ -273,10 +281,15 @@ class EvidenceSession:
         if not self._hub.inventory.configured:
             return self._envelope("unavailable", {"items": []}, diagnostics=[{"reason": "inventory_not_configured"}])
         result = self._hub.inventory_find({"character": self._character, "query": arguments["query"]})
-        items = self._bounded_items(result["items"], MAX_EVIDENCE_CHARS)
-        return self._envelope("success" if items else "not_found", {"items": items, "total": result["total"], "historical": True},
+        items = self._bounded_items(result["items"], self._max_evidence_chars)
+        omitted = len(result["items"]) - len(items)
+        return self._envelope("partial" if omitted else "success" if items else "not_found", {"items": items, "total": result["total"], "historical": True},
                               sources=[{"source": "recorded_inventory", "dossier_id": item.get("dossier_id"), "observed_at": item.get("last_seen_at")} for item in items],
-                              diagnostics=[{"reason": "output_budget"}] if len(items) < len(result["items"]) else [])
+                              diagnostics=[self._item_omission(omitted)] if omitted else [])
+
+    def _item_omission(self, count):
+        return {"reason": "output_budget", "omitted_items": count,
+                "configured_data_limit_chars": self._max_evidence_chars}
 
     @staticmethod
     def _bounded_items(items, budget, *, duplicate_provenance=False):
@@ -292,10 +305,11 @@ class EvidenceSession:
 
     def _search(self, arguments):
         result = self._hub.wiki_search({"character": self._character, "query": arguments["query"], "limit": 6})
-        items = self._bounded_items(result["items"], MAX_EVIDENCE_CHARS, duplicate_provenance=True)
-        return self._envelope("success" if items else "not_found", {"items": items, "total": result["total"]},
+        items = self._bounded_items(result["items"], self._max_evidence_chars, duplicate_provenance=True)
+        omitted = len(result["items"]) - len(items)
+        return self._envelope("partial" if omitted else "success" if items else "not_found", {"items": items, "total": result["total"]},
                               sources=[{key: value for key, value in item.items() if key != "text"} for item in items],
-                              diagnostics=[*result.get("diagnostics", []), *([{"reason": "output_budget"}] if len(items) < len(result["items"]) else [])])
+                              diagnostics=[*result.get("diagnostics", []), *([self._item_omission(omitted)] if omitted else [])])
 
     def close(self):
         self._closed = True

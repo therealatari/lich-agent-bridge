@@ -99,3 +99,28 @@ Check service health, resolved configuration, selected backend, local files,
 and existing logs first. Status/source/timing queries do not require new game
 commands. Logins, script reloads, snapshots that issue commands, and live
 operations require the user's authorization. Keep raw diagnostic data private.
+
+## Evidence allowances
+
+Edit the selected profile in the settings file reported by `labctl config path`:
+
+```toml
+[profiles.default]
+# Keep the profile's existing provider/model settings.
+evidence_result_chars = 12000
+evidence_total_chars = 36000
+```
+
+These optional fields also appear in `labctl config show` and saved setup
+configuration. Existing files without them use the values above. Profiles can
+use smaller allowances for a local model's limited context, or larger ones for
+multi-source questions. The per-result range is 3,000–100,000 characters; total
+must be at least per-result plus 2,400 characters for omission notices, and no
+more than 300,000. These are character counts, not model-token guarantees.
+
+Higher limits may send more private observations to the selected backend and
+increase input cost, latency, and context usage. Keep the initial context,
+instructions, output, and model context capacity in mind when choosing them.
+The change does not increase evidence rounds, permit additional game commands,
+or override action approval. Apply settings at a deliberate service restart;
+editing configuration alone does not alter an already running sidecar.
