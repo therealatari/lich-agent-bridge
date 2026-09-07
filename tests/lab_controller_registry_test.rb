@@ -5,6 +5,35 @@ require 'tempfile'
 load File.expand_path('../lich/lab-controller-registry.rb', __dir__)
 
 class LabControllerRegistryTest < Minitest::Test
+  def test_test_registration_rejects_changed_command_policy_and_metadata
+    raw = {
+      'name' => 'test-probe', 'script' => 'lab-test-runner', 'summary' => 'Synthetic lifecycle test.',
+      'characters' => ['Testmage'], 'result_global' => '$lab_test_result', 'signal_global' => '$lab_test_cancel',
+      'lanes' => %w[movement combat], 'owner_scripts' => %w[lab-test-runner probe],
+      'safe_handoff' => {'kind' => 'room', 'room_id' => '1000'}, 'capability_action' => 'start',
+      'test_suite' => {'manifest' => 'suite.json', 'files' => %w[suite.json probe.lic lab-test-runner.lic lab-test-runner.rb].to_h { |name| [name, 'a' * 64] }},
+      'actions' => [{'name' => 'start', 'kind' => 'launch', 'launch_mode' => 'start',
+                     'command_template' => 'lab-test probe {revision} {case_id}',
+                     'script_args_template' => 'probe {revision} {case_id}',
+                     'policy' => {'category' => 'configuration', 'confirmation_required' => true},
+                     'parameters' => [{'name' => 'revision', 'type' => 'enum', 'values' => ['a' * 64]},
+                                      {'name' => 'case_id', 'type' => 'enum', 'values' => %w[normal all]}]}]
+    }
+    assert LabControllerRegistry::Controller.new(raw, 'test').test_suite
+    mutations = [
+      ->(data) { data['actions'][0]['command_template'] = 'something-else {revision} {case_id}' },
+      ->(data) { data['actions'][0]['policy']['confirmation_required'] = false },
+      ->(data) { data['actions'][0]['parameters'][0]['values'] = ['b' * 64] },
+      ->(data) { data['characters'] << 'Othermage' },
+      ->(data) { data['test_suite']['manifest'] = 'probe.lic' }
+    ]
+    mutations.each do |mutation|
+      changed = JSON.parse(JSON.generate(raw))
+      mutation.call(changed)
+      assert_raises(LabControllerRegistry::ManifestError) { LabControllerRegistry::Controller.new(changed, 'test') }
+    end
+  end
+
   def setup
     @path = File.expand_path('fixtures/controllers.json', __dir__)
     @registry = LabControllerRegistry.load(@path)

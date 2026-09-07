@@ -11,6 +11,7 @@
 - [Research workspace plan](Research-Workspace-Plan.md): approved search/read redesign and acceptance gates.
 - [Discovery ranking plan](Discovery-Ranking-Plan.md): bounded recall, explainable ranking, and relevance regressions.
 - [Developer testing](Developer-Testing.md): isolated tests and authorized live checks.
+- [Script-test pilot plan](Script-Test-Pilot-Plan.md): trusted non-combat suites, scope fence, and verification gates.
 - [Configuration and knowledge](Configuration-and-Knowledge-Arc.md): settings and providers.
 - [Reliability requirements](Developer-Reliability-Arc.md): failure-mode acceptance.
 - [Capability roadmap](Capability-Roadmap.md): registered extensions and limits.

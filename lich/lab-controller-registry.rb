@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require 'json'
+require_relative 'lab-test-runner'
 
 # Strict, shared controller metadata. The manifest owns controller command
 # grammar and bindings; runtime behavior remains in the controller cores and
@@ -200,12 +201,12 @@ module LabControllerRegistry
   class Controller
     attr_reader :name, :script, :summary, :characters, :result_global,
                 :signal_global, :lanes, :owner_scripts, :safe_handoff,
-                :capability_action, :actions
+                :capability_action, :actions, :test_suite
 
     def initialize(raw, context)
       Registry.strict_keys(
         raw,
-        %w[name script summary characters result_global signal_global lanes owner_scripts safe_handoff capability_action actions],
+        %w[name script summary characters result_global signal_global lanes owner_scripts safe_handoff capability_action actions test_suite],
         %w[name script summary characters result_global lanes owner_scripts safe_handoff capability_action actions],
         context
       )
@@ -227,6 +228,33 @@ module LabControllerRegistry
       raise ManifestError, "#{context}.actions contains duplicate names" unless @actions.map(&:name).uniq.length == @actions.length
       raise ManifestError, "#{context}.capability_action was not found" unless action(@capability_action)
       raise ManifestError, "#{context}.signal_global is required by signal action" if @actions.any? { |item| item.kind == 'signal' } && !@signal_global
+      if raw.key?('test_suite')
+        begin
+          @test_suite = LabTestRunner.metadata!(raw['test_suite'])
+        rescue LabTestRunner::Invalid => error
+          raise ManifestError, error.message
+        end
+        raise ManifestError, 'test suite must use the fixed runner and result globals' unless
+          @script == 'lab-test-runner' && @result_global == '$lab_test_result' && @signal_global == '$lab_test_cancel'
+        raise ManifestError, 'test suite requires room-bound handoff and exclusion lanes' unless
+          @safe_handoff['kind'] == 'room' && @lanes.sort == %w[combat movement]
+        raise ManifestError, 'test suite only supports a registered launch' unless
+          @actions.length == 1 && @actions.first.kind == 'launch' && @actions.first.launch_mode == 'start'
+        suite_id = @name.delete_prefix('test-')
+        raise ManifestError, 'test registration must bind one character and fixed capability' unless
+          @name.start_with?('test-') && LabTestRunner::ID.match?(suite_id) && @characters.length == 1 &&
+          @capability_action == 'start' && @owner_scripts.include?('lab-test-runner')
+        launch = @actions.first
+        params = launch.parameters.to_h { |parameter| [parameter.name, parameter] }
+        raise ManifestError, 'invalid test launch contract' unless launch.name == 'start' &&
+          launch.category == 'configuration' && launch.confirmation_required &&
+          launch.command_template == "lab-test #{suite_id} {revision} {case_id}" &&
+          launch.script_args_template == "#{suite_id} {revision} {case_id}" &&
+          params.keys.sort == %w[case_id revision] && params['revision'].type == 'enum' &&
+          params['revision'].values == [@test_suite['files'][@test_suite['manifest']]] &&
+          params['case_id'].type == 'enum' && params['case_id'].values.include?('all') &&
+          params['case_id'].values.length.between?(2, 21)
+      end
     end
 
     def action(name)

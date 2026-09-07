@@ -8,6 +8,7 @@ state transitions live here.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import secrets
@@ -82,6 +83,8 @@ class ActionProposal:
     expected_room_id: str | None = None
     expected_generation: str | None = None
     ttl_seconds: int = DEFAULT_TTL_SECONDS
+    # Internal owner deadline; the HTTP proposal schema deliberately omits it.
+    deadline: float | None = None
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ActionProposal":
@@ -400,6 +403,10 @@ class CommandPolicy:
     def __init__(self, controller_manifest: ControllerManifest | None = None):
         self._controller_manifest = controller_manifest or ControllerManifest.load()
 
+    def is_test_launch(self, command: str) -> bool:
+        matched = self._controller_manifest.match_command(command)
+        return matched is not None and matched.controller.test_suite is not None
+
     def evaluate(self, command: str) -> tuple[str, PolicyDecision]:
         if any(character in command for character in ("\r", "\n", ";", "|", "&")):
             raise ValidationError("command chaining or control characters are forbidden")
@@ -460,6 +467,8 @@ class _Action:
     notified: bool = False
     completion: str | None = None
     detail: str | None = None
+    test_run: bool = False
+    stop_requested: bool = False
 
     def public(self, *, instruction: str) -> dict[str, Any]:
         result = {
@@ -480,6 +489,8 @@ class _Action:
             result["completion"] = self.completion
         if self.detail is not None:
             result["detail"] = self.detail
+        if self.test_run:
+            result["stop_requested"] = self.stop_requested
         return result
 
 
@@ -533,6 +544,10 @@ class ActionBroker:
             cancelled: list[str] = []
             if previous is not None and previous != admitted_generation:
                 for action in self._actions.values():
+                    if (action.test_run and action.character.casefold() == character_key
+                            and action.generation != admitted_generation
+                            and action.status in {"dispatched", "completed", "failed"}):
+                        action.stop_requested = True
                     if (
                         action.character.casefold() == character_key
                         and action.generation != admitted_generation
@@ -574,6 +589,9 @@ class ActionBroker:
             else:
                 self._enabled.discard(character_key)
                 for action in self._actions.values():
+                    if (action.test_run and action.character.casefold() == character_key
+                            and action.status in {"dispatched", "completed", "failed"}):
+                        action.stop_requested = True
                     if (
                         action.character.casefold() == character_key
                         and action.status in {"confirmation_required", "queued"}
@@ -605,6 +623,12 @@ class ActionBroker:
             if character_key not in self._enabled:
                 raise ValidationError(f"actions are disabled for {proposal.character}")
             now = self._clock()
+            expires_at = now + proposal.ttl_seconds
+            if proposal.deadline is not None:
+                if (isinstance(proposal.deadline, bool) or not isinstance(proposal.deadline, (int, float))
+                        or not math.isfinite(proposal.deadline) or proposal.deadline <= now):
+                    raise ValidationError("operation deadline expired or invalid before action admission")
+                expires_at = min(expires_at, proposal.deadline)
             action = _Action(
                 action_id=secrets.token_hex(8),
                 character=proposal.character,
@@ -614,8 +638,9 @@ class ActionBroker:
                 status=("confirmation_required" if confirmation_required else "queued"),
                 expected_room_id=proposal.expected_room_id,
                 created_at=now,
-                expires_at=now + proposal.ttl_seconds,
+                expires_at=expires_at,
                 confirmation_required=confirmation_required,
+                test_run=(len(normalized_commands) == 1 and self._policy.is_test_launch(normalized_commands[0])),
             )
             self._audit(
                 {
@@ -831,6 +856,26 @@ class ActionBroker:
                 })
                 self._changed.notify_all()
             return {**action.public(instruction=action.status), "cancelled": cancelled}
+
+    def request_test_stop(self, action_id: str, *, character: str, generation: str) -> dict[str, Any]:
+        """Internal exact-owner stop; dispatched work remains dispatched/completed."""
+        with self._lock:
+            action = self._find_locked(_action_id(action_id))
+            if (action.character.casefold() != _character(character).casefold()
+                    or action.generation != _generation(generation)):
+                raise ValidationError("test action belongs to another character or generation")
+            if not action.test_run:
+                raise ValidationError("action is not a registered test launch")
+            self._expire_locked()
+            if action.status in {"confirmation_required", "queued"}:
+                action.status = "cancelled"
+            elif action.status in {"dispatched", "completed", "failed"}:
+                action.stop_requested = True
+            self._audit({"event": "test_stop_requested", "action_id": action.action_id,
+                         "character": action.character, "generation": action.generation,
+                         "status": action.status, "stop_requested": action.stop_requested})
+            self._changed.notify_all()
+            return action.public(instruction=action.status)
 
     def _poll_locked(self, context: ActionContext) -> dict[str, Any] | None:
         self._expire_locked()

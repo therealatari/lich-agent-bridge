@@ -1,5 +1,7 @@
 require 'minitest/autorun'
 require 'timeout'
+require 'tmpdir'
+require 'fileutils'
 
 ENV['LAB_BRIDGE_LIBRARY_ONLY'] = '1'
 ENV['LAB_CONTROLLER_MANIFEST'] = File.expand_path('fixtures/controllers.json', __dir__)
@@ -82,6 +84,228 @@ def waitcastrt? = (($roundtime_waits ||= []) << :cast_roundtime)
 load File.expand_path('../lich/lab-bridge.lic', __dir__)
 
 class LabBridgeTest < Minitest::Test
+  class OwnedTestScript
+    attr_accessor :thread, :exit_error, :cleanup_blocked
+    attr_reader :file_name, :vars, :kills
+    def initialize(path, args)
+      @file_name, @vars, @kills = path, [args, *args.split(' ')], 0
+    end
+    def join(timeout) = !cleanup_blocked && thread&.join(timeout) && self
+    def kill_sync(timeout:)
+      @kills += 1
+      thread&.kill
+      join(timeout)
+    end
+    def completed_successfully? = exit_error.nil? && @kills.zero?
+  end
+
+  def with_pinned_test_runtime
+    Dir.mktmpdir('lab-bridge-pilot-') do |temporary|
+      scripts = File.join(temporary, 'scripts')
+      Dir.mkdir(scripts)
+      Dir.mkdir(File.join(temporary, 'data'))
+      %w[lab-test-runner.rb lab-test-runner.lic].each do |name|
+        FileUtils.cp(File.expand_path("../lich/#{name}", __dir__), File.join(scripts, name))
+      end
+      File.write(File.join(scripts, 'probe.lic'), "raise 'wrong fixed args' unless Script.current.vars.drop(1) == ['normal']\n")
+      suite = {'version' => 1, 'id' => 'probe', 'script' => 'probe', 'files' => ['probe.lic'],
+               'cases' => [{'id' => 'normal', 'args' => ['normal'], 'assertions' => [{'field' => 'room_id', 'op' => 'unchanged'}]}],
+               'limits' => {'case_seconds' => 0.2, 'run_seconds' => 1, 'cleanup_seconds' => 0.1}}
+      File.write(File.join(scripts, 'suite.json'), JSON.generate(suite))
+      pins = %w[suite.json probe.lic lab-test-runner.lic lab-test-runner.rb].to_h { |name| [name, Digest::SHA256.file(File.join(scripts, name)).hexdigest] }
+      registration = {'name' => 'test-probe', 'script' => 'lab-test-runner', 'summary' => 'Synthetic test.',
+                      'characters' => ['Testmage'], 'result_global' => '$lab_test_result', 'signal_global' => '$lab_test_cancel',
+                      'lanes' => %w[movement combat], 'owner_scripts' => %w[lab-test-runner probe],
+                      'safe_handoff' => {'kind' => 'room', 'room_id' => '1000'}, 'capability_action' => 'start',
+                      'test_suite' => {'manifest' => 'suite.json', 'files' => pins},
+                      'actions' => [{'name' => 'start', 'kind' => 'launch', 'launch_mode' => 'start',
+                                     'command_template' => 'lab-test probe {revision} {case_id}',
+                                     'script_args_template' => 'probe {revision} {case_id}',
+                                     'policy' => {'category' => 'configuration', 'confirmation_required' => true},
+                                     'parameters' => [{'name' => 'revision', 'type' => 'enum', 'values' => [pins['suite.json']]},
+                                                      {'name' => 'case_id', 'type' => 'enum', 'values' => %w[normal all]}]}]}
+      controller = LabControllerRegistry::Controller.new(registration, 'test')
+      registry = LabControllerRegistry::Registry.new([controller], 'synthetic')
+      command = "lab-test probe #{pins['suite.json']} normal"
+      match = registry.match(command)
+      action = {action_id: 'owned-test-action', character: 'Testmage', generation: LichAgentBridge.session_generation,
+                expected_room_id: '1000', command: command, expires_at: Time.now.to_f + 5}
+      originals = %i[start_child current running? __find_script_file].to_h { |name| [name, (Script.method(name) rescue nil)] }
+      bridge_originals = %i[test_runtime_supported? snapshot_state publish_snapshot publish_controller_result request action_request].to_h { |name| [name, LichAgentBridge.method(name)] }
+      old_dir = $script_dir
+      old_run = LichAgentBridge.instance_variable_get(:@test_run)
+      $script_dir = scripts
+      LichAgentBridge.instance_variable_set(:@test_run, nil)
+      events, instances = Queue.new, []
+      Script.define_singleton_method(:current) { Thread.current[:pilot_script] || originals[:current].call }
+      Script.define_singleton_method(:running?) { |name| instances.any? { |instance| File.basename(instance.file_name, '.lic') == name && !instance.join(0) } }
+      Script.define_singleton_method(:__find_script_file) { |name| "#{name}.lic" }
+      Script.define_singleton_method(:start_child) do |name, args, _options|
+        instance = OwnedTestScript.new(File.join(scripts, "#{name}.lic"), args)
+        instances << instance
+        instance.thread = Thread.new do
+          Thread.current[:pilot_script] = instance
+          begin
+            load instance.file_name
+          rescue StandardError => error
+            instance.exit_error = error
+          end
+        end
+        instance
+      end
+      LichAgentBridge.define_singleton_method(:test_runtime_supported?) { true }
+      LichAgentBridge.define_singleton_method(:snapshot_state) do
+        {character: 'Testmage', generation: action[:generation], room: {id: '1000'}, dead: false, stunned: false,
+         hands: {right: nil, left: nil}, scripts: [], owners: {movement: nil, combat: nil}}
+      end
+      LichAgentBridge.define_singleton_method(:publish_snapshot) { |**_options| events << [:snapshot] }
+      LichAgentBridge.define_singleton_method(:publish_controller_result) { |_controller, id, result| events << [:result, id, result] }
+      LichAgentBridge.define_singleton_method(:request) { |*_args, **_options| action.merge(status: 'dispatched', stop_requested: false) }
+      requests = @requests
+      LichAgentBridge.define_singleton_method(:action_request) { |path, payload| requests << [path, payload]; {} }
+      yield action, match, events, instances
+    ensure
+      instances&.each { |instance| instance.kill_sync(timeout: 0.1) unless instance.join(0) }
+      originals&.each do |name, method|
+        method ? Script.define_singleton_method(name, method) : Script.singleton_class.send(:remove_method, name)
+      end
+      bridge_originals&.each { |name, method| LichAgentBridge.define_singleton_method(name, method) }
+      $script_dir = old_dir
+      LichAgentBridge.instance_variable_set(:@test_run, old_run)
+    end
+  end
+
+  def test_pinned_bridge_launch_claim_and_monitor_publish_owned_report_after_exit
+    with_pinned_test_runtime do |action, match, events, instances|
+      LichAgentBridge.execute_controller_action(action, match)
+      assert_equal [:snapshot], Timeout.timeout(2) { events.pop }
+      event = Timeout.timeout(2) { events.pop }
+      assert_equal [:result, action[:action_id]], event.first(2)
+      assert event.last[:ok], event.last.inspect
+      assert_equal %w[lab-test-runner.lic probe.lic], instances.map { |instance| File.basename(instance.file_name) }
+      assert instances.all? { |instance| instance.join(0) }
+      report = JSON.parse(File.read(event.last[:details][:report_path]))
+      assert_equal action[:action_id], report['action_id']
+      assert_equal 'passed', report['cases'][0]['status']
+      assert LichAgentBridge.test_run_released?(LichAgentBridge.instance_variable_get(:@test_run))
+    end
+  end
+
+  def test_pinned_bridge_rejects_unsupported_runtime_without_launch
+    with_pinned_test_runtime do |action, match, _events, instances|
+      LichAgentBridge.define_singleton_method(:test_runtime_supported?) { false }
+      LichAgentBridge.execute_controller_action(action, match)
+      assert_empty instances
+      assert_equal 'failed', @requests.last[1][:outcome]
+      assert_includes @requests.last[1][:detail], 'unsupported loaded Lich lifecycle'
+    end
+  end
+
+  def test_incomplete_cleanup_result_arrives_even_when_wrapper_teardown_is_blocked
+    with_pinned_test_runtime do |action, match, events, instances|
+      original_start = Script.method(:start_child)
+      Script.define_singleton_method(:start_child) do |*args|
+        instance = original_start.call(*args)
+        instance.cleanup_blocked = true
+        instance
+      end
+      LichAgentBridge.execute_controller_action(action, match)
+      assert_equal [:snapshot], Timeout.timeout(2) { events.pop }
+      event = Timeout.timeout(2) { events.pop }
+      refute event.last[:ok]
+      refute event.last[:details][:cleanup_complete]
+      refute LichAgentBridge.test_run_released?(LichAgentBridge.instance_variable_get(:@test_run))
+      assert_equal 2, instances.length
+      LichAgentBridge.execute_controller_action(action, match)
+      assert_equal 2, instances.length, 'an unresolved cleanup must not launch a successor'
+      assert_equal 'failed', @requests.last[1][:outcome]
+      instances.each { |instance| instance.cleanup_blocked = false }
+      assert instances.all? { |instance| instance.join(0.2) }
+    end
+  end
+
+  def test_private_report_failure_starts_no_target_and_does_not_orphan_wrapper
+    with_pinned_test_runtime do |action, match, events, instances|
+      report_directory = File.expand_path('../data/lab-script-tests', $script_dir)
+      File.write(report_directory, 'protected existing file')
+      LichAgentBridge.execute_controller_action(action, match)
+      assert_equal [:snapshot], Timeout.timeout(2) { events.pop }
+      result = Timeout.timeout(2) { events.pop }.last
+      refute result[:ok]
+      assert_equal 'runner_failed', result[:code]
+      assert_equal ['lab-test-runner.lic'], instances.map { |instance| File.basename(instance.file_name) }
+      assert LichAgentBridge.test_run_released?(LichAgentBridge.instance_variable_get(:@test_run))
+      assert_equal 'protected existing file', File.read(report_directory)
+    end
+  end
+
+  def test_failed_wrapper_lifecycle_cannot_publish_a_passed_child_report_as_success
+    with_pinned_test_runtime do |action, match, events, _instances|
+      original_start = Script.method(:start_child)
+      Script.define_singleton_method(:start_child) do |*args|
+        instance = original_start.call(*args)
+        instance.define_singleton_method(:completed_successfully?) { false } if args.first == 'lab-test-runner'
+        instance
+      end
+      LichAgentBridge.execute_controller_action(action, match)
+      assert_equal [:snapshot], Timeout.timeout(2) { events.pop }
+      result = Timeout.timeout(2) { events.pop }.last
+      refute result[:ok]
+      assert_equal 'wrapper_failed', result[:code]
+      refute result[:details][:assertions_passed]
+    end
+  end
+
+  def test_test_exclusion_retains_an_owned_child_after_wrapper_exit
+    child = Object.new
+    finished = false
+    child.define_singleton_method(:join) { |_timeout| finished ? self : nil }
+    runner = Object.new
+    runner.define_singleton_method(:cleanup_complete?) { !!child.join(0) }
+    wrapper = Object.new
+    wrapper.define_singleton_method(:join) { |_timeout| self }
+    run = {instance: wrapper, runner: runner}
+    refute LichAgentBridge.test_run_released?(run)
+    finished = true
+    assert LichAgentBridge.test_run_released?(run)
+  end
+
+  def test_test_snapshot_preserves_known_empty_hands_and_rejects_new_combat_owner
+    original_snapshot = LichAgentBridge.method(:snapshot_state)
+    state = {character: 'Testmage', generation: 'g', room: {id: '1000'},
+             dead: false, stunned: false, hands: {right: nil, left: nil},
+             scripts: ['lab-test-runner'], owners: {movement: 'lab-test-runner', combat: 'lab-test-runner'}}
+    LichAgentBridge.define_singleton_method(:snapshot_state) { state }
+    context = {'excluded_scripts' => [], 'owned_scripts' => ['lab-test-runner', 'probe']}
+    snapshot = LichAgentBridge.test_local_snapshot(context)
+    assert_equal '', snapshot['right_hand_id']
+    assert_equal '', snapshot['left_hand_id']
+    state[:owners][:combat] = 'bigshot'
+    assert_raises(LabTestRunner::Halt) { LichAgentBridge.test_local_snapshot(context) }
+  ensure
+    LichAgentBridge.define_singleton_method(:snapshot_state, original_snapshot)
+  end
+
+  def test_test_control_checks_exact_run_identity_stop_and_bridge_kill_switch
+    original_request = LichAgentBridge.method(:request)
+    context = {'action_id' => 'owned-action', 'character' => 'Testmage',
+               'generation' => LichAgentBridge.session_generation,
+               'room_id' => '1000', 'command' => 'lab-test probe revision normal'}
+    reply = context.transform_keys(&:to_sym).merge(expected_room_id: '1000', status: 'dispatched', stop_requested: false)
+    LichAgentBridge.define_singleton_method(:request) { |*_args, **_options| reply }
+    assert LichAgentBridge.test_run_control(context)
+    reply[:action_id] = 'successor-action'
+    refute LichAgentBridge.test_run_control(context)
+    reply[:action_id] = 'owned-action'
+    reply[:stop_requested] = true
+    refute LichAgentBridge.test_run_control(context)
+    reply[:stop_requested] = false
+    LichAgentBridge.instance_variable_set(:@actions_enabled, false)
+    refute LichAgentBridge.test_run_control(context)
+  ensure
+    LichAgentBridge.define_singleton_method(:request, original_request)
+  end
+
   def setup
     @requests = []
     $plain_responses = []

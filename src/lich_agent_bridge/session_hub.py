@@ -605,15 +605,17 @@ class SessionHub:
         return {"character": character, "items": items, "total": len(items)}
 
     def perform(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        character, capability, arguments = self._perform_request(payload)
-        operation = self.capabilities.perform(character, capability, arguments)
+        character, capability, arguments, generation = self._perform_request(payload)
+        options = {} if generation is None else {"expected_generation": generation}
+        operation = self.capabilities.perform(character, capability, arguments, **options)
         return self._operation_mapping(operation)
 
     def start_operation(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """Admit an operation and return immediately with its stable ID."""
 
-        character, capability, arguments = self._perform_request(payload)
-        operation = self.capabilities.start(character, capability, arguments)
+        character, capability, arguments, generation = self._perform_request(payload)
+        options = {} if generation is None else {"expected_generation": generation}
+        operation = self.capabilities.start(character, capability, arguments, **options)
         return self._operation_mapping(operation)
 
     def watch_operation(self, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -657,10 +659,26 @@ class SessionHub:
         request = _strict(
             payload,
             label="operation stop request",
-            allowed={"character"},
+            allowed={"character", "operation_id", "expected_generation"},
             required={"character"},
         )
         character = _character(request["character"])
+        if "operation_id" in request or "expected_generation" in request:
+            if not {"operation_id", "expected_generation"}.issubset(request):
+                raise ValidationError("exact stop requires operation_id and expected_generation")
+            operation_id = _text(request["operation_id"], "operation_id", maximum=64)
+            generation = _text(request["expected_generation"], "expected_generation", maximum=128)
+            operation = self.capabilities.get(operation_id)
+            bound_generation = (operation.start_state.generation if operation.start_state is not None
+                                else operation.expected_generation)
+            if operation.character.casefold() != character.casefold() or generation != bound_generation:
+                raise ValidationError("stop identity does not match the operation")
+            if operation.status in {"succeeded", "failed", "timed_out", "interrupted"}:
+                return {"character": character, "stopped": False, "operation_id": operation_id,
+                        "reason": "operation_already_terminal"}
+            self.capabilities.interrupt(operation_id)
+            return {"character": character, "stopped": True, "stop_requested": True,
+                    "operation_id": operation_id}
         active = [
             operation
             for operation in self.capabilities.history(character)
@@ -670,6 +688,8 @@ class SessionHub:
             return {"character": character, "stopped": False, "reason": "no_active_operation"}
         if len(active) != 1:
             raise ValidationError("multiple active operations require explicit inspection")
+        if self.capabilities.is_test_operation(active[0]):
+            raise ValidationError("test run stop requires operation_id and expected_generation")
         self.capabilities.interrupt(active[0].operation_id)
         return {
             "character": character,
@@ -680,11 +700,11 @@ class SessionHub:
     @staticmethod
     def _perform_request(
         payload: Mapping[str, Any],
-    ) -> tuple[str, str, dict[str, Any]]:
+    ) -> tuple[str, str, dict[str, Any], str | None]:
         request = _strict(
             payload,
             label="perform request",
-            allowed={"character", "capability", "args"},
+            allowed={"character", "capability", "args", "expected_generation"},
             required={"character", "capability"},
         )
         character = _character(request["character"])
@@ -694,7 +714,9 @@ class SessionHub:
         arguments = request.get("args", {})
         if not isinstance(arguments, Mapping):
             raise ValidationError("args must be an object")
-        return character, capability, dict(arguments)
+        generation = (None if "expected_generation" not in request else
+                      _text(request["expected_generation"], "expected_generation", maximum=128))
+        return character, capability, dict(arguments), generation
 
     @staticmethod
     def _knowledge_mapping(excerpt: KnowledgeExcerpt) -> dict[str, Any]:

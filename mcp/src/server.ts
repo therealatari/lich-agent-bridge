@@ -42,9 +42,9 @@ export function createApp(config: AdapterConfig) {
           description: entry.description,
           inputSchema: entry.input,
           annotations: {
-            readOnlyHint: entry.route !== 'perform',
-            destructiveHint: entry.route === 'perform',
-            idempotentHint: entry.route !== 'perform',
+            readOnlyHint: entry.route !== 'perform' && entry.route !== 'operationStop',
+            destructiveHint: entry.route === 'perform' || entry.route === 'operationStop',
+            idempotentHint: entry.route !== 'perform' && entry.route !== 'operationStop',
             openWorldHint: false,
           },
         },
@@ -54,7 +54,7 @@ export function createApp(config: AdapterConfig) {
     server.registerTool(
       'lab.execute_code',
       {
-        description: `Execute bounded TypeScript against the isolated LAB SDK. Use for dependent reads, compact aggregation, or reads followed by at most one perform. Long watches must use direct lab.watch.\n${SDK_TYPE_DECLARATIONS}`,
+        description: `Execute bounded TypeScript against the isolated LAB SDK. Use for dependent reads, compact aggregation, or reads followed by at most one perform or stop. Long watches must use direct lab.watch.\n${SDK_TYPE_DECLARATIONS}`,
         inputSchema: EXECUTE_CODE_INPUT,
         annotations: {
           readOnlyHint: false,

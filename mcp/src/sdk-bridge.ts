@@ -30,9 +30,9 @@ export function createBridge(client: SessionHubCaller, state: BridgeState) {
         const entry = entryBySdkMethod(method);
         if (!entry) throw new Error(`Unknown LAB SDK method '${method}'`);
         step.tool = entry.toolName;
-        if (entry.route === 'perform') {
+        if (entry.route === 'perform' || entry.route === 'operationStop') {
           state.performCalls += 1;
-          if (state.performCalls > 1) throw new Error('At most one lab.perform call is allowed per execute_code operation');
+          if (state.performCalls > 1) throw new Error('At most one lab.perform or lab.stop call is allowed per execute_code operation');
         }
         const parsed = entry.input.safeParse(params ?? {});
         if (!parsed.success) {

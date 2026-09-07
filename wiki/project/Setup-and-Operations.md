@@ -37,6 +37,7 @@ Copy or symlink each file into the active Lich scripts directory:
 - `lich/lab-inventory.lic`
 - `lich/lich-state-core.rb`
 - `lich/lab-controller-registry.rb`
+- `lich/lab-test-runner.rb`
 - `lich/lab-controllers.json`
 
 Lich resolves these dependencies in its scripts directory even when the
@@ -45,6 +46,11 @@ for inventory tracking.
 
 The public controller manifest is empty. Personal combat scripts, hunt profiles,
 and character policy are neither bundled nor required for the bridge.
+
+The optional trusted script-test pilot also needs `lich/lab-test-runner.lic`.
+Use real copies of the runner pair and reviewed suite files for that pilot:
+revision pinning rejects symlink substitutions. Merely installing these files
+does not register a suite or grant test execution authority.
 
 ## Start deliberately
 

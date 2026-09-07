@@ -325,6 +325,7 @@ class ControllerDefinition:
     safe_handoff: Mapping[str, Any]
     capability_action: str
     actions: tuple[ControllerAction, ...]
+    test_suite: Mapping[str, Any] | None = None
 
     def action(self, name: str) -> ControllerAction:
         selected = next((item for item in self.actions if item.name == name), None)
@@ -423,6 +424,7 @@ def _controller_from_mapping(raw: Any, label: str) -> ControllerDefinition:
             "safe_handoff",
             "capability_action",
             "actions",
+            "test_suite",
         },
         required={
             "name",
@@ -482,7 +484,7 @@ def _controller_from_mapping(raw: Any, label: str) -> ControllerDefinition:
         raise ConfigurationError(f"{label}.capability_action was not found")
     if any(item.kind == "signal" for item in actions) and signal_global is None:
         raise ConfigurationError(f"{label}.signal_global is required")
-    return ControllerDefinition(
+    controller = ControllerDefinition(
         name,
         script,
         summary,
@@ -494,7 +496,56 @@ def _controller_from_mapping(raw: Any, label: str) -> ControllerDefinition:
         dict(safe),
         capability_action,
         actions,
+        _test_suite_metadata(value["test_suite"], label) if "test_suite" in value else None,
     )
+    if controller.test_suite is not None:
+        _validate_test_controller(controller, label)
+    return controller
+
+
+def _test_suite_metadata(raw: Any, label: str) -> Mapping[str, Any]:
+    value = _strict(raw, label=f"{label}.test_suite", allowed={"manifest", "files"},
+                    required={"manifest", "files"})
+    files = value["files"]
+    if not isinstance(files, Mapping) or not 4 <= len(files) <= 67:
+        raise ConfigurationError(f"{label}.test_suite.files must contain 4–67 pinned files")
+    path_pattern = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_-][A-Za-z0-9_.-]*)*")
+    for path, digest in files.items():
+        if (not isinstance(path, str) or len(path) > 240 or path_pattern.fullmatch(path) is None
+                or not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None):
+            raise ConfigurationError(f"{label}.test_suite has an invalid relative path or SHA-256")
+    manifest = value["manifest"]
+    if (not isinstance(manifest, str) or not manifest.endswith(".json") or manifest not in files
+            or not {"lab-test-runner.lic", "lab-test-runner.rb"}.issubset(files)
+            or not any(path.endswith(".lic") and path != "lab-test-runner.lic" for path in files)):
+        raise ConfigurationError(f"{label}.test_suite must pin its manifest, runner, and target")
+    return {"manifest": manifest, "files": dict(files)}
+
+
+def _validate_test_controller(controller: ControllerDefinition, label: str) -> None:
+    suite = controller.test_suite
+    assert suite is not None
+    suite_id = controller.name.removeprefix("test-")
+    if (not controller.name.startswith("test-") or _NAME.fullmatch(suite_id) is None
+            or controller.script != "lab-test-runner" or len(controller.characters) != 1
+            or controller.result_global != "$lab_test_result" or controller.signal_global != "$lab_test_cancel"
+            or controller.lanes != {"movement", "combat"}
+            or controller.safe_handoff["kind"] != "room"
+            or "lab-test-runner" not in controller.owner_scripts
+            or len(controller.actions) != 1 or controller.capability_action != "start"):
+        raise ConfigurationError(f"{label} does not match the fixed test-runner contract")
+    action = controller.action("start")
+    params = {parameter.name: parameter for parameter in action.parameters}
+    if (action.kind != "launch" or action.launch_mode != "start"
+            or action.category != "configuration" or not action.confirmation_required
+            or action.command_template != f"lab-test {suite_id} {{revision}} {{case_id}}"
+            or action.script_args_template != f"{suite_id} {{revision}} {{case_id}}"
+            or set(params) != {"revision", "case_id"}
+            or params["revision"].type != "enum"
+            or params["revision"].values != (suite["files"][suite["manifest"]],)
+            or params["case_id"].type != "enum" or "all" not in params["case_id"].values
+            or not 2 <= len(params["case_id"].values) <= 21):
+        raise ConfigurationError(f"{label} has invalid test launch arguments or policy")
 
 
 def default_controller_manifest_path() -> Path:
