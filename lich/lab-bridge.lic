@@ -1648,6 +1648,11 @@ module LichAgentBridge
       return
     end
 
+    if controller.test_suite
+      execute_test_controller(broker_action, match)
+      return
+    end
+
     case controller_action.kind
     when 'launch'
       owners = controller.owner_scripts.select { |name| Script.running?(name) }
@@ -1722,6 +1727,148 @@ module LichAgentBridge
     else
       report_action(broker_action, 'failed', 'unsupported controller action kind')
     end
+  end
+
+  # Test runs retain instances across cancellation and even an incomplete stop.
+  # A new bridge load in this Ruby process must not discard those exclusions.
+  @test_run_mutex ||= Mutex.new
+
+  def self.test_runtime_supported?
+    Script.respond_to?(:start_child) && Script.respond_to?(:__find_script_file, true) && Script.current &&
+      %i[join kill_sync completed_successfully? exit_error file_name].all? { |name| Script.instance_methods.include?(name) }
+  end
+
+  def self.test_run_released?(run)
+    return true unless run
+    return false unless run[:instance] && run[:instance].join(0)
+    !run[:runner] || run[:runner].cleanup_complete?
+  end
+
+  def self.test_local_snapshot(context)
+    raise LabTestRunner::Halt, 'bridge or actions unavailable' unless @running && @actions_enabled && !@snapshot_generation_rejected
+    state = snapshot_state
+    active = Array(state[:scripts]).map(&:downcase)
+    raise LabTestRunner::Halt, 'conflicting script owner' unless (active & context.fetch('excluded_scripts')).empty?
+    owned = Array(context['owned_scripts'])
+    lane_owners = (state[:owners] || {}).values_at(:movement, :combat).compact.map(&:downcase)
+    raise LabTestRunner::Halt, 'conflicting lane owner' unless (lane_owners - owned).empty?
+    values = {
+      'character' => state[:character], 'generation' => state[:generation],
+      'room_id' => state.dig(:room, :id), 'dead' => state[:dead], 'stunned' => state[:stunned],
+      'right_hand_id' => state.dig(:hands, :right, :id), 'left_hand_id' => state.dig(:hands, :left, :id)
+    }
+    # A present hand observation with no object is known empty. An absent
+    # observation remains nil and cannot satisfy an unchanged assertion.
+    %i[right left].each do |hand|
+      hands = state[:hands]
+      values["#{hand}_hand_id"] = '' if hands.is_a?(Hash) && hands.key?(hand) && hands[hand].nil?
+    end
+    # The general hub projection defaults unknown vitals to zero. Assertions
+    # need the raw observation so missing never becomes a successful zero.
+    %w[health mana spirit].each do |field|
+      values[field] = XMLData.respond_to?(field) ? XMLData.public_send(field) : nil
+    end
+    values
+  end
+
+  def self.test_run_control(context)
+    return false unless @running && @actions_enabled && !@snapshot_generation_rejected &&
+      session_generation == context['generation'] && character_name == context['character']
+    action = request(:post, '/v1/actions/status', {action_id: context['action_id']},
+                     authorized: true, read_timeout: 0.75)
+    %w[action_id character generation command].all? { |key| action[key.to_sym] == context[key] } &&
+      action[:expected_room_id].to_s == context['room_id'] &&
+      %w[dispatched completed].include?(action[:status]) && action[:stop_requested] == false
+  rescue StandardError
+    false
+  end
+
+  def self.execute_test_controller(action, match)
+    controller = match.controller
+    raise LabTestRunner::Invalid, 'unsupported loaded Lich lifecycle' unless test_runtime_supported?
+    raise LabTestRunner::Invalid, 'session generation changed' unless action[:generation] == session_generation
+    root = defined?(SCRIPT_DIR) ? SCRIPT_DIR : $script_dir
+    suite_id, revision, case_id = match.script_args.split(' ')
+    raise LabTestRunner::Invalid, 'invalid test selector' unless match.script_args == [suite_id, revision, case_id].join(' ') && case_id
+    suite = LabTestRunner::Suite.new(root: root, metadata: controller.test_suite,
+                                    suite_id: suite_id, revision: revision, case_id: case_id,
+                                    resolve: ->(name) { Script.__send__(:__find_script_file, name) })
+    owners = controller.owner_scripts.select { |name| Script.running?(name) }
+    raise LabTestRunner::Invalid, 'another controller owner is already running' unless owners.empty?
+    context = {'action_id' => action.fetch(:action_id), 'character' => action.fetch(:character),
+               'generation' => action.fetch(:generation), 'room_id' => action.fetch(:expected_room_id).to_s,
+               'expires_at' => action.fetch(:expires_at).to_f,
+               'command' => action.fetch(:command), 'suite_id' => suite_id, 'revision' => revision, 'case_id' => case_id,
+               'owned_scripts' => [controller.script, suite.data['script']].map(&:downcase),
+               'excluded_scripts' => (controller.owner_scripts - [controller.script, suite.data['script']]).map(&:downcase)}
+    raise LabTestRunner::Invalid, 'room-bound test context required' unless context['room_id'] == controller.safe_handoff['room_id'].to_s
+    state = test_local_snapshot(context)
+    raise LabTestRunner::Invalid, 'test preconditions changed' unless
+      %w[character generation room_id].all? { |key| state[key] == context[key] } && state['dead'] == false && state['stunned'] == false
+    raise LabTestRunner::Invalid, 'test launch revoked' unless test_run_control(context)
+    run = {context: context, suite: suite, controller: controller, instance: nil}
+    @test_run_mutex.synchronize do
+      raise LabTestRunner::Invalid, 'previous test cleanup is incomplete' unless test_run_released?(@test_run)
+      @test_run = run
+    end
+    begin
+      clear_controller_result(controller)
+      instance = Script.start_child(controller.script, match.script_args, {quiet: true})
+      raise LabTestRunner::Invalid, 'test runner did not start' unless instance
+      @test_run_mutex.synchronize { run[:instance] = instance }
+      set_script_status(controller.script, "starting:#{context['action_id']}")
+      Thread.new do
+        # A stuck owned child can also delay the wrapper's parent teardown.
+        # Deliver its explicit non-success now; admission still retains both
+        # exact instances until their joins confirm cleanup.
+        sleep 0.05 until instance.join(0) || run.dig(:result, :details, :cleanup_complete) == false
+        result = run[:result] || {ok: false, code: 'missing_result', message: 'Test runner exited without a result.', details: {}}
+        if result[:ok] && (!instance.completed_successfully? || instance.exit_error)
+          result = result.merge(ok: false, code: 'wrapper_failed', message: 'Test wrapper cleanup failed.',
+                                details: result[:details].merge(status: 'failed', assertions_passed: false))
+        end
+        set_script_status(controller.script, "#{result[:code]}:#{context['action_id']}")
+        publish_snapshot(force: true)
+        publish_controller_result(controller, context['action_id'], result)
+      rescue StandardError => error
+        Lich.log("lab test monitor failed: #{error.class}")
+      end
+      report_action(action, 'completed', 'Pinned test runner started; awaiting assertions and cleanup.')
+    rescue StandardError
+      @test_run_mutex.synchronize { @test_run = nil if @test_run.equal?(run) && !run[:instance] }
+      raise
+    end
+  rescue StandardError => error
+    report_action(action, 'failed', "Test admission failed: #{error.class}: #{error.message}")
+  end
+
+  def self.run_test_script(instance)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 1
+    run = nil
+    loop do
+      run = @test_run_mutex.synchronize { @test_run }
+      break if run && run[:instance].equal?(instance)
+      raise LabTestRunner::Invalid, 'no exact action-bound runner context' if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+      sleep 0.01
+    end
+    raise LabTestRunner::Invalid, 'runner context already claimed' if run[:claimed]
+    run[:claimed] = true
+    context = run[:context]
+    data_root = defined?(DATA_DIR) ? DATA_DIR : File.expand_path('../data', run[:suite].root)
+    runner = LabTestRunner::Runner.new(
+      suite: run[:suite], context: context, snapshot: -> { test_local_snapshot(context) },
+      control: -> { test_run_control(context) }, report_directory: File.join(data_root, 'lab-script-tests'),
+      start_child: ->(name, args) { Script.start_child(name, args, {quiet: true}) }
+    )
+    run[:runner] = runner
+    run[:result] = runner.run
+    $lab_test_result = run[:result]
+  rescue StandardError => error
+    if run && run[:instance].equal?(instance)
+      run[:result] = {ok: false, code: 'runner_failed', message: "Test runner failed: #{error.class}", details: {}}
+      $lab_test_result = run[:result]
+    end
+    raise
   end
 
   def self.execute_action(action)

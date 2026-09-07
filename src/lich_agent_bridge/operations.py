@@ -328,6 +328,7 @@ class CapabilityRunner:
         self._operations: OrderedDict[str, OperationRecord] = OrderedDict()
         self._interruptions: set[str] = set()
         self._recon_actions: dict[str, tuple[str, str]] = {}
+        self._test_actions: dict[str, tuple[str, str]] = {}
         self._cursor = 0
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
@@ -527,7 +528,12 @@ class CapabilityRunner:
             handler = getattr(self, definition.handler_name)
             explanation = handler(operation)
             operation.explanation = explanation
-            self._finish(operation, "succeeded", operation.explanation)
+            # Resolve the final stop/success race while the same lock still
+            # protects interruption admission. Ordinary capabilities are unchanged.
+            with self._lock:
+                if self.is_test_operation(operation):
+                    self._check_test_stop(operation)
+                self._finish(operation, "succeeded", operation.explanation)
             return operation
         except _OperationAbort as error:
             abort = error
@@ -539,6 +545,7 @@ class CapabilityRunner:
             )
 
         assert abort is not None
+        self._stop_test_action(operation)
         try:
             self._safe_cleanup(operation, allow_commands=abort.status != "timed_out")
         except Exception as error:
@@ -608,6 +615,30 @@ class CapabilityRunner:
             if operation.status not in TERMINAL_OPERATION_STATES:
                 self._interruptions.add(operation_id)
         self._cancel_recon_action(operation)
+        self._stop_test_action(operation)
+
+    def is_test_operation(self, operation: OperationRecord) -> bool:
+        if not operation.capability.startswith("controller."):
+            return False
+        try:
+            controller = self._controller_manifest.controller(operation.capability.removeprefix("controller."))
+        except ValidationError:
+            return False
+        return controller.test_suite is not None
+
+    def _stop_test_action(self, operation: OperationRecord) -> None:
+        with self._lock:
+            owned = self._test_actions.get(operation.operation_id)
+        if owned is not None:
+            action_id, generation = owned
+            self._actions.request_test_stop(action_id, character=operation.character, generation=generation)
+
+    def _check_test_stop(self, operation: OperationRecord) -> None:
+        self._check_deadline_and_interruption(operation)
+        with self._lock:
+            owned = self._test_actions.get(operation.operation_id)
+        if owned is not None and self._actions.get(owned[0]).get("stop_requested") is True:
+            raise _OperationAbort("interrupted", "test stop requested; no success is published")
 
     def _cancel_recon_action(self, operation: OperationRecord) -> None:
         with self._lock:
@@ -818,10 +849,16 @@ class CapabilityRunner:
         action = controller.action(controller.capability_action)
         command, _script_args, normalized = action.build(operation.arguments)
         operation.arguments = normalized
+        if controller.test_suite is not None and operation.expected_generation is None:
+            raise _OperationAbort("failed", "test runs require expected_generation at admission")
+        if controller.test_suite is not None and operation.deadline - operation.requested_at > 30:
+            raise _OperationAbort("failed", "test runs are limited to the existing 30-second envelope")
 
         start = self._require_fresh_session(operation)
         operation.start_state = start
         self._validate_controller_start(start, controller)
+        if controller.test_suite is not None:
+            self._validate_test_state(start, controller)
         registration = self._evidence.register_controller(
             operation.operation_id,
             controller.name,
@@ -840,27 +877,53 @@ class CapabilityRunner:
             minimum_sequence=start.sequence,
         )
         self._validate_controller_start(current, controller)
-        broker_result = self._run_broker_step(
-            operation,
-            current,
-            command,
-            f"starting registered {controller.name} controller",
-        )
+        if controller.test_suite is not None:
+            self._validate_test_state(current, controller)
+        broker_error = None
+        try:
+            broker_result = self._run_broker_step(
+                operation,
+                current,
+                command,
+                f"starting registered {controller.name} controller",
+            )
+        except _OperationAbort as error:
+            if controller.test_suite is None:
+                raise
+            with self._lock:
+                owned = self._test_actions.get(operation.operation_id)
+            if owned is None:
+                raise
+            broker_result = self._actions.get(owned[0])
+            if broker_result["status"] not in {"dispatched", "completed", "failed"}:
+                raise
+            # A failed acknowledgement can follow an already published report.
+            # Drain only evidence currently available; do not extend execution.
+            broker_error = error
         action_id = str(broker_result.get("action_id", ""))
         remaining = operation.deadline - self._clock()
-        if remaining <= 0:
+        if remaining <= 0 and controller.test_suite is None:
             raise _OperationAbort(
                 "timed_out", "operation timed out waiting for controller result"
             )
         evidence = self._evidence.verify_controller(
             registration,
             action_id,
-            remaining,
+            max(0.0, remaining) if broker_error is None else 0.0,
         )
         if evidence is None:
+            if controller.test_suite is not None:
+                self._check_test_stop(operation)
+            if broker_error is not None:
+                raise broker_error
             raise _OperationAbort(
                 "failed", "registered controller result evidence was not observed"
             )
+        if controller.test_suite is not None:
+            explanation = self._complete_test_controller(operation, controller, evidence, action_id, current)
+            if broker_error is not None:
+                raise broker_error
+            return explanation
         self._verify_controller_evidence(
             evidence,
             controller=controller,
@@ -884,6 +947,49 @@ class CapabilityRunner:
             f"{controller.name} controller reported {evidence.facts['code']} and "
             "safe owner release was verified"
         )
+
+    def _complete_test_controller(self, operation, controller, evidence, action_id, before):
+        # Retain attributed terminal reports even when assertions, cleanup, or
+        # cancellation make the operation a non-success.
+        self._verify_controller_evidence(evidence, controller=controller,
+                                         generation=before.generation, action_id=action_id,
+                                         require_success=False)
+        operation.evidence.append(evidence)
+        details = evidence.facts["details"]
+        if (details.get("suite_id") != controller.name.removeprefix("test-")
+                or details.get("revision") != operation.arguments["revision"]
+                or details.get("case_id") != operation.arguments["case_id"]
+                or details.get("status") not in {"passed", "failed", "skipped", "inconclusive"}
+                or not isinstance(details.get("assertions_passed"), bool)
+                or not isinstance(details.get("cleanup_complete"), bool)
+                or not isinstance(details.get("report_path"), str)
+                or not details["report_path"].strip() or len(details["report_path"]) > 1024):
+            raise _OperationAbort("failed", "test result identity or summary did not match the pinned run")
+        if not details["cleanup_complete"]:
+            self._raise_alert(operation, "test cleanup is incomplete; local exclusion requires operator resolution")
+            raise _OperationAbort("failed", "test cleanup was not verified complete")
+        end = self._require_fresh_session(operation, expected_generation=before.generation,
+                                          after_sequence=before.sequence)
+        operation.end_state = end
+        self._verify_controller_handoff(end, controller, operation.arguments)
+        self._validate_test_state(end, controller)
+        self._check_test_stop(operation)
+        if (evidence.facts["ok"] is not True or details["status"] != "passed"
+                or not details["assertions_passed"]):
+            raise _OperationAbort("failed", f"test suite reported {details['status']}: {evidence.facts['message']}")
+        return "Pinned test assertions passed and same-room cleanup was verified"
+
+    @staticmethod
+    def _validate_test_state(snapshot, controller):
+        if snapshot.room_id != controller.safe_room({}):
+            raise _OperationAbort("failed", "test requires the registered allowed room")
+        if snapshot.dead is not False or snapshot.stunned is not False:
+            raise _OperationAbort("failed", "test requires known alive and unstunned state")
+        if snapshot.scripts is None:
+            raise _OperationAbort("failed", "test requires known script ownership")
+        running = {name.casefold() for name in snapshot.scripts}
+        if running.intersection(name.casefold() for name in controller.owner_scripts):
+            raise _OperationAbort("failed", "test owner scripts have not exited")
 
     @staticmethod
     def _validate_controller_start(
@@ -911,6 +1017,7 @@ class CapabilityRunner:
         controller: ControllerDefinition,
         generation: str,
         action_id: str,
+        require_success: bool = True,
     ) -> None:
         if (
             evidence.method != f"controller.{controller.name}"
@@ -929,7 +1036,7 @@ class CapabilityRunner:
             or not isinstance(facts.get("details"), Mapping)
         ):
             raise _OperationAbort("failed", "controller result evidence is malformed")
-        if facts["ok"] is not True:
+        if require_success and facts["ok"] is not True:
             raise _OperationAbort(
                 "failed", f"controller failed: {facts['code']}: {facts['message']}"
             )
@@ -1335,19 +1442,31 @@ class CapabilityRunner:
                     expected_room_id=snapshot.room_id,
                     expected_generation=snapshot.generation,
                     ttl_seconds=ttl,
+                    deadline=operation.deadline if self.is_test_operation(operation) else None,
                 )
             )
         except ValidationError as error:
             raise _OperationAbort("failed", f"broker denied {detail}: {error}") from error
         recon = operation.capability == "character.recon"
+        test_run = self.is_test_operation(operation)
         if recon:
             with self._lock:
                 self._recon_actions[operation.operation_id] = (str(action["action_id"]), snapshot.generation)
+        if test_run:
+            with self._lock:
+                self._test_actions[operation.operation_id] = (str(action["action_id"]), snapshot.generation)
         try:
             # An interrupt can arrive while submit is returning, before its ID
             # can be associated with the operation. Recheck before dispatch.
             if recon:
                 self._check_deadline_and_interruption(operation)
+            if test_run:
+                with self._lock:
+                    stopped = operation.operation_id in self._interruptions
+                if stopped or self._clock() >= operation.deadline:
+                    self._stop_test_action(operation)
+                    if self._actions.get(str(action["action_id"]))["status"] == "cancelled":
+                        self._check_deadline_and_interruption(operation)
             self._progress(operation, f"broker admitted action {action['action_id']}: {detail}")
             if self._step_hook is not None:
                 self._step_hook(self._actions, action, snapshot)
@@ -1363,8 +1482,10 @@ class CapabilityRunner:
                     )
                     return result
                 if status in {"failed", "expired", "cancelled", "denied_stale_room"}:
+                    if test_run:
+                        self._check_deadline_and_interruption(operation)
                     raise _OperationAbort("failed", f"broker action {status}: {detail}")
-                self._check_deadline_and_interruption(operation, allow_interrupt=not cleanup)
+                self._check_deadline_and_interruption(operation, allow_interrupt=not cleanup and not test_run)
                 self._sleeper(self._action_poll_interval)
         finally:
             if recon:
@@ -1562,6 +1683,8 @@ class CapabilityRunner:
     def _finish(self, operation: OperationRecord, status: str, detail: str) -> None:
         operation.ended_at = self._clock()
         self._transition(operation, status, detail)
+        with self._lock:
+            self._test_actions.pop(operation.operation_id, None)
         emit_timing(
             self._timing,
             "operation.end_to_end_ms",

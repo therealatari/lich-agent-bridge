@@ -62,6 +62,7 @@ export function generatedSdkTypes(): string {
     'export interface OperationResult { operation_id: string; capability: string; character: string; args: Record<string, JsonValue>; status: OperationStatus; requested_at: number; admitted_at: number | null; started_at: number | null; ended_at: number | null; binding: ItemBinding | null; start_state: OperationState | null; end_state: OperationState | null; evidence: EvidenceRecord[]; progress: OperationProgress[]; alerts: string[]; explanation: string }',
     'export interface CapabilityDescriptor { name: string; summary: string; arguments: Record<string, JsonValue>; supported_characters: string[]; available: boolean | null }',
     'export interface CapabilityPage { character: string | null; items: CapabilityDescriptor[]; total: number }',
+    'export interface OperationStopResult { character: string; stopped: boolean; stop_requested?: boolean; operation_id?: string; reason?: string }',
   ];
   const methods = DIRECT_TOOLS.map((entry) => {
     const schema = z.toJSONSchema(entry.input) as JsonSchema;

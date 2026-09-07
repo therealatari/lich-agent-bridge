@@ -63,7 +63,7 @@ test('at most one perform reaches SessionHub even when the script catches the se
     catch (error: any) { return { first: first.status, second: error.message }; }
   `, 'one-perform', hub);
   assert.equal(result.success, true, result.error);
-  assert.deepEqual(result.result, { first: 'succeeded', second: 'At most one lab.perform call is allowed per execute_code operation' });
+  assert.deepEqual(result.result, { first: 'succeeded', second: 'At most one lab.perform or lab.stop call is allowed per execute_code operation' });
   assert.equal(hub.calls.filter((call) => call.route === 'perform').length, 1);
 });
 

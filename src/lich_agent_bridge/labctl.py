@@ -89,6 +89,14 @@ def parser() -> argparse.ArgumentParser:
         help="allow fixed INFO/SKILLS recon through existing action and approval gates",
     )
 
+    tests = commands.add_parser("tests", help="prepare explicitly trusted script suites offline")
+    test_commands = tests.add_subparsers(dest="test_command", required=True)
+    prepare = test_commands.add_parser("prepare", help="validate files and print an uninstalled controller entry")
+    prepare.add_argument("manifest", type=Path)
+    prepare.add_argument("--scripts-dir", type=Path, required=True)
+    prepare.add_argument("--character", required=True)
+    prepare.add_argument("--room-id", required=True)
+
     watch = commands.add_parser("watch", help="stream meaningful character events")
     watch.add_argument("character")
     watch.add_argument("--cursor", type=int, default=0)
@@ -124,9 +132,12 @@ def parser() -> argparse.ArgumentParser:
     )
     perform.add_argument("--wait", action="store_true")
     perform.add_argument("--timeout", type=float, default=30.0)
+    perform.add_argument("--expected-generation", help="bind admission to the observed session generation")
 
     stop = commands.add_parser("stop", help="interrupt a character's active operation")
     stop.add_argument("character")
+    stop.add_argument("--operation-id", help="stop this exact operation, not a successor")
+    stop.add_argument("--expected-generation", help="required with --operation-id")
     return result
 
 
@@ -760,6 +771,17 @@ def _perform_args(args: argparse.Namespace) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> None:
     args = parser().parse_args(argv)
+    if args.command == "tests":
+        from .script_tests import prepare_script_suite
+
+        try:
+            registration = prepare_script_suite(
+                args.manifest, args.scripts_dir, args.character, args.room_id
+            )
+        except (ConfigurationError, ValidationError, OSError) as error:
+            raise SystemExit(f"cannot prepare script suite: {error}") from error
+        _dump(registration)
+        return
     active_config = Settings.path_for(args.config)
     if args.command == "setup":
         _setup(active_config)
@@ -866,10 +888,15 @@ def main(argv: list[str] | None = None) -> None:
         )
         return
     if args.command == "stop":
+        if bool(args.operation_id) != bool(args.expected_generation):
+            raise SystemExit("--operation-id and --expected-generation must be supplied together")
+        payload = {"character": args.character}
+        if args.operation_id:
+            payload.update(operation_id=args.operation_id, expected_generation=args.expected_generation)
         _dump(
             _post(
                 "/v1/session/operation/stop",
-                {"character": args.character},
+                payload,
                 settings=settings,
                 token=token,
             )
@@ -886,6 +913,7 @@ def main(argv: list[str] | None = None) -> None:
                 "character": args.character,
                 "capability": args.capability,
                 "args": _perform_args(args),
+                **({"expected_generation": args.expected_generation} if args.expected_generation else {}),
             },
             settings=settings,
             token=token,

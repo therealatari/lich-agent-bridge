@@ -59,6 +59,13 @@ combat-profile availability.
 Perform admits an operation and returns its stable ID. Watch that operation to
 `succeeded`, `failed`, `timed_out`, or `interrupted`; avoid submitting
 a duplicate merely because the caller lost its connection.
+Perform also accepts `expected_generation`; it is mandatory for registered
+script-test suites. Stop accepts `character`, `operation_id`, and
+`expected_generation` to target one exact run. Script tests require all three;
+the legacy character-only stop remains available for non-test operations. A
+successful stop request records intent, not verified child cleanup. For dispatched
+test launches, the existing action-status response exposes `stop_requested`
+without rewriting the launch as an unsent cancellation.
 Sources reports supplied references and diagnostics, not raw prompts.
 Forget clears temporary dialogue and invalidates owned in-flight work without
 deleting durable inventory or character knowledge.

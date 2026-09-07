@@ -57,8 +57,63 @@ methods can involve spells. Every step still passes ActionBroker and the
 independent Lich checks.
 
 The isolated `lab.execute_code` tool can combine small state/query operations,
-but permits only one perform per execution and has a short execution limit.
+but permits only one mutation (perform or exact-operation stop) per execution and has a short execution limit.
 Use direct perform/watch for long operations; it is not a general script runner.
+
+## Trusted script-test pilot
+
+The [approved plan](Script-Test-Pilot-Plan.md) limits this slice to one trusted
+non-combat suite on an already logged-in, player-selected character: at most
+20 fixed cases, 20 seconds of local work, and 3 seconds of cleanup within the
+existing operation deadline. There is no model round trip between case steps.
+No automatic login, world setup, live fuzzing, or multi-character campaign is
+provided. The [synthetic example](../../examples/script-tests/README.md) includes
+a normal exit and an intentional exception; running all cases should **not** pass.
+
+Preparation is offline and requires an explicitly supplied scripts directory.
+After staging and reviewing the runner pair, probe, and manifest in that directory:
+
+```text
+labctl tests prepare /PRIVATE/LICH/scripts/lifecycle-probe.json --scripts-dir /PRIVATE/LICH/scripts --character Testmage --room-id 123
+```
+
+The output is one controller entry, not a complete manifest. Review it before
+adding it to the local `controllers` array in `lab-controllers.json`, preserving
+existing entries. LAB and the bridge must load the same registration. Restart
+only after the player has stopped LAB safely; preparation never does this for
+you. The default distribution still has no registered controllers.
+
+Discover `controller.test-lifecycle-probe`, read a fresh snapshot, and use the
+advertised revision and case IDs. The following placeholders must come from
+that discovery, not from remembered session data:
+
+```text
+labctl perform Testmage controller.test-lifecycle-probe --expected-generation GENERATION --arg 'revision="MANIFEST_SHA256"' --arg 'case_id="CASE_ID"'
+labctl stop Testmage --operation-id OPERATION_ID --expected-generation GENERATION
+```
+
+Perform without `--wait` returns the operation ID immediately; `--wait` instead
+streams progress to a terminal result. MCP offers the same capability through
+`lab.perform` and exact cancellation through `lab.stop`. Watch the operation's
+terminal evidence after requesting stop: stop acceptance is not cleanup proof.
+Do not retry an ambiguous launch. Tests also stop new steps when local control
+is revoked, the session changes, or control cannot be verified.
+
+The private report includes the pinned file digests, not just the manifest hash,
+so a changed target with an unchanged suite description remains identifiable.
+The runner reports per-case parameters, before/after observations, assertion
+expected/actual values, normal exit versus exception, and cleanup. Missing state
+is inconclusive; a clean exit alone is not a pass. Remaining cases are skipped
+after the first non-pass. Detailed reports are created exclusively with owner-only
+permissions beneath the Lich data directory's `lab-script-tests` folder; the
+controller result carries the private report locator and compact summary. Keep
+these reports out of git. A stuck child's incomplete cleanup blocks subsequent
+local test runs until the operator resolves it.
+
+This trusts the target Ruby code; it does not sandbox it. Review the
+[trust boundary](Safety.md#protected-operations) before adapting any real script.
+Only isolated verification is sufficient for development—not for claiming a
+live pass. A live test requires separate exact player authorization.
 
 ## Diagnosing conversation and latency
 

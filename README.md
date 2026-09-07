@@ -83,6 +83,7 @@ Copy or symlink these files into the active Lich `scripts` directory:
 - `lich/lab-inventory.lic`
 - `lich/lich-state-core.rb`
 - `lich/lab-controller-registry.rb`
+- `lich/lab-test-runner.rb`
 - `lich/lab-controllers.json`
 
 Each file needs its own entry in the active scripts directory because Lich resolves runtime dependencies there, even when `lab.lic` itself is a symlink.
@@ -150,6 +151,14 @@ instead of hard-coding availability:
 
 - MCP: `lab.capabilities`
 - HTTP: `POST /v1/session/capabilities`
+
+An optional [trusted script-test pilot](wiki/project/Developer-Testing.md#trusted-script-test-pilot)
+uses this same controller interface for short, explicitly registered non-combat
+suites. Offline `labctl tests prepare` prints a pinned registration for review;
+it does not install or enable one. The example is a harmless lifecycle probe,
+not a sandbox or an unattended gameplay test campaign.
+For that pilot, also install `lich/lab-test-runner.lic` as a real file alongside
+the helper and reviewed suite files; suite pinning rejects symlink substitutions.
 
 Questions use a bounded evidence loop, not a list of question keywords. The model
 can answer from the supplied context or request current state, character
@@ -363,6 +372,7 @@ The core Ruby bridge tests require a Ruby runtime compatible with the installed 
 ruby tests/lab_dispatcher_test.rb
 ruby tests/lab_bridge_test.rb
 ruby tests/lab_controller_registry_test.rb
+ruby tests/lab_test_runner_test.rb
 ruby tests/lab_inventory_test.rb
 bash tests/play_gemstone_detach_test.sh
 ```

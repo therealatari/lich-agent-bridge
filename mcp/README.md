@@ -12,6 +12,10 @@ This package is a loopback-only Streamable HTTP MCP adapter over Python `Session
 The centralized SessionHub route mapping is in `src/routes.ts`. Direct
 `lab.perform` starts an asynchronous SessionHub operation and follows its
 private operation-watch route until it can return a terminal, verified outcome.
+`lab.stop` targets an exact operation ID and session generation; an accepted stop
+request is not proof that local script cleanup has completed. Inspect the terminal
+operation evidence. Registered script suites require `expected_generation` on
+perform as well; discover approved arguments through `lab.capabilities`.
 
 ## Development
 
@@ -25,4 +29,4 @@ npm run build
 
 The generated declarations come from the same Zod objects registered as direct MCP tool inputs. `npm run check:sdk-types` is the non-mutating drift gate.
 
-`lab.execute_code` accepts a TypeScript function body and returns one compact JSON-serializable result. It is limited to 20 KiB source, 10 seconds, 8 MiB isolate heap, 20 inner calls, two concurrent executions per local connection, one `lab.perform`, and one-second watches. Use direct `lab.watch` for blocking watches.
+`lab.execute_code` accepts a TypeScript function body and returns one compact JSON-serializable result. It is limited to 20 KiB source, 10 seconds, 8 MiB isolate heap, 20 inner calls, two concurrent executions per local connection, one mutation (`lab.perform` or `lab.stop`), and one-second watches. Use direct `lab.watch` for blocking watches.

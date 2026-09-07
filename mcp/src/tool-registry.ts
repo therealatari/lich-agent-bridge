@@ -64,8 +64,21 @@ export const DIRECT_TOOL_REGISTRY = {
       character,
       capability: z.string().trim().regex(/^[a-z][a-z0-9_.-]{0,63}$/).describe('Registered SessionHub capability name.'),
       args: z.record(z.string(), z.unknown()).optional().describe('Capability-specific JSON arguments.'),
+      expected_generation: z.string().trim().min(1).max(128).optional().describe('Observed session generation; required for trusted script tests.'),
     }),
     returnType: 'OperationResult',
+  },
+  stop: {
+    toolName: 'lab.stop',
+    sdkMethod: 'stop',
+    route: 'operationStop',
+    description: 'Request cancellation of one exact operation and generation. Acknowledgment is not proof of script cleanup.',
+    input: z.strictObject({
+      character,
+      operation_id: z.string().trim().min(1).max(64),
+      expected_generation: z.string().trim().min(1).max(128),
+    }),
+    returnType: 'OperationStopResult',
   },
 } as const satisfies Record<string, {
   toolName: `lab.${string}`;

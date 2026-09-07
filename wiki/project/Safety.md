@@ -68,6 +68,17 @@ The driver denies dropping, external giving/trading, selling, destruction,
 unmarking, disabling protective drop flags, arbitrary scripts, and hidden command
 chains. Ordinary owned-inventory handling still requires the existing gates.
 
+The optional script-test pilot explicitly trusts locally reviewed, registered
+Ruby scripts and their declared dependencies. Their launch passes these gates,
+but code running inside Lich can issue commands independently: this is not a Ruby
+sandbox or per-command mediation of third-party scripts. The shipped probe sends
+no game commands. Approve only non-combat suites within the pilot's scope, review
+the pinned files and fixed parameters, and retain private configuration locally.
+Digests detect file changes but cannot eliminate concurrent local mutation or
+discover undeclared dynamic dependencies. Cleanup verifies owned-child exit;
+it cannot roll back arbitrary script side effects. Incomplete cleanup keeps a
+local exclusion and requires operator resolution before another run.
+
 Configure routine-resource limits privately. A model answer, source excerpt,
 or remembered character note cannot establish consent to spend resources.
 
