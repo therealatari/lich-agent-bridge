@@ -52,6 +52,7 @@ _KNOWLEDGE_KEYS = frozenset(
         "project_root",
         "wiki_root",
         "gswiki_database",
+        "semantic_model_directory",
         "mirror_max_age_hours",
         "online_fallback",
         "general_web_provider",
@@ -124,6 +125,7 @@ class KnowledgeSettings:
     online_fallback: OnlineFallbackPolicy
     general_web_provider: GeneralWebProvider
     general_web_credential_env: str | None
+    semantic_model_directory: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,6 +270,7 @@ class Settings:
                 "project_root": str(self.knowledge.project_root),
                 "wiki_root": str(self.knowledge.wiki_root),
                 "gswiki_database": str(self.knowledge.gswiki_database),
+                "semantic_model_directory": _path_text(self.knowledge.semantic_model_directory),
                 "mirror_max_age_hours": self.knowledge.mirror_max_age_hours,
                 "online_fallback": self.knowledge.online_fallback.value,
                 "general_web_provider": self.knowledge.general_web_provider.value,
@@ -393,6 +396,7 @@ def _default_mapping(*, environment: Mapping[str, str]) -> dict[str, Any]:
             "project_root": str(project_root),
             "wiki_root": None,
             "gswiki_database": None,
+            "semantic_model_directory": None,
             "mirror_max_age_hours": 168.0,
             "online_fallback": OnlineFallbackPolicy.WHEN_NEEDED.value,
             "general_web_provider": GeneralWebProvider.DISABLED.value,
@@ -600,6 +604,12 @@ def _build_settings(
             database_value, "knowledge.gswiki_database", base, home
         )
     )
+    semantic_model_directory = _optional_path(
+        knowledge_raw.get("semantic_model_directory"),
+        "knowledge.semantic_model_directory", base, home,
+    )
+    if semantic_model_directory is not None and "\x00" in str(semantic_model_directory):
+        raise ConfigurationError("knowledge.semantic_model_directory must not contain a null byte")
     max_age = _number(
         knowledge_raw["mirror_max_age_hours"],
         "knowledge.mirror_max_age_hours",
@@ -836,6 +846,7 @@ def _build_settings(
             online_fallback=fallback,
             general_web_provider=general_web_provider,
             general_web_credential_env=general_web_credential_env,
+            semantic_model_directory=semantic_model_directory,
         ),
         storage=StorageSettings(
             state_directory=state_directory,

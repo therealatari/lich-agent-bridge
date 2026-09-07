@@ -19,6 +19,7 @@ from urllib.request import Request, urlopen
 from .gswiki import DEFAULT_API_URL, USER_AGENT, wikitext_to_text
 from .settings import GeneralWebProvider, OnlineFallbackPolicy
 from .discovery import source_kind
+from .wiki_text import research_text as _research_text
 
 if TYPE_CHECKING:
     from .settings import Settings
@@ -564,6 +565,7 @@ class KnowledgeBase:
         online_fallback: OnlineFallbackPolicy = OnlineFallbackPolicy.DISABLED,
         live_gswiki: LiveGSWikiSource | None = None,
         general_web: BraveWebSearchSource | None = None,
+        semantic_reranker=None,
         now: Callable[[], datetime] | None = None,
     ):
         self._wiki_root = Path(wiki_root)
@@ -577,6 +579,7 @@ class KnowledgeBase:
         self._online_fallback = online_fallback
         self._live_gswiki = live_gswiki
         self._general_web = general_web
+        self._semantic_reranker = semantic_reranker
         self._now = now or (lambda: datetime.now(UTC))
 
     @classmethod
@@ -591,11 +594,16 @@ class KnowledgeBase:
     def from_settings(cls, settings: "Settings") -> "KnowledgeBase":
         """Build from the already-resolved application configuration."""
 
+        semantic = None
+        if settings.knowledge.semantic_model_directory is not None:
+            from .semantic import SemanticReranker
+            semantic = SemanticReranker(settings.knowledge.semantic_model_directory)
         return cls(
             wiki_root=settings.knowledge.wiki_root,
             gswiki_database=settings.knowledge.gswiki_database,
             mirror_max_age_hours=settings.knowledge.mirror_max_age_hours,
             online_fallback=settings.knowledge.online_fallback,
+            semantic_reranker=semantic,
             live_gswiki=LiveGSWikiSource(
                 cache_path=settings.storage.state_directory / "live-gswiki-cache.json"
             ),
@@ -851,6 +859,133 @@ class KnowledgeBase:
             )
         return excerpts, diagnostic
 
+    def _research_gswiki(self, *, terms: tuple[str, ...]):
+        """Rank bounded indexed passages, falling back to legacy mirror discovery.
+
+        This read-only path never builds or repairs derived data. Full normalized
+        documents are fetched separately after the research source shortlist.
+        """
+        from .passage_index import PassageIndexUnavailable, query_passages
+
+        database = self._gswiki_database
+        reason = 'missing'
+        if database is not None and database.is_file() and terms:
+            try:
+                connection = sqlite3.connect(f'file:{database}?mode=ro', uri=True)
+                try:
+                    connection.row_factory = sqlite3.Row
+                    hits = query_passages(connection, terms, namespaces=(0, 4), limit=36)
+                    row = connection.execute("SELECT value FROM metadata WHERE key = 'last_sync'").fetchone()
+                    stamp = None if row is None else str(row[0])
+                finally:
+                    connection.close()
+                grouped = {}
+                for hit in hits:
+                    grouped.setdefault((hit.url, hit.revision_id), []).append(hit)
+                excerpts = []
+                for passages in grouped.values():
+                    first = passages[0]
+                    # Match the existing source ranker's input using bounded
+                    # passage text, not a freshly normalized full wiki page.
+                    preview = '\n\n'.join('\n'.join('# ' + heading for heading in hit.heading_path)
+                                            + '\n' + hit.text for hit in passages)
+                    excerpts.append(KnowledgeExcerpt('external GSWiki reference', first.title,
+                                                     preview, first.url, url=first.url,
+                                                     revision_id=first.revision_id, retrieved_at=stamp))
+                freshness = _mirror_diagnostic(stamp, self._mirror_max_age_hours, self._now())
+                diagnostic = KnowledgeSourceDiagnostic('local_gswiki',
+                    'stale' if freshness.status == 'stale' else ('success' if excerpts else 'empty'),
+                    f'passage index: {len(hits)} matches in {len(excerpts)} sources'
+                    + ('; ' + freshness.detail if freshness.status == 'stale' else ''))
+                return excerpts, diagnostic, grouped
+            except (sqlite3.Error, PassageIndexUnavailable) as error:
+                reason = str(error) or 'unavailable'
+        excerpts, diagnostic = self._search_gswiki(terms=terms, full_documents=True)
+        diagnostic = KnowledgeSourceDiagnostic(diagnostic.source, diagnostic.status,
+            diagnostic.detail + '; legacy page search (passage index ' + reason[:160] + ')')
+        return excerpts, diagnostic, {}
+
+    def _rerank_research(self, ranked, passage_hits, *, query, terms, check):
+        """Optional local relevance only; never broadens discovery or read rights."""
+        if self._semantic_reranker is None:
+            return ranked, None
+        from .discovery import rerank_semantic
+        from .passage_index import PassageIndexUnavailable, ranking_passage_bodies
+        from .semantic import SemanticPassage, SemanticUnavailable
+        import hashlib
+
+        eligible = {(item.excerpt.source, item.excerpt.revision_id) for item in ranked
+                    if item.scope == 'reference'}
+        hits = tuple(hit for identity, group in passage_hits.items() if identity in eligible
+                     for hit in group)
+        if not hits:
+            return ranked, {'source': 'semantic_reranking', 'status': 'not_needed',
+                            'detail': 'No indexed reference candidates; lexical order retained.'}
+        check()
+        try:
+            connection = sqlite3.connect(f'file:{self._gswiki_database}?mode=ro', uri=True)
+            try:
+                connection.execute('BEGIN')
+                bodies = ranking_passage_bodies(connection, hits, check=check)
+            finally:
+                connection.close()
+        except (sqlite3.Error, PassageIndexUnavailable):
+            return ranked, {'source': 'semantic_reranking', 'status': 'input_unavailable',
+                            'detail': 'Indexed ranking ranges unavailable or over allowance; lexical order retained.'}
+        passages = []
+        for hit, body in zip(hits, bodies):
+            identity = (hit.url, hit.revision_id, hit.normalizer_version,
+                        hit.source_fingerprint, hit.document_fingerprint, hit.start, hit.end)
+            key = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
+            passages.append(SemanticPassage(key, hit.title, hit.heading_path, body))
+        check()
+        try:
+            result = self._semantic_reranker.score(query, passages, check=check)
+        except SemanticUnavailable as error:
+            return ranked, {'source': 'semantic_reranking', 'status': error.code,
+                            'detail': error.reason + '; lexical order retained.'}
+        check()
+        scores = {}
+        for hit, passage in zip(hits, passages):
+            identity = (hit.url, hit.revision_id)
+            scores[identity] = max(scores.get(identity, -1.0), result.scores[passage.key])
+        return rerank_semantic(ranked, query, scores), {
+            'source': 'semantic_reranking', 'status': 'success',
+            'detail': 'Local source reranking with explicit-name protection; read policy unchanged.',
+            'metrics': result.stats}
+
+    def _load_research_document(self, hit, *, retrieved_at):
+        """Load one selected immutable indexed snapshot, checking range identity."""
+        from .passage_index import PassageIndexUnavailable, load_document
+
+        connection = sqlite3.connect(f'file:{self._gswiki_database}?mode=ro', uri=True)
+        try:
+            connection.row_factory = sqlite3.Row
+            document = load_document(connection, hit.page_id)
+        finally:
+            connection.close()
+        if document is None or any(getattr(document, key) != getattr(hit, key) for key in
+                ('page_id', 'title', 'url', 'namespace', 'revision_id', 'normalizer_version',
+                 'source_fingerprint', 'document_fingerprint')):
+            raise PassageIndexUnavailable('selected indexed snapshot changed; search again')
+        return KnowledgeExcerpt('external GSWiki reference', document.title, document.text,
+                                document.url, url=document.url, revision_id=document.revision_id,
+                                retrieved_at=retrieved_at)
+
+    def _research_document_passages(self, hit, excerpt, *, terms, limit=3):
+        """Find focused ranges without reloading a selected normalized source."""
+        from .passage_index import PassageIndexUnavailable, document_passages
+
+        if (excerpt.title != hit.title or excerpt.source != hit.url
+                or excerpt.revision_id != hit.revision_id):
+            raise PassageIndexUnavailable('selected excerpt belongs to a different snapshot')
+        connection = sqlite3.connect(f'file:{self._gswiki_database}?mode=ro', uri=True)
+        try:
+            connection.execute('BEGIN')
+            return document_passages(connection, hit, excerpt.text, terms, limit=limit)
+        finally:
+            connection.close()
+
     def _search_gswiki(
         self, *, terms: tuple[str, ...], full_documents: bool = False
     ) -> tuple[list[KnowledgeExcerpt], KnowledgeSourceDiagnostic]:
@@ -1041,25 +1176,6 @@ class KnowledgeBase:
                 source="local_gswiki", status="success", detail=f"matched {len(excerpts)} excerpt(s)"
             )
         return excerpts, diagnostic
-
-
-def _research_text(wikitext: str) -> str:
-    """Retain headings and table structure; this is not a MediaWiki renderer."""
-    tables = []
-    def retain_table(match):
-        tables.append(match[0])
-        return f"LABRESEARCHTABLE{len(tables) - 1}END"
-
-    wikitext = re.sub(r"^\{\|.*?^\|\}[^\n]*", retain_table, wikitext, flags=re.MULTILINE | re.DOTALL)
-    marked = re.sub(
-        r"^(={1,6})[ \t]*(.*?)[ \t]*\1[ \t]*$",
-        lambda match: "#" * len(match[1]) + " " + match[2],
-        wikitext, flags=re.MULTILINE,
-    )
-    text = wikitext_to_text(marked)
-    for index, table in enumerate(tables):
-        text = text.replace(f"LABRESEARCHTABLE{index}END", table)
-    return text
 
 
 def _cache_is_fresh(

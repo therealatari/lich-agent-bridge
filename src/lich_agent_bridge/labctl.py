@@ -56,6 +56,9 @@ def parser() -> argparse.ArgumentParser:
     )
     wiki_commands = wiki.add_subparsers(dest="wiki_command", required=True)
     wiki_commands.add_parser("status", help="show mirror health, size, and freshness")
+    wiki_commands.add_parser(
+        "index", help="atomically build the local passage index without downloading wiki pages"
+    )
     refresh = wiki_commands.add_parser(
         "refresh", help="atomically refresh the local GSWiki mirror"
     )
@@ -318,6 +321,10 @@ def _setup(path: Path) -> None:
         knowledge["gswiki_database"] = _prompt(
             "Local GSWiki database", knowledge["gswiki_database"]
         )
+        knowledge["semantic_model_directory"] = _prompt_optional(
+            "Optional local semantic model directory (unset keeps lexical retrieval)",
+            knowledge["semantic_model_directory"],
+        )
         knowledge["mirror_max_age_hours"] = _prompt_float(
             "Mirror freshness threshold in hours",
             knowledge["mirror_max_age_hours"],
@@ -487,6 +494,7 @@ def _wiki_status(settings: Settings) -> dict[str, Any]:
         "health": _gswiki_check(str(path), settings.knowledge.mirror_max_age_hours),
         "size_bytes": path.stat().st_size if path.is_file() else 0,
         "last_sync": None,
+        "passage_index": {"status": "missing"},
     }
     if not path.is_file():
         return summary
@@ -496,12 +504,27 @@ def _wiki_status(settings: Settings) -> dict[str, Any]:
             "SELECT value FROM metadata WHERE key = 'last_sync'"
         ).fetchone()
         summary["last_sync"] = None if row is None else row[0]
+        from .passage_index import status as passage_status
+
+        summary["passage_index"] = passage_status(connection)
     except sqlite3.Error:
         pass
     finally:
         if "connection" in locals():
             connection.close()
     return summary
+
+
+def _wiki_index(settings: Settings) -> dict[str, Any]:
+    from .passage_index import PassageIndexUnavailable, rebuild
+
+    path = settings.knowledge.gswiki_database
+    try:
+        result = rebuild(path)
+    except (OSError, ValueError, sqlite3.Error, PassageIndexUnavailable) as error:
+        return {"status": "error", "database": str(path),
+                "detail": f"passage indexing failed; previous mirror was retained: {error}"}
+    return {"status": "ok", "database": str(path), "passage_index": result}
 
 
 def _wiki_refresh(
@@ -568,6 +591,19 @@ def _general_web_check(settings: Settings, environment: dict[str, str]) -> dict[
     if credential is None or not environment.get(credential):
         return _check("general_web", "warning", f"environment variable {credential or 'for general web'} is not set")
     return _check("general_web", "ok", "brave general-web fallback configured")
+
+
+def _semantic_check(settings: Settings) -> dict[str, str]:
+    directory = settings.knowledge.semantic_model_directory
+    if directory is None:
+        return {**_check("semantic_model", "ok", "disabled; using lexical retrieval"),
+                "semantic_status": "disabled"}
+    from .semantic import inspect_model
+
+    inspection = inspect_model(directory)
+    status = inspection["status"]
+    return {**_check("semantic_model", "ok" if status == "ready" else "warning",
+                     inspection["detail"]), "semantic_status": status}
 
 
 def _loopback_host(host: str) -> bool:
@@ -724,6 +760,7 @@ def _doctor(path: Path) -> dict[str, Any]:
         _gswiki_check(
             knowledge["gswiki_database"], knowledge["mirror_max_age_hours"]
         ),
+        _semantic_check(settings),
         _general_web_check(settings, dict(os.environ)),
         _inventory_check(str(settings.storage.resolved_inventory_database or "")),
         _optional_path_check(
@@ -817,6 +854,12 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "wiki":
         if args.wiki_command == "status":
             _dump(_wiki_status(settings))
+            return
+        if args.wiki_command == "index":
+            result = _wiki_index(settings)
+            _dump(result)
+            if result["status"] != "ok":
+                raise SystemExit(1)
             return
         _dump(
             _wiki_refresh(

@@ -13,6 +13,9 @@ authors = [{ name = "ATARI" }]
 classifiers = ["License :: OSI Approved :: GNU General Public License v3 (GPLv3)"]
 dependencies = []
 
+[project.optional-dependencies]
+semantic = ["numpy>=1.26,<3", "onnxruntime>=1.18,<2", "tokenizers>=0.20,<1"]
+
 [project.urls]
 Homepage = "https://github.com/therealatari/lich-agent-bridge"
 Repository = "https://github.com/therealatari/lich-agent-bridge"
