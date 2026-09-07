@@ -309,9 +309,34 @@ GSWiki lookup. Live excerpts retain their GSWiki URL, revision, and retrieval
 time; a small local cache avoids repeating the same request.
 
 Use `labctl wiki status` to inspect mirror path, size, schema health, last sync,
-and freshness threshold. `labctl wiki refresh` builds a replacement mirror and
+freshness threshold, and passage-index readiness/coverage. `labctl wiki refresh` builds a replacement mirror and
 only swaps it in after a successful sync, preserving the previous usable mirror
 on failure.
+
+`labctl wiki index` adds or rebuilds the local passage index without downloading
+pages or making old sources fresh. Explicit indexing regenerates derived tables
+from the retained pages, including repair of damaged derived content; ordinary
+sync reuses unchanged snapshots. Keep mirror writers offline while it runs;
+it requires a DELETE-journal mirror (the sync default) and enough free disk space
+for a replacement database. It does not convert an active WAL database.
+Subsequent syncs maintain the index. Missing or unusable indexes fall back to
+page search; questions never trigger database migration.
+
+Indexed research exposes matching passages through the same `knowledge.search`
+and `knowledge.read` tools. Ranges carry revision and normalized-text identity,
+so replaced pages cannot silently reinterpret old offsets. Default retrieval is
+local lexical search and does not expand MediaWiki templates.
+For an offline synthetic comparison, run
+`python3 scripts/benchmark-wiki-retrieval.py --iterations 5`.
+See the [passage-index plan](wiki/project/Passage-Index-Plan.md) for scope and limits.
+Selected pages also support focused passage recovery and contiguous coverage
+windows within the existing read limit. Optional local semantic source reranking
+is available through the `semantic` installation extra and one
+`knowledge.semantic_model_directory` setting. It protects explicitly named
+references, caches bounded window vectors, and falls back to lexical order when
+unavailable or over allowance. Nothing downloads automatically; base installation
+remains dependency-free. See [semantic setup and limits](wiki/project/Semantic-Reranking.md)
+and the [coverage experiments](wiki/project/Retrieval-Coverage-Expansion.md).
 
 General-web fallback is separately opt-in. Set a selected profile's
 `web_search = true`, choose `general_web_provider = "brave"`, and provide only

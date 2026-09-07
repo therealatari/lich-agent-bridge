@@ -94,6 +94,12 @@ Use setup to select an optional private Markdown root and GSWiki mirror.
 General-web fallback is separately opt-in. Downloaded references and script
 corpora remain local data subject to their own licenses.
 
+Local semantic source reranking is also opt-in: install the `semantic` extra,
+provide the pinned model artifacts yourself, and set
+`knowledge.semantic_model_directory`. Setup offers this optional field; doctor
+checks readiness without inference. Default lexical retrieval remains available.
+See [semantic setup, costs, and fallback](Semantic-Reranking.md).
+
 Configure `LAB_INVENTORY_DB` or the supported Lich-data settings to read the
 same private inventory ledger used by the bridge. Different data paths can make
 the service appear to have no inventory even when the Lich script has recorded

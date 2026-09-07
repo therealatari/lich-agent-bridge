@@ -10,6 +10,10 @@
 - [Evidence gathering](Evidence-Gathering-Arc.md): bounded model-directed observations.
 - [Research workspace plan](Research-Workspace-Plan.md): approved search/read redesign and acceptance gates.
 - [Discovery ranking plan](Discovery-Ranking-Plan.md): bounded recall, explainable ranking, and relevance regressions.
+- [Passage-index plan](Passage-Index-Plan.md): offline lexical passage indexing and a fixed retrieval benchmark.
+- [Full-mirror benchmark](Passage-Index-Benchmark.md): measured storage, latency, evidence coverage, and deployment gate.
+- [Retrieval coverage expansion](Retrieval-Coverage-Expansion.md): broader frozen corpus, page recovery, bounded coverage windows, and optional semantic pilot.
+- [Optional semantic reranking](Semantic-Reranking.md): local model setup, bounded runtime source ordering, cache, and fallback.
 - [Developer testing](Developer-Testing.md): isolated tests and authorized live checks.
 - [Script-test pilot plan](Script-Test-Pilot-Plan.md): trusted non-combat suites, scope fence, and verification gates.
 - [Configuration and knowledge](Configuration-and-Knowledge-Arc.md): settings and providers.

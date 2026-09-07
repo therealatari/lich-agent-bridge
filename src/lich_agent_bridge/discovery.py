@@ -119,3 +119,37 @@ def rank_discovery(candidates: Sequence[tuple[KnowledgeExcerpt, str, str]],
             if item.kind == 'catalog':
                 families.add(family)
     return selected + deferred
+
+
+def explicitly_named(candidate: RankedCandidate, query_text: str) -> bool:
+    """Protect a reference named as a whole phrase or canonical spell number.
+
+    This is a relevance anchor, not an authority claim. Incidental overlapping
+    title words and catalogs do not qualify. Keep lexical order among anchors.
+    """
+    if candidate.kind != 'reference':
+        return False
+    if candidate.identifier_match:
+        return True
+    title = re.sub(r'\s*\(\d{3,4}\)$', '', candidate.excerpt.title)
+    def tokens(value):
+        return tuple(next(iter(_words(word))) for word in _WORD.findall(value.casefold()))
+    name, query = tokens(title), tokens(query_text)
+    return bool(name and any(query[start:start + len(name)] == name
+                             for start in range(len(query) - len(name) + 1)))
+
+
+def rerank_semantic(ranked: Sequence[RankedCandidate], query_text: str,
+                    scores: dict[tuple[str, int | str | None], float]) -> list[RankedCandidate]:
+    """Reorder only scored reference slots; preserve all other source scopes."""
+    positions = [index for index, item in enumerate(ranked)
+                 if item.scope == 'reference'
+                 and (item.excerpt.source, item.excerpt.revision_id) in scores]
+    eligible = [ranked[index] for index in positions]
+    anchored = [item for item in eligible if explicitly_named(item, query_text)]
+    rest = [item for item in eligible if not explicitly_named(item, query_text)]
+    rest.sort(key=lambda item: -scores[(item.excerpt.source, item.excerpt.revision_id)])
+    result = list(ranked)
+    for index, item in zip(positions, anchored + rest):
+        result[index] = item
+    return result
