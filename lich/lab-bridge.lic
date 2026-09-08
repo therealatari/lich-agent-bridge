@@ -1697,7 +1697,7 @@ module LichAgentBridge
     status = quick_runtime_status(run)
     successful_exit = joined && run[:instance].completed_successfully? && !run[:instance].exit_error
     reason = status[:reason].to_s
-    complete = status[:state].to_s == 'completed' || (status[:state].to_s == 'stopped' && reason == 'retreated')
+    complete = status[:state].to_s == 'completed' || (status[:state].to_s == 'stopped' && %w[retreated already_at_refuge].include?(reason))
     code = !joined ? 'cleanup_incomplete' : run[:failure] || (!successful_exit ? 'script_failed' : "quick_#{reason.empty? ? 'unverified' : reason}")
     { ok: successful_exit && complete && !run[:failure], code: code.to_s[0, 128],
       message: "Quick runtime ended: #{code}. Game effects and safe handoff require separate evidence."[0, 500],

@@ -445,6 +445,21 @@ class LabBridgeTest < Minitest::Test
     end
   end
 
+  def test_refuge_terminal_observation_is_distinct_from_stop_or_verified_game_effects
+    with_controlled_quick do |fixture|
+      fixture[:child].alive = false
+      run = { instance: fixture[:child], runtime: fixture[:runtime], action: fixture[:action] }
+      %w[retreated already_at_refuge manual_stop retreat_unconfirmed execution_error].each do |reason|
+        fixture[:runtime].current_status = { state: :stopped, reason: reason }
+        result = LichAgentBridge.controlled_terminal_result(run, true)
+        assert_equal %w[retreated already_at_refuge].include?(reason), result[:ok]
+        assert_equal "quick_#{reason}", result[:code]
+        assert_equal false, result[:details][:effects_verified]
+      end
+      refute LichAgentBridge.controlled_terminal_result(run, false)[:ok]
+    end
+  end
+
   def test_controlled_launch_rejects_missing_operation_deadline_before_spawn
     with_controlled_quick do |fixture|
       fixture[:action].delete(:controller_deadline)
