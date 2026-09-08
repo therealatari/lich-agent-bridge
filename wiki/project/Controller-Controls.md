@@ -100,6 +100,33 @@ Terminal success still requires fresh survival, configured safe-room arrival,
 and owner release. The bridge preserves these distinctions and the existing
 broker/independent Lich checks, without another listener or authentication path.
 
+### Bounded status presentation
+
+Terminal runtime reports and control acknowledgements share the bridge's Quick
+status presentation adapter. The existing 32,768-byte status limit and server
+event depth/string limits remain unchanged. Small plain-command reports are
+unchanged. A native grouped command is rendered as JSON **text**, marked
+`command_presentation: "json"`; this is display data, not a new command or replay
+format. Command text exceeding 4,000 characters is shortened and marked with
+`command_omitted_characters`. Truncated JSON text need not be valid JSON.
+
+If needed to meet the byte limit, only the oldest transcript entries are omitted;
+the newest outcome/send/sequence records are retained. `observation_transport`
+reports `omitted_entries` and the transmitted `retained_sequence_range`.
+Bigshot's original `observations_total`, `observations_dropped`, and
+`observation_sequence_range` still describe its own runtime ring, not this
+additional transport trimming. Selected configuration names, limits, timings,
+usage totals, control fields, and exact result identities are preserved. The
+runtime's immutable snapshot is never modified. A summary which exceeds the
+limit even without transcript entries is still rejected, not silently rewritten.
+These presentation changes do not verify game effects or control application.
+
+Verified offline with 712 Python tests and 111 focused Ruby bridge/controller
+tests (675 assertions, no skips). A cross-check using Bigshot's actual controller
+report producer and LAB's event validator covers simple commands, grouped
+commands, oversized grouped transcripts, and long command text. This confirms
+transport compatibility, not live combat behavior.
+
 ## Verification boundary
 
 Tests use the production schemas, ActionBroker, CapabilityRunner, Ruby bridge

@@ -1647,10 +1647,53 @@ module LichAgentBridge
 
   def self.quick_runtime_status(run)
     value = run[:runtime]&.status || run[:terminal_status]
+    quick_status_payload(value)
+  end
+
+  # Presentation only: retain summaries/identity and newest outcome records
+  # within the existing result budget. Never mutate the owner's cached status
+  # or turn transport completion into evidence that game effects occurred.
+  def self.quick_status_payload(value)
     return {} unless value.is_a?(Hash)
-    encoded = JSON.generate(value)
-    raise LabControllerControls::Invalid, 'Quick status exceeds result limit' if encoded.bytesize > 32_768
-    JSON.parse(encoded, symbolize_names: true)
+    copy = JSON.parse(JSON.generate(value), symbolize_names: true)
+    observations = copy[:observations]
+    projected = false
+    if observations.is_a?(Array)
+      observations.each do |entry|
+        next unless entry.is_a?(Hash)
+        command = entry[:command]
+        if command.is_a?(Array)
+          # An array inside an outcome exceeds the event envelope's depth cap.
+          # JSON text preserves grouping without creating executable commands.
+          command = JSON.generate(command)
+          entry[:command_presentation] = 'json'
+          projected = true
+        end
+        next unless command.is_a?(String)
+        if command.length > 4000
+          entry[:command_omitted_characters] = command.length - 4000
+          command = command[0, 4000]
+          projected = true
+        end
+        entry[:command] = command
+      end
+    end
+    encoded = JSON.generate(copy)
+    return copy if !projected && encoded.bytesize <= 32_768
+
+    omitted = 0
+    loop do
+      if observations.is_a?(Array)
+        copy[:observation_transport] = {
+          omitted_entries: omitted,
+          retained_sequence_range: { first: observations.first&.dig(:sequence), last: observations.last&.dig(:sequence) }
+        }
+      end
+      return copy if JSON.generate(copy).bytesize <= 32_768
+      raise LabControllerControls::Invalid, 'Quick status summary exceeds result limit' unless observations.is_a?(Array) && !observations.empty?
+      observations.shift
+      omitted += 1
+    end
   end
 
   def self.quick_runtime_terminal?(run)
@@ -1827,6 +1870,7 @@ module LichAgentBridge
     run = @controlled_run_mutex.synchronize { @controlled_runs[match.controller.name] }
     raise LabControllerControls::Invalid, 'no exact Quick runtime is bound' unless run && run[:binding]
     result = run[:binding].request(action: action, match: match)
+    result[:details][:status] = quick_status_payload(result[:details][:status])
     publish_controller_result(match.controller, action.fetch(:action_id), result)
     report_action(action, 'sent_unverified', result[:message])
   rescue StandardError => error

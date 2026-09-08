@@ -2,6 +2,7 @@ require 'minitest/autorun'
 require 'timeout'
 require 'tmpdir'
 require 'fileutils'
+require 'open3'
 
 ENV['LAB_BRIDGE_LIBRARY_ONLY'] = '1'
 ENV['LAB_CONTROLLER_MANIFEST'] = File.expand_path('fixtures/controllers.json', __dir__)
@@ -341,6 +342,78 @@ class LabBridgeTest < Minitest::Test
     end
   end
 
+  def synthetic_large_quick_status(command: Array.new(12, 'force unarmed grapple until 3'), count: 100)
+    { mode: 'trial', state: :completed, reason: 'sequence_dispatched', room_id: 123456,
+      room_epoch: 98765, target_id: '123456789', actions: 110, sends: 110, sends_unverified: 0,
+      configuration: { preset: 'synthetic', profile: 'synthetic-area', sequence: 'synthetic-probe' },
+      limits: { scope: :run, max_actions: 200, max_seconds: 1000.0, max_ineffective: 3 },
+      timing: { clock: :monotonic, started_at: 12345678.123456, updated_at: 12345679.123456,
+                ended_at: 12345679.123456, deadline: 12346678.123456, target_started_at: 12345678.123456 },
+      observations_total: 110, observations_dropped: 10, observation_sequence_range: { first: 11, last: 110 },
+      retreat_pending: false, escape_sends: 0, control_error: 'synthetic prior rejection',
+      observations: Array.new(count) { |index| { sequence: index + 11, target_id: '123456789', room_id: 123456,
+        room_epoch: 98765, command: command, outcome: :sent, sends: 1, reserved_actions: 1,
+        started_at: 12345678.123456, at: 12345679.123456, evidence_reason: :no_evidence } } }
+  end
+
+  def test_quick_status_bounds_transcript_without_losing_summary_or_newest_outcomes
+    source = synthetic_large_quick_status
+    original = JSON.generate(source)
+    assert_operator original.bytesize, :>, 32_768
+    compact = LichAgentBridge.quick_runtime_status(terminal_status: source)
+    assert_operator JSON.generate(compact).bytesize, :<=, 32_768
+    assert_equal original, JSON.generate(source), 'serialization must not mutate the runtime snapshot'
+    expected_summary = JSON.parse(original, symbolize_names: true).reject { |key, _| key == :observations }
+    assert_equal expected_summary, compact.reject { |key, _| %i[observations observation_transport].include?(key) }
+    assert_operator compact[:observations].length, :>, 0
+    assert_equal 110, compact[:observations].last[:sequence]
+    assert_equal 1, compact[:observations].last[:sends]
+    assert_equal 'sent', compact[:observations].last[:outcome]
+    assert_equal 'json', compact[:observations].last[:command_presentation]
+    assert_equal source[:observations].last[:command], JSON.parse(compact[:observations].last[:command])
+    assert_equal 100 - compact[:observations].length, compact[:observation_transport][:omitted_entries]
+    assert_equal({ first: compact[:observations].first[:sequence], last: 110 }, compact[:observation_transport][:retained_sequence_range])
+
+    child = SyntheticQuickChild.new('bigshot')
+    child.alive = false
+    result = LichAgentBridge.controlled_terminal_result({ instance: child, action: { action_id: '0123456789abcdef' }, terminal_status: source }, true)
+    assert_equal 'quick_sequence_dispatched', result[:code]
+    assert_equal '0123456789abcdef', result[:details][:run_id]
+    assert_equal false, result[:details][:effects_verified]
+  end
+
+  def test_quick_command_presentation_bounds_long_text_and_passes_real_event_validation
+    status = synthetic_large_quick_status(command: Array.new(300, 'attack target'), count: 1)
+    compact = LichAgentBridge.quick_runtime_status(terminal_status: status)
+    event = compact[:observations].first
+    assert_equal 4000, event[:command].length
+    assert_equal JSON.generate(status[:observations].first[:command]).length - 4000, event[:command_omitted_characters]
+    assert_equal 11, event[:sequence]
+    assert_equal 0, compact[:observation_transport][:omitted_entries]
+    payload = { character: 'Testmage', generation: 'synthetic-generation', observed_at: '2026-09-09T00:00:00Z',
+                kind: 'controller_result', summary: 'Synthetic result', data: { details: { runtime: compact } } }
+    root = File.expand_path('..', __dir__)
+    output, error, result = Open3.capture3({ 'PYTHONPATH' => File.join(root, 'src') }, 'python3', '-c',
+      'import json,sys; from lich_agent_bridge.protocol import MeaningfulEvent; MeaningfulEvent.from_mapping(json.load(sys.stdin)); print("validated")', stdin_data: JSON.generate(payload))
+    assert result.success?, "Actual event validator rejected compact result: #{output} #{error}"
+    assert_equal "validated\n", output
+  end
+
+  def test_quick_status_keeps_small_plain_reports_unchanged_and_rejects_oversized_summary
+    source = { state: :running, observations: [{ sequence: 1, command: 'attack target', sends: 1 }] }
+    compact = LichAgentBridge.quick_runtime_status(terminal_status: source)
+    assert_equal JSON.parse(JSON.generate(source), symbolize_names: true), compact
+    assert_equal 'attack target', compact[:observations].first[:command]
+    refute compact[:observations].first.key?(:command_presentation)
+    long_text = synthetic_large_quick_status(command: 'a' * 5000, count: 1)
+    long_entry = LichAgentBridge.quick_runtime_status(terminal_status: long_text)[:observations].first
+    assert_equal 4000, long_entry[:command].length
+    assert_equal 1000, long_entry[:command_omitted_characters]
+    assert_raises(LabControllerControls::Invalid) do
+      LichAgentBridge.quick_runtime_status(terminal_status: { state: :running, control_error: 'x' * 32_769, observations: [] })
+    end
+  end
+
   def with_controlled_quick
     originals = {}
     replace = lambda do |object, name, &implementation|
@@ -428,6 +501,26 @@ class LabBridgeTest < Minitest::Test
       assert run[:monitor].join(1)
       assert_equal 'quick_sequence_dispatched', run[:result][:code]
       assert_equal false, run[:result][:details][:effects_verified]
+    end
+  end
+
+  def test_controlled_status_uses_the_same_bounded_presentation_without_changing_control_identity
+    with_controlled_quick do |fixture|
+      LichAgentBridge.execute_action(fixture[:action])
+      source = synthetic_large_quick_status.merge(state: :running, reason: nil)
+      fixture[:runtime].current_status = source
+      action = quick_control_action(fixture)
+      LichAgentBridge.execute_action(action)
+      event = fixture[:http].find { |item| item[1] == '/v1/event' && item[2][:data][:code] == 'control_queued' }
+      refute_nil event
+      details = event[2][:data][:details]
+      assert_equal fixture[:action][:action_id], details[:run_id]
+      assert_equal action[:action_id], details[:control_action_id]
+      assert_nil details[:applied]
+      assert_equal 110, details[:status][:observations_total]
+      assert_equal 'json', details[:status][:observations].last[:command_presentation]
+      assert_operator JSON.generate(details[:status]).bytesize, :<=, 32_768
+      assert_instance_of Array, source[:observations].last[:command]
     end
   end
 
