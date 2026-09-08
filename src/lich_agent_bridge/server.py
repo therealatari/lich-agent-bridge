@@ -232,6 +232,8 @@ class LabRequestHandler(BaseHTTPRequestHandler):
                 self._json(200, self.server.session_hub.watch_operation(payload))
             elif parsed.path == "/v1/session/operation/stop":
                 self._json(200, self.server.session_hub.stop_operation(payload))
+            elif parsed.path == "/v1/session/operation/control":
+                self._json(202, self.server.session_hub.control_operation(payload))
             elif parsed.path.startswith("/v1/actions/"):
                 if parsed.path == "/v1/actions/control":
                     result = self.server.actions.control(ActionControl.from_mapping(payload))

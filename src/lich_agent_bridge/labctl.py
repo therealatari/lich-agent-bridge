@@ -17,6 +17,7 @@ from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 from .errors import ConfigurationError, ValidationError
+from .controller_manifest import CONTROLLER_CONTROLS
 from .gswiki import DEFAULT_NAMESPACES, sync
 from .local_connection import read_action_token
 from .question_tests import QuestionSession, load_corpus, run_corpus, validate_question
@@ -141,6 +142,12 @@ def parser() -> argparse.ArgumentParser:
     stop.add_argument("character")
     stop.add_argument("--operation-id", help="stop this exact operation, not a successor")
     stop.add_argument("--expected-generation", help="required with --operation-id")
+
+    control = commands.add_parser("control", help="request a registered control on an exact active operation")
+    control.add_argument("character")
+    control.add_argument("control", choices=sorted(CONTROLLER_CONTROLS))
+    control.add_argument("--operation-id", required=True, help="control this exact operation, not a successor")
+    control.add_argument("--expected-generation", required=True, help="bind the control to the operation's session")
     return result
 
 
@@ -944,6 +951,14 @@ def main(argv: list[str] | None = None) -> None:
                 token=token,
             )
         )
+        return
+    if args.command == "control":
+        _dump(_post(
+            "/v1/session/operation/control",
+            {"character": args.character, "operation_id": args.operation_id,
+             "expected_generation": args.expected_generation, "control": args.control},
+            settings=settings, token=token,
+        ))
         return
     if args.command == "perform":
         if not 0 <= args.timeout <= MAX_WATCH_TIMEOUT_SECONDS:

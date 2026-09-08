@@ -697,6 +697,17 @@ class SessionHub:
             "operation_id": active[0].operation_id,
         }
 
+    def control_operation(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Admit a registered control on one exact operation, not another launch."""
+        fields = {"character", "operation_id", "expected_generation", "control"}
+        request = _strict(payload, label="operation control request", allowed=fields, required=fields)
+        return self.capabilities.control_controller(
+            _text(request["operation_id"], "operation_id", maximum=64),
+            character=_character(request["character"]),
+            expected_generation=_text(request["expected_generation"], "expected_generation", maximum=128),
+            control=_text(request["control"], "control", maximum=16),
+        )
+
     @staticmethod
     def _perform_request(
         payload: Mapping[str, Any],

@@ -10,9 +10,10 @@ module LabControllerRegistry
   NAME = /\A[a-z][a-z0-9_-]{0,63}\z/
   GLOBAL = /\A\$lab_[a-z0-9_]+\z/
   LANES = %w[movement combat inventory communication].freeze
-  KINDS = %w[launch stop signal status sync].freeze
+  KINDS = %w[launch stop signal status sync control].freeze
+  CONTROLS = %w[status hold resume retreat].freeze
   CATEGORIES = %w[inspection configuration movement combat].freeze
-  PARAMETER_TYPES = %w[enum numeric flag_suffix].freeze
+  PARAMETER_TYPES = %w[enum numeric flag_suffix action_id].freeze
 
   class ManifestError < StandardError; end
 
@@ -33,8 +34,8 @@ module LabControllerRegistry
         raise ManifestError, "#{context}.values must not be empty" if @values.empty?
         raise ManifestError, "#{context}.values contains duplicates" unless @values.map(&:downcase).uniq.length == @values.length
         @values.each { |value| Registry.token(value, "#{context}.values") }
-      when 'numeric'
-        raise ManifestError, "#{context} numeric parameters do not accept values" unless @values.empty?
+      when 'numeric', 'action_id'
+        raise ManifestError, "#{context} #{@type} parameters do not accept values" unless @values.empty?
       when 'flag_suffix'
         raise ManifestError, "#{context}.default must be boolean" unless [true, false].include?(@default)
         raise ManifestError, "#{context}.true_value must begin with a space" unless @true_value.start_with?(' ')
@@ -50,6 +51,7 @@ module LabControllerRegistry
       case @type
       when 'enum' then @values.map { |value| Regexp.escape(value) }.join('|')
       when 'numeric' then '[0-9]+'
+      when 'action_id' then '(?-i:[0-9a-f]{16})'
       when 'flag_suffix' then Regexp.escape(@true_value)
       end
     end
@@ -60,6 +62,8 @@ module LabControllerRegistry
         @values.find { |candidate| candidate.casecmp?(value.to_s) }
       when 'numeric'
         value.to_s
+      when 'action_id'
+        render(value)
       when 'flag_suffix'
         !value.nil? && !value.empty?
       end
@@ -67,6 +71,9 @@ module LabControllerRegistry
 
     def render(value)
       case @type
+      when 'action_id'
+        raise ManifestError, "#{@name} must be a lowercase 16-digit action ID" unless value.is_a?(String) && value.match?(/\A[0-9a-f]{16}\z/)
+        value
       when 'enum'
         candidate = value.to_s
         canonical = @values.find { |allowed| allowed.casecmp?(candidate) }
@@ -87,6 +94,7 @@ module LabControllerRegistry
       case @type
       when 'enum' then { 'type' => 'string', 'enum' => @values.dup }
       when 'numeric' then { 'type' => 'string', 'pattern' => '^[0-9]+$' }
+      when 'action_id' then { 'type' => 'string', 'pattern' => '^[0-9a-f]{16}$' }
       when 'flag_suffix' then { 'type' => 'boolean', 'default' => @default }
       end
     end
@@ -122,6 +130,12 @@ module LabControllerRegistry
       raw_parameters = raw.fetch('parameters')
       raise ManifestError, "#{context}.parameters must be an array" unless raw_parameters.is_a?(Array)
       @parameters = raw_parameters.each_with_index.map { |item, index| Parameter.new(item, "#{context}.parameters[#{index}]") }
+      if @kind == 'control'
+        valid = CONTROLS.include?(@name) && @script_args_template.empty? && @launch_mode.nil? &&
+                @parameters.length == 1 && @parameters.first.name == 'run_id' && @parameters.first.type == 'action_id' &&
+                @category == (@name == 'status' ? 'inspection' : 'combat') && (@name == 'status' || @confirmation_required)
+        raise ManifestError, "#{context} has an invalid exact-run control contract" unless valid
+      end
       raise ManifestError, "#{context}.parameters contains duplicate names" unless @parameters.map(&:name).uniq.length == @parameters.length
       validate_placeholders(context)
       @pattern = compile_pattern
@@ -134,6 +148,8 @@ module LabControllerRegistry
       @parameters.to_h do |parameter|
         [parameter.name, parameter.normalize_capture(found[parameter.name])]
       end
+    rescue ManifestError
+      nil
     end
 
     def build(arguments)
@@ -201,12 +217,12 @@ module LabControllerRegistry
   class Controller
     attr_reader :name, :script, :summary, :characters, :result_global,
                 :signal_global, :lanes, :owner_scripts, :safe_handoff,
-                :capability_action, :actions, :test_suite
+                :capability_action, :actions, :test_suite, :control_owner_scripts
 
     def initialize(raw, context)
       Registry.strict_keys(
         raw,
-        %w[name script summary characters result_global signal_global lanes owner_scripts safe_handoff capability_action actions test_suite],
+        %w[name script summary characters result_global signal_global lanes owner_scripts safe_handoff capability_action actions test_suite control_owner_scripts],
         %w[name script summary characters result_global lanes owner_scripts safe_handoff capability_action actions],
         context
       )
@@ -219,6 +235,7 @@ module LabControllerRegistry
       @lanes = Registry.string_array(raw.fetch('lanes'), "#{context}.lanes")
       raise ManifestError, "#{context}.lanes is invalid" unless (@lanes - LANES).empty?
       @owner_scripts = Registry.string_array(raw.fetch('owner_scripts'), "#{context}.owner_scripts")
+      @control_owner_scripts = raw.key?('control_owner_scripts') ? Registry.string_array(raw['control_owner_scripts'], "#{context}.control_owner_scripts") : []
       @safe_handoff = raw.fetch('safe_handoff')
       Registry.validate_safe_handoff(@safe_handoff, "#{context}.safe_handoff")
       @capability_action = Registry.name(raw.fetch('capability_action'), "#{context}.capability_action")
@@ -227,6 +244,17 @@ module LabControllerRegistry
       @actions = raw_actions.each_with_index.map { |item, index| Action.new(item, "#{context}.actions[#{index}]") }
       raise ManifestError, "#{context}.actions contains duplicate names" unless @actions.map(&:name).uniq.length == @actions.length
       raise ManifestError, "#{context}.capability_action was not found" unless action(@capability_action)
+      if @actions.any? { |item| item.kind == 'control' } && action(@capability_action).kind != 'launch'
+        raise ManifestError, "#{context} controls require a launch capability"
+      end
+      if @actions.any? { |item| item.kind == 'control' }
+        allowed = @control_owner_scripts.map(&:downcase)
+        unless allowed.include?(@script.downcase) && (allowed - @owner_scripts.map(&:downcase)).empty?
+          raise ManifestError, "#{context} requires explicit control_owner_scripts within owner_scripts"
+        end
+      elsif !@control_owner_scripts.empty?
+        raise ManifestError, "#{context}.control_owner_scripts requires registered controls"
+      end
       raise ManifestError, "#{context}.signal_global is required by signal action" if @actions.any? { |item| item.kind == 'signal' } && !@signal_global
       if raw.key?('test_suite')
         begin

@@ -20,7 +20,7 @@ from datetime import datetime
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
 from .actions import ActionBroker, ActionProposal
-from .controller_manifest import ControllerDefinition, ControllerManifest
+from .controller_manifest import CONTROLLER_CONTROLS, ControllerDefinition, ControllerManifest
 from .errors import ValidationError
 from .script_adapters import BIGSHOT_ADAPTER, ELOOT_ADAPTER, ScriptAdapter
 from .watchers import CharacterProfile
@@ -329,6 +329,8 @@ class CapabilityRunner:
         self._interruptions: set[str] = set()
         self._recon_actions: dict[str, tuple[str, str]] = {}
         self._test_actions: dict[str, tuple[str, str]] = {}
+        self._controller_actions: dict[str, tuple[str, str]] = {}
+        self._controller_controls: dict[str, set[str]] = {}
         self._cursor = 0
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
@@ -533,6 +535,8 @@ class CapabilityRunner:
             with self._lock:
                 if self.is_test_operation(operation):
                     self._check_test_stop(operation)
+                elif operation.operation_id in self._controller_actions:
+                    self._check_deadline_and_interruption(operation)
                 self._finish(operation, "succeeded", operation.explanation)
             return operation
         except _OperationAbort as error:
@@ -616,6 +620,84 @@ class CapabilityRunner:
                 self._interruptions.add(operation_id)
         self._cancel_recon_action(operation)
         self._stop_test_action(operation)
+        self._cancel_controller_controls(operation)
+
+    def control_controller(
+        self, operation_id: str, *, character: str, expected_generation: str, control: str,
+    ) -> dict[str, Any]:
+        """Queue one registered control on an exact existing operation, never a new owner.
+
+        The response is broker admission only. Neither queued nor dispatched
+        establishes application, command effectiveness, or safe handoff.
+        """
+        if not isinstance(control, str) or control not in CONTROLLER_CONTROLS:
+            raise ValidationError("unsupported controller control")
+        if not isinstance(character, str) or not isinstance(expected_generation, str):
+            raise ValidationError("control requires exact character and generation strings")
+        operation = self.get(operation_id)
+        with self._lock:
+            owned = self._controller_actions.get(operation_id)
+            if (operation.character.casefold() != character.casefold()
+                    or owned is None or expected_generation != owned[1]):
+                raise ValidationError("control does not match an active controller operation")
+            if (operation.status in TERMINAL_OPERATION_STATES
+                    or operation_id in self._interruptions or self._clock() >= operation.deadline):
+                raise ValidationError("controller operation is no longer accepting controls")
+            controller = self._controller_manifest.controller(operation.capability.removeprefix("controller."))
+            action = controller.action(control)
+            if action.kind != "control":
+                raise ValidationError("control is not registered as an exact-run action")
+            launch = self._actions.get(owned[0])
+            if launch["status"] not in {"dispatched", "completed"}:
+                raise ValidationError("controller launch has not been dispatched")
+            try:
+                snapshot = self._require_fresh_session(operation, expected_generation=owned[1])
+            except _OperationAbort as error:
+                raise ValidationError(error.detail) from error
+            if snapshot.owners is None or snapshot.scripts is None:
+                raise ValidationError("known controller ownership is required")
+            scripts = {name.casefold() for name in snapshot.scripts}
+            if controller.script.casefold() not in scripts:
+                raise ValidationError("the registered controller is not running")
+            allowed = {name.casefold() for name in controller.control_owner_scripts}
+            if scripts.intersection(name.casefold() for name in controller.owner_scripts) - allowed:
+                raise ValidationError("conflicting controller owner script is running")
+            for lane in controller.lanes:
+                owner = snapshot.owners.get(lane)
+                if not isinstance(owner, str) or owner.casefold() not in allowed:
+                    raise ValidationError(f"controller ownership is not verified in {lane}")
+            pending = self._controller_controls.setdefault(operation_id, set())
+            pending.intersection_update(
+                action_id for action_id in tuple(pending)
+                if self._actions.get(action_id)["expires_at"] > self._clock()
+            )
+            if len(pending) >= 32:
+                raise ValidationError("controller control queue is full")
+            command, _, _ = action.build({"run_id": owned[0]})
+            remaining = operation.deadline - self._clock()
+            if remaining <= 0:
+                raise ValidationError("controller operation expired before control admission")
+            admitted = self._actions.submit(ActionProposal(
+                character=operation.character, command=command,
+                expected_generation=owned[1], expected_room_id=snapshot.room_id,
+                ttl_seconds=max(1, min(5, math.ceil(remaining))),
+                deadline=min(operation.deadline, self._clock() + 5),
+            ))
+            pending.add(str(admitted["action_id"]))
+            self._emit_locked(operation, operation.status,
+                              f"{control} control admitted as {admitted['action_id']}; application unverified")
+            return {"operation_id": operation_id, "run_id": owned[0], "control": control,
+                    "applied": None, "action": admitted}
+
+    def _cancel_controller_controls(self, operation: OperationRecord, *, revoke_run: bool = True) -> None:
+        with self._lock:
+            owned = self._controller_actions.get(operation.operation_id)
+            if owned is None:
+                return
+            for action_id in self._controller_controls.pop(operation.operation_id, set()):
+                self._actions.revoke_controller_control(action_id, character=operation.character, generation=owned[1])
+            if revoke_run:
+                self._actions.revoke_controller_run(owned[0], character=operation.character, generation=owned[1])
 
     def is_test_operation(self, operation: OperationRecord) -> bool:
         if not operation.capability.startswith("controller."):
@@ -1434,6 +1516,10 @@ class CapabilityRunner:
             # recon operation, including fractional request deadlines.
             ttl = min(120, math.floor(remaining))
         try:
+            controlled_launch = isinstance(command, str) and self._controller_manifest.match_command(command)
+            controlled_launch = bool(controlled_launch and controlled_launch.action.kind == "launch"
+                                     and controlled_launch.controller.control_owner_scripts
+                                     and operation.capability == f"controller.{controlled_launch.controller.name}")
             action = self._actions.submit(
                 ActionProposal(
                     character=operation.character,
@@ -1443,6 +1529,7 @@ class CapabilityRunner:
                     expected_generation=snapshot.generation,
                     ttl_seconds=ttl,
                     deadline=operation.deadline if self.is_test_operation(operation) else None,
+                    controller_deadline=operation.deadline if controlled_launch else None,
                 )
             )
         except ValidationError as error:
@@ -1455,6 +1542,15 @@ class CapabilityRunner:
         if test_run:
             with self._lock:
                 self._test_actions[operation.operation_id] = (str(action["action_id"]), snapshot.generation)
+        controller_match = self._controller_manifest.match_command(command) if isinstance(command, str) else None
+        if (controller_match is not None and controller_match.action.kind == "launch"
+                and controller_match.controller.control_owner_scripts
+                and operation.capability == f"controller.{controller_match.controller.name}"):
+            with self._lock:
+                self._controller_actions.setdefault(operation.operation_id, (str(action["action_id"]), snapshot.generation))
+                if operation.operation_id in self._interruptions or self._clock() >= operation.deadline:
+                    self._actions.revoke_controller_run(str(action["action_id"]), character=operation.character,
+                                                        generation=snapshot.generation)
         try:
             # An interrupt can arrive while submit is returning, before its ID
             # can be associated with the operation. Recheck before dispatch.
@@ -1684,6 +1780,8 @@ class CapabilityRunner:
         operation.ended_at = self._clock()
         self._transition(operation, status, detail)
         with self._lock:
+            self._cancel_controller_controls(operation, revoke_run=status != "succeeded")
+            self._controller_actions.pop(operation.operation_id, None)
             self._test_actions.pop(operation.operation_id, None)
         emit_timing(
             self._timing,

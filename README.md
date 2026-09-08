@@ -397,6 +397,8 @@ The core Ruby bridge tests require a Ruby runtime compatible with the installed 
 ruby tests/lab_dispatcher_test.rb
 ruby tests/lab_bridge_test.rb
 ruby tests/lab_controller_registry_test.rb
+ruby tests/lab_controller_controls_test.rb
+ruby tests/lab_controller_control_binding_test.rb
 ruby tests/lab_test_runner_test.rb
 ruby tests/lab_inventory_test.rb
 bash tests/play_gemstone_detach_test.sh

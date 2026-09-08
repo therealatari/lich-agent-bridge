@@ -183,6 +183,13 @@ timeout is an explicit error, not permission to enqueue endless retries.
 
 ## Adding a supported test operation
 
+The [exact-operation controller controls](Controller-Controls.md) document
+authenticated HTTP/CLI admission for typed controls of a registered active
+controller. The bridge binds opted-in Quick controllers to the exact native
+child/runtime; public installation alone does not register a capability. The
+[direct trial example](../../examples/controllers/README.md) is opt-in and
+requires separately authorized live verification.
+
 If discovery has no suitable operation, propose the smallest capability needed
 with its admission checks, exact target binding, evidence, restoration, and
 failure tests. A controller must use the existing shared manifest and lifecycle.

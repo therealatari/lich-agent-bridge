@@ -33,6 +33,7 @@ controller_registry_core = if defined?($script_dir) && $script_dir
                              File.expand_path('lab-controller-registry', __dir__)
                            end
 require controller_registry_core
+require File.join(File.dirname(controller_registry_core), 'lab-controller-controls')
 if ENV['LAB_BRIDGE_LIBRARY_ONLY'] == '1'
   require lich_state_core
 else
@@ -1635,6 +1636,203 @@ module LichAgentBridge
     false
   end
 
+  # Opted-in Quick controllers retain exact native Script/runtime identities.
+  # These are bridge-local lifecycle records, never a public global registry.
+  @controlled_run_mutex ||= Mutex.new
+  @controlled_runs ||= {}
+
+  def self.controlled_action_authority(action_id)
+    request(:post, '/v1/actions/status', { action_id: action_id }, authorized: true, read_timeout: 0.2)
+  end
+
+  def self.quick_runtime_status(run)
+    value = run[:runtime]&.status || run[:terminal_status]
+    return {} unless value.is_a?(Hash)
+    encoded = JSON.generate(value)
+    raise LabControllerControls::Invalid, 'Quick status exceeds result limit' if encoded.bytesize > 32_768
+    JSON.parse(encoded, symbolize_names: true)
+  end
+
+  def self.quick_runtime_terminal?(run)
+    %w[completed stopped].include?(quick_runtime_status(run)[:state].to_s)
+  end
+
+  def self.controlled_local_available?(run, action, check_room: true)
+    return false unless @running && @actions_enabled && !@snapshot_generation_rejected
+    return false unless action[:generation] == session_generation && action[:character].to_s.casecmp?(character_name)
+    return false unless @controlled_run_mutex.synchronize { @controlled_runs[run[:controller].name].equal?(run) }
+    instance = run[:instance]
+    return false unless instance && instance.running? && !instance.stopping?
+    return false unless instance.respond_to?(:quick_combat_runtime) && instance.quick_combat_runtime.equal?(run[:runtime])
+    return false if check_room && (action[:expected_room_id].to_s != room_fingerprint || run[:action][:expected_room_id].to_s != room_fingerprint)
+    scripts = live_scripts.map(&:downcase)
+    allowed = run[:controller].control_owner_scripts.map(&:downcase)
+    excluded = run[:controller].owner_scripts.map(&:downcase) - allowed
+    return false unless (scripts & excluded).empty?
+    owners = script_owners(scripts)
+    run[:controller].lanes.all? { |lane| allowed.include?(owners[lane.to_sym].to_s.downcase) }
+  rescue StandardError
+    false
+  end
+
+  def self.cooperatively_close_controlled_run(run)
+    run[:binding]&.close
+    runtime = run[:runtime]
+    if !runtime && run[:instance]&.respond_to?(:quick_combat_runtime)
+      runtime = run[:instance].quick_combat_runtime
+    end
+    return if !runtime || run[:stop_requested]
+    status = runtime.status
+    # Movement during admitted retreat may finish within the cleanup budget;
+    # revoked launch authority still requests stop, including during retreat.
+    return if run[:failure] != 'controller_authority_lost' && (status[:retreat_pending] || status[:reason].to_s == 'retreat_pending')
+    return if %w[completed stopped].include?(status[:state].to_s)
+    response = runtime.request('stop')
+    run[:stop_requested] = response.is_a?(Hash) && response[:accepted] == true
+  rescue StandardError
+    run[:failure] ||= 'cooperative_stop_unavailable'
+  end
+
+  def self.controlled_terminal_result(run, joined)
+    status = quick_runtime_status(run)
+    successful_exit = joined && run[:instance].completed_successfully? && !run[:instance].exit_error
+    reason = status[:reason].to_s
+    complete = status[:state].to_s == 'completed' || (status[:state].to_s == 'stopped' && reason == 'retreated')
+    code = !joined ? 'cleanup_incomplete' : run[:failure] || (!successful_exit ? 'script_failed' : "quick_#{reason.empty? ? 'unverified' : reason}")
+    { ok: successful_exit && complete && !run[:failure], code: code.to_s[0, 128],
+      message: "Quick runtime ended: #{code}. Game effects and safe handoff require separate evidence."[0, 500],
+      details: { run_id: run[:action][:action_id], runtime: status, cleanup_complete: joined,
+                 effects_verified: false } }
+  rescue StandardError
+    { ok: false, code: 'malformed_runtime_result', message: 'Quick runtime result unavailable.', details: { cleanup_complete: joined } }
+  end
+
+  def self.monitor_controlled_run(run, cleanup_timeout: 3)
+    Thread.new do
+      cleanup_deadline = nil
+      loop do
+        break if run[:instance].join(0)
+        terminal = quick_runtime_terminal?(run)
+        if run[:failure] || terminal || !run[:instance].running?
+          run[:binding]&.close
+        elsif !run[:lease]&.refresh
+          run[:failure] = 'controller_authority_lost'
+        elsif run[:action][:expected_room_id].to_s != room_fingerprint
+          state = quick_runtime_status(run)
+          run[:failure] = 'controller_room_changed' unless state[:retreat_pending] || state[:reason].to_s == 'retreat_pending'
+          run[:binding]&.close
+        else
+          run[:binding].refresh
+        end
+        if run[:failure] || terminal || !run[:binding]&.open?
+          cooperatively_close_controlled_run(run) if run[:failure]
+          cleanup_deadline ||= Process.clock_gettime(Process::CLOCK_MONOTONIC) + cleanup_timeout
+          break if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= cleanup_deadline
+        end
+        sleep 0.05
+      end
+      run[:binding]&.close
+      joined = !!run[:instance].join(0)
+      result = controlled_terminal_result(run, joined)
+      run[:result] = result
+      # Do not relabel an old run's evidence as a replacement session.
+      if run[:action][:generation] == session_generation && run[:action][:character].to_s.casecmp?(character_name)
+        set_script_status(run[:controller].script, "#{result[:code]}:#{run[:action][:action_id]}")
+        publish_snapshot(force: true)
+        publish_controller_result(run[:controller], run[:action][:action_id], result)
+      end
+    rescue StandardError => error
+      run[:failure] ||= 'controller_monitor_failed'
+      cooperatively_close_controlled_run(run)
+      Lich.log("lab controlled monitor failed: #{error.class}")
+    ensure
+      run[:binding]&.close
+      # A missing/incomplete join retains exclusion; never release by name.
+      if run[:instance]&.join(0)
+        @controlled_run_mutex.synchronize { @controlled_runs.delete(run[:controller].name) if @controlled_runs[run[:controller].name].equal?(run) }
+      end
+    end
+  end
+
+  def self.launch_controlled_controller(action, match, startup_timeout: 3)
+    controller = match.controller
+    deadline = action[:controller_deadline]
+    raise LabControllerControls::Invalid, 'controlled launch requires its operation deadline' unless deadline.is_a?(Numeric) && deadline.finite? && deadline > Time.now.to_f
+    raise LabControllerControls::Invalid, 'controlled launch requires exact current session and room' unless
+      action[:generation] == session_generation && action[:expected_room_id].to_s == room_fingerprint && room_fingerprint != 'unknown'
+    raise LabControllerControls::Invalid, 'native child lifecycle unavailable' unless Script.respond_to?(:start_child) && Script.current
+    observed = controlled_action_authority(action.fetch(:action_id))
+    raise LabControllerControls::Invalid, 'controlled launch was revoked or replaced' unless
+      %i[action_id character generation command expected_room_id controller_deadline].all? { |key| observed[key] == action[key] } &&
+      observed[:status] == 'dispatched' && observed[:stop_requested] == false
+    run = { controller: controller, action: action.transform_values { |value| value.is_a?(String) ? value.dup.freeze : value }.freeze }
+    @controlled_run_mutex.synchronize do
+      previous = @controlled_runs[controller.name]
+      raise LabControllerControls::Invalid, 'previous controlled child cleanup is incomplete' if previous && (!previous[:instance] || !previous[:instance].join(0))
+      @controlled_runs[controller.name] = run
+    end
+    instance = Script.start_child(controller.script, match.script_args, { quiet: true })
+    raise LabControllerControls::Invalid, 'controlled child did not start' unless instance
+    run[:instance] = instance
+    raise LabControllerControls::Invalid, 'native child lifecycle unavailable' unless %i[join running? stopping? completed_successfully? exit_error].all? { |name| instance.respond_to?(name) }
+    startup_deadline = [Time.now.to_f + startup_timeout, deadline].min
+    loop do
+      run[:runtime] = instance.quick_combat_runtime if instance.respond_to?(:quick_combat_runtime)
+      break if run[:runtime]
+      if instance.respond_to?(:quick_combat_result)
+        run[:terminal_status] = instance.quick_combat_result
+        break if quick_runtime_terminal?(run)
+      end
+      raise LabControllerControls::Invalid, 'Quick runtime publication was not observed' if instance.join(0) || Time.now.to_f >= startup_deadline
+      sleep 0.01
+    end
+    if run[:terminal_status] && !run[:runtime]
+      run[:monitor] = monitor_controlled_run(run)
+      report_action(action, 'completed', 'Exact Quick child terminal snapshot observed; game effects remain unverified.')
+      return run
+    end
+    run[:lease] = LabControllerControls::Lease.new(action: run[:action], deadline: deadline,
+      available: ->(request) { controlled_local_available?(run, request, check_room: false) },
+      authority: method(:controlled_action_authority), clock: -> { Time.now.to_f })
+    run[:binding] = LabControllerControls::Binding.new(controller: controller, launch: run[:action], instance: instance,
+      available: ->(request) { run[:lease].valid? && controlled_local_available?(run, request) },
+      authority: method(:controlled_action_authority))
+    run[:binding].bind(instance, run[:runtime])
+    raise LabControllerControls::Invalid, 'controlled launch authority unavailable' unless run[:lease].refresh
+    run[:monitor] = monitor_controlled_run(run)
+    set_script_status(controller.script, "starting:#{action[:action_id]}")
+    publish_snapshot(force: true)
+    report_action(action, 'completed', 'Exact Quick child and runtime bound; terminal result remains unverified.')
+    run
+  rescue StandardError => error
+    if run
+      run[:failure] = 'controlled_startup_failed'
+      # A child which has not advertised its runtime cannot consume cooperative
+      # controls. Native lifecycle cancellation sets stopping? synchronously;
+      # compatible Quick startup/guards refuse that exact owner before sending.
+      # Never stop a successor by script name, and never call this extraction.
+      if run[:instance] && !run[:runtime] && run[:instance].respond_to?(:kill)
+        run[:instance].kill(async: true)
+        run[:failure] = 'forced_startup_cancelled'
+      end
+      cooperatively_close_controlled_run(run)
+      run[:monitor] ||= monitor_controlled_run(run) if run[:instance]&.respond_to?(:join)
+      @controlled_run_mutex.synchronize { @controlled_runs.delete(controller.name) if @controlled_runs[controller.name].equal?(run) && !run[:instance] }
+    end
+    report_action(action, 'failed', "Controlled startup failed: #{error.class}: #{error.message}")
+    nil
+  end
+
+  def self.execute_controlled_action(action, match)
+    run = @controlled_run_mutex.synchronize { @controlled_runs[match.controller.name] }
+    raise LabControllerControls::Invalid, 'no exact Quick runtime is bound' unless run && run[:binding]
+    result = run[:binding].request(action: action, match: match)
+    publish_controller_result(match.controller, action.fetch(:action_id), result)
+    report_action(action, 'sent_unverified', result[:message])
+  rescue StandardError => error
+    report_action(action, 'failed', "Control rejected: #{error.class}: #{error.message}")
+  end
+
   def self.execute_controller_action(broker_action, match)
     controller = match.controller
     controller_action = match.action
@@ -1654,6 +1852,8 @@ module LichAgentBridge
     end
 
     case controller_action.kind
+    when 'control'
+      execute_controlled_action(broker_action, match)
     when 'launch'
       owners = controller.owner_scripts.select { |name| Script.running?(name) }
       unless owners.empty?
@@ -1662,6 +1862,10 @@ module LichAgentBridge
           'failed',
           "another controller owner is already running: #{owners.join(', ')}"
         )
+        return
+      end
+      unless controller.control_owner_scripts.empty?
+        launch_controlled_controller(broker_action, match)
         return
       end
       clear_controller_result(controller)

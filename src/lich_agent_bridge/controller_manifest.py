@@ -15,9 +15,10 @@ _GLOBAL = re.compile(r"^\$lab_[a-z0-9_]+$")
 _TOKEN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$", re.IGNORECASE)
 _PLACEHOLDER = re.compile(r"\{([a-z][a-z0-9_]*)\}")
 _LANES = frozenset({"movement", "combat", "inventory", "communication"})
-_KINDS = frozenset({"launch", "stop", "signal", "status", "sync"})
+_KINDS = frozenset({"launch", "stop", "signal", "status", "sync", "control"})
+CONTROLLER_CONTROLS = frozenset({"status", "hold", "resume", "retreat"})
 _CATEGORIES = frozenset({"inspection", "configuration", "movement", "combat"})
-_PARAMETER_TYPES = frozenset({"enum", "numeric", "flag_suffix"})
+_PARAMETER_TYPES = frozenset({"enum", "numeric", "flag_suffix", "action_id"})
 
 
 def _strict(
@@ -99,8 +100,8 @@ class ControllerParameter:
         if parameter_type == "enum":
             if not values or len({item.casefold() for item in values}) != len(values):
                 raise ConfigurationError(f"{label}.values must be nonempty and unique")
-        elif parameter_type == "numeric" and values:
-            raise ConfigurationError(f"{label} numeric parameters do not accept values")
+        elif parameter_type in {"numeric", "action_id"} and values:
+            raise ConfigurationError(f"{label} {parameter_type} parameters do not accept values")
         elif parameter_type == "flag_suffix":
             if not isinstance(default, bool):
                 raise ConfigurationError(f"{label}.default must be boolean")
@@ -119,9 +120,15 @@ class ControllerParameter:
             return "|".join(re.escape(item) for item in self.values)
         if self.type == "numeric":
             return r"[0-9]+"
+        if self.type == "action_id":
+            return r"(?-i:[0-9a-f]{16})"
         return re.escape(self.true_value)
 
     def render(self, raw: object) -> str:
+        if self.type == "action_id":
+            if not isinstance(raw, str) or re.fullmatch(r"[0-9a-f]{16}", raw) is None:
+                raise ValidationError(f"{self.name} must be a lowercase 16-digit action ID")
+            return raw
         if self.type == "enum":
             candidate = str(raw)
             canonical = next(
@@ -159,6 +166,8 @@ class ControllerParameter:
             return {"type": "string", "enum": list(self.values)}
         if self.type == "numeric":
             return {"type": "string", "pattern": "^[0-9]+$"}
+        if self.type == "action_id":
+            return {"type": "string", "pattern": "^[0-9a-f]{16}$"}
         return {"type": "boolean", "default": self.default}
 
 
@@ -227,6 +236,17 @@ class ControllerAction:
             ControllerParameter.from_mapping(item, f"{label}.parameters[{index}]")
             for index, item in enumerate(raw_parameters)
         )
+        if kind == "control" and (
+            name not in CONTROLLER_CONTROLS
+            or script_args_template != ""
+            or launch_mode is not None
+            or len(parameters) != 1
+            or parameters[0].name != "run_id"
+            or parameters[0].type != "action_id"
+            or category != ("inspection" if name == "status" else "combat")
+            or (name != "status" and not confirmation)
+        ):
+            raise ConfigurationError(f"{label} has an invalid exact-run control contract")
         names = tuple(item.name for item in parameters)
         if len(set(names)) != len(names):
             raise ConfigurationError(f"{label}.parameters contains duplicates")
@@ -293,10 +313,17 @@ class ControllerAction:
         found = self.pattern.fullmatch(command)
         if found is None:
             return None
-        return {
-            parameter.name: parameter.normalize_capture(found.group(parameter.name))
-            for parameter in self.parameters
-        }
+        try:
+            return {
+                parameter.name: (
+                    parameter.render(found.group(parameter.name))
+                    if parameter.type == "action_id"
+                    else parameter.normalize_capture(found.group(parameter.name))
+                )
+                for parameter in self.parameters
+            }
+        except ValidationError:
+            return None
 
     def argument_schema(self) -> dict[str, Any]:
         return {
@@ -326,6 +353,7 @@ class ControllerDefinition:
     capability_action: str
     actions: tuple[ControllerAction, ...]
     test_suite: Mapping[str, Any] | None = None
+    control_owner_scripts: tuple[str, ...] = ()
 
     def action(self, name: str) -> ControllerAction:
         selected = next((item for item in self.actions if item.name == name), None)
@@ -425,6 +453,7 @@ def _controller_from_mapping(raw: Any, label: str) -> ControllerDefinition:
             "capability_action",
             "actions",
             "test_suite",
+            "control_owner_scripts",
         },
         required={
             "name",
@@ -453,6 +482,10 @@ def _controller_from_mapping(raw: Any, label: str) -> ControllerDefinition:
     if not lanes.issubset(_LANES):
         raise ConfigurationError(f"{label}.lanes is invalid")
     owner_scripts = _string_array(value["owner_scripts"], f"{label}.owner_scripts")
+    control_owners = (
+        _string_array(value["control_owner_scripts"], f"{label}.control_owner_scripts")
+        if "control_owner_scripts" in value else ()
+    )
     safe = _strict(
         value["safe_handoff"],
         label=f"{label}.safe_handoff",
@@ -482,6 +515,17 @@ def _controller_from_mapping(raw: Any, label: str) -> ControllerDefinition:
     capability_action = _name(value["capability_action"], f"{label}.capability_action")
     if not any(item.name == capability_action for item in actions):
         raise ConfigurationError(f"{label}.capability_action was not found")
+    if any(item.kind == "control" for item in actions) and not any(
+        item.name == capability_action and item.kind == "launch" for item in actions
+    ):
+        raise ConfigurationError(f"{label} controls require a launch capability")
+    if any(item.kind == "control" for item in actions):
+        if (script.casefold() not in {item.casefold() for item in control_owners}
+                or not {item.casefold() for item in control_owners}.issubset(
+                    item.casefold() for item in owner_scripts)):
+            raise ConfigurationError(f"{label} requires explicit control_owner_scripts within owner_scripts")
+    elif control_owners:
+        raise ConfigurationError(f"{label}.control_owner_scripts requires registered controls")
     if any(item.kind == "signal" for item in actions) and signal_global is None:
         raise ConfigurationError(f"{label}.signal_global is required")
     controller = ControllerDefinition(
@@ -497,6 +541,7 @@ def _controller_from_mapping(raw: Any, label: str) -> ControllerDefinition:
         capability_action,
         actions,
         _test_suite_metadata(value["test_suite"], label) if "test_suite" in value else None,
+        control_owners,
     )
     if controller.test_suite is not None:
         _validate_test_controller(controller, label)
