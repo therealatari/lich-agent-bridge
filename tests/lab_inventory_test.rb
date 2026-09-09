@@ -2,6 +2,9 @@ require 'minitest/autorun'
 require 'tmpdir'
 
 ENV['LAB_INVENTORY_LIBRARY_ONLY'] = '1'
+if ENV['LICH_EXECUTION_GUARD_ROOT']
+  require File.join(ENV.fetch('LICH_EXECUTION_GUARD_ROOT'), 'lib/common/script_execution_guard')
+end
 DATA_DIR = Dir.mktmpdir('lab-inventory-test') unless defined?(DATA_DIR)
 
 FakeInventoryObject = Struct.new(:id, :noun, :name, :full_name)
@@ -35,6 +38,120 @@ def respond(_message) = nil
 load File.expand_path('../lich/lab-inventory.lic', __dir__)
 
 class LabInventoryTest < Minitest::Test
+  def with_refresh_fixture
+    old_constants = %i[Script LichAgentBridge].to_h do |name|
+      [name, (Object.const_get(name) if Object.const_defined?(name))]
+    end
+    old_constants.each_key { |name| Object.send(:remove_const, name) if Object.const_defined?(name) }
+    owners = { movement: nil, combat: nil, inventory: 'lab-inventory' }
+    sent = []
+    owner = Object.new
+    policy = nil
+    guard = nil
+    owner.define_singleton_method(:with_execution_guard) do |callback, &work|
+      policy = callback
+      guard = Lich::Common::ScriptExecutionGuard.new(callback) if ENV['LICH_EXECUTION_GUARD_ROOT']
+      guard ? guard.checkpoint! : (raise 'guard denied' unless policy.call(nil) == true)
+      work.call
+    ensure
+      guard&.close!
+      guard = nil
+      policy = nil
+    end
+    owner.define_singleton_method(:emit) do |command|
+      if guard
+        guard.checkpoint!(command: command)
+      else
+        raise 'guard denied' unless policy && policy.call(command) == true
+      end
+      sent << command
+    end
+    script = Module.new
+    script.define_singleton_method(:current) { owner }
+    Object.const_set(:Script, script)
+    bridge = Module.new
+    bridge.define_singleton_method(:live_scripts) { ['lab-inventory'] }
+    bridge.define_singleton_method(:script_owners) { |_scripts| owners }
+    Object.const_set(:LichAgentBridge, bridge)
+    yield owners, owner, sent
+  ensure
+    old_constants.each do |name, old|
+      Object.send(:remove_const, name) if Object.const_defined?(name)
+      Object.const_set(name, old) if old
+    end
+  end
+
+  def test_refresh_claims_lane_then_returns_to_passive_even_after_failure
+    with_refresh_fixture do |_owners, _owner, _sent|
+      refute LabInventory.inventory_lane_active?
+      assert_raises(RuntimeError) do
+        LabInventory.with_inventory_action do
+          assert LabInventory.inventory_lane_active?
+          raise 'synthetic failure'
+        end
+      end
+      refute LabInventory.inventory_lane_active?
+    end
+  end
+
+  def test_refresh_refuses_competing_or_unknown_ownership_without_sends
+    with_refresh_fixture do |owners, owner, sent|
+      [{ movement: 'go2' }, { combat: 'bigshot' }, { inventory: 'eloot' }, { inventory: 'eherbs' }].each do |conflict|
+        original = owners.dup
+        owners.merge!(conflict)
+        assert_raises(StandardError) { LabInventory.with_inventory_action { owner.emit('inventory enhancive list') } }
+        refute LabInventory.inventory_lane_active?
+        owners.replace(original)
+      end
+      owners.clear
+      assert_raises(StandardError) { LabInventory.with_inventory_action { owner.emit('inventory enhancive list') } }
+      assert_empty sent
+    end
+  end
+
+  def test_refresh_rechecks_competitors_before_each_send
+    with_refresh_fixture do |owners, owner, sent|
+      assert_raises(StandardError) do
+        LabInventory.with_inventory_action do
+          owner.emit('first')
+          owners[:combat] = 'bigshot'
+          owner.emit('must not send')
+        end
+      end
+      assert_equal ['first'], sent
+      refute LabInventory.inventory_lane_active?
+    end
+  end
+
+  def test_rejected_concurrent_refresh_does_not_release_the_first_claim
+    with_refresh_fixture do |_owners, _owner, _sent|
+      LabInventory.with_inventory_action do
+        error = Thread.new do
+          LabInventory.with_inventory_action { flunk 'second refresh entered' }
+        rescue RuntimeError => exception
+          exception
+        end.value
+        assert_match(/already active/, error.message)
+        assert LabInventory.inventory_lane_active?
+      end
+      refute LabInventory.inventory_lane_active?
+    end
+  end
+
+  def test_charge_refresh_entry_point_uses_the_guard
+    with_refresh_fixture do |owners, owner, sent|
+      LabInventory.define_singleton_method(:fput) { |command| owner.emit(command) }
+      LabInventory.handle_request('charges refresh')
+      assert_equal ['inventory enhancive list'], sent
+      owners[:combat] = 'bigshot'
+      LabInventory.handle_request('charges refresh')
+      assert_equal ['inventory enhancive list'], sent
+      refute LabInventory.inventory_lane_active?
+    ensure
+      LabInventory.singleton_class.send(:remove_method, :fput)
+    end
+  end
+
   def setup
     database = LabInventory.instance_variable_get(:@database)
     database.close if database

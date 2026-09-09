@@ -24,8 +24,14 @@ remains empty; synthetic fixtures are not active registrations.
 Declared controller lanes also participate in observed ownership. In particular,
 an inventory-capable controller must be recognized as the inventory owner while
 its exact runtime executes cleanup. Independent eLoot, healing, and inventory
-tracker scripts take precedence as conflicts; an unrecognized owner is not
-silently treated as permission to continue.
+scripts take precedence as conflicts; an unrecognized owner is not silently
+treated as permission to continue. LAB Inventory reports an automatic
+passive/active flag: passive observation does not reserve the inventory lane,
+so it can remain running across logins and controller tests. Explicit enhancive
+and charge refreshes claim that lane until completion (including error cleanup)
+and use native execution guards to refuse competing movement, combat, or
+inventory owners before each send. An older tracker without this interface, or
+an unreadable flag, remains a conflict. No persistent user toggle is needed.
 
 `CapabilityRunner.control_controller(operation_id, character=...,
 expected_generation=..., control=...)` submits a control through ActionBroker for

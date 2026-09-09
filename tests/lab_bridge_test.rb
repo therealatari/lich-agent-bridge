@@ -597,6 +597,24 @@ class LabBridgeTest < Minitest::Test
     end
   end
 
+  def test_passive_inventory_observer_does_not_claim_the_inventory_lane
+    previous = Object.const_get(:LabInventory) if Object.const_defined?(:LabInventory)
+    Object.send(:remove_const, :LabInventory) if previous
+    tracker = Module.new
+    active = false
+    tracker.define_singleton_method(:inventory_lane_active?) { active }
+    Object.const_set(:LabInventory, tracker)
+    assert_nil LichAgentBridge.script_owners(['lab-inventory'])[:inventory]
+    active = true
+    assert_equal 'lab-inventory', LichAgentBridge.script_owners(['lab-inventory'])[:inventory]
+    assert_equal 'lab-inventory', LichAgentBridge.script_owners([])[:inventory], 'refresh workers retain ownership if the passive observer exits'
+    tracker.define_singleton_method(:inventory_lane_active?) { raise 'unavailable' }
+    assert_equal 'lab-inventory', LichAgentBridge.script_owners(['lab-inventory'])[:inventory]
+  ensure
+    Object.send(:remove_const, :LabInventory) if Object.const_defined?(:LabInventory)
+    Object.const_set(:LabInventory, previous) if previous
+  end
+
   def test_controlled_bridge_pins_native_child_and_routes_control_without_owner_transport_calls
     with_controlled_quick do |fixture|
       LichAgentBridge.execute_action(fixture[:action])

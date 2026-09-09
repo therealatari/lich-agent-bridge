@@ -300,11 +300,14 @@ module LichAgentBridge
 
   def self.script_owners(scripts)
     folded = scripts.map(&:downcase)
+    tracker_activity = inventory_tracker_activity
+    folded << 'lab-inventory' if tracker_activity == true
     movement_candidates = %w[go2 bigshot ebounty escortgo2 echild] + CONTROLLER_REGISTRY.controller_scripts_for_lane('movement')
     combat_candidates = %w[bigshot] + CONTROLLER_REGISTRY.controller_scripts_for_lane('combat')
     movement = movement_candidates.uniq.find { |name| folded.include?(name) }
     combat = combat_candidates.uniq.find { |name| folded.include?(name) }
     inventory_candidates = %w[eloot eherbs lab-inventory] + CONTROLLER_REGISTRY.controller_scripts_for_lane('inventory')
+    inventory_candidates.delete('lab-inventory') if tracker_activity == false
     inventory = inventory_candidates.uniq.find { |name| folded.include?(name) }
     {
       movement: movement,
@@ -312,6 +315,14 @@ module LichAgentBridge
       inventory: inventory,
       communication: nil
     }
+  end
+
+  def self.inventory_tracker_activity
+    return nil unless defined?(LabInventory) && LabInventory.respond_to?(:inventory_lane_active?)
+    value = LabInventory.inventory_lane_active?
+    [true, false].include?(value) ? value : nil
+  rescue StandardError
+    nil
   end
 
   def self.live_script_status(scripts)

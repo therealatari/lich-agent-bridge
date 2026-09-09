@@ -79,6 +79,8 @@ module LabInventory
   }.freeze
 
   @mutex = Mutex.new
+  @inventory_action_mutex = Mutex.new
+  @inventory_action_active = false
   @running = false
   @dirty = false
   @loaded = false
@@ -95,6 +97,33 @@ module LabInventory
   @session_id = nil
 
   class << self
+    # Passive observation never reserves equipment control. Explicit refreshes
+    # claim it before checking competing owners and release it on every exit.
+    def inventory_lane_active?
+      @inventory_action_mutex.synchronize { @inventory_action_active }
+    end
+
+    def with_inventory_action
+      owner = Script.current
+      unless owner.respond_to?(:with_execution_guard) && defined?(LichAgentBridge)
+        raise 'Inventory refresh requires LAB ownership checks and native execution guards'
+      end
+      acquired = @inventory_action_mutex.synchronize do
+        next false if @inventory_action_active
+        @inventory_action_active = true
+      end
+      raise 'An inventory refresh is already active' unless acquired
+
+      owner.with_execution_guard(lambda do |_command|
+        owners = LichAgentBridge.script_owners(LichAgentBridge.live_scripts)
+        %i[movement combat inventory].all? { |lane| owners.key?(lane) } &&
+          owners[:movement].nil? && owners[:combat].nil? &&
+          [nil, 'lab-inventory'].include?(owners[:inventory])
+      end) { yield }
+    ensure
+      @inventory_action_mutex.synchronize { @inventory_action_active = false } if acquired
+    end
+
     # Lich's live XML objects may expose byte strings (ASCII-8BIT) even when
     # their contents are UTF-8. sqlite3 binds those as BLOB values, which makes
     # visually identical character names and object IDs compare unequal to
@@ -1360,7 +1389,7 @@ module LabInventory
       end
 
       enhancive = Lich::Gemstone::Enhancive
-      enhancive.refresh(silent: true, quiet: true) if refresh
+      with_inventory_action { enhancive.refresh(silent: true, quiet: true) } if refresh
       stats = enhancive::STATS.filter_map do |stat|
         value = enhancive.public_send(stat).value
         "#{stat}=#{value}" if value.positive?
@@ -1404,7 +1433,7 @@ module LabInventory
       when 'enhancives refresh'
         show_enhancive_totals(refresh: true)
       when 'charges refresh'
-        fput('inventory enhancive list')
+        with_inventory_action { fput('inventory enhancive list') }
         display('requested a fresh per-item enhancive charge list; results will update matching dossiers')
       when /\Afocus\s+off\z/i
         @mutex.synchronize { @focused_local_id = nil }
