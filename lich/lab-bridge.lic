@@ -32,7 +32,9 @@ controller_registry_core = if defined?($script_dir) && $script_dir
                            else
                              File.expand_path('lab-controller-registry', __dir__)
                            end
-require controller_registry_core
+# Resolve the installed symlink so a deliberate build switch does not reuse
+# the previous build's cached registry in this long-lived Lich process.
+require File.realpath("#{controller_registry_core}.rb")
 require File.join(File.dirname(controller_registry_core), 'lab-controller-controls')
 if ENV['LAB_BRIDGE_LIBRARY_ONLY'] == '1'
   require lich_state_core

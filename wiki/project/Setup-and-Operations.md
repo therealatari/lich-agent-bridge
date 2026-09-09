@@ -45,6 +45,12 @@ Lich resolves these dependencies in its scripts directory even when the
 dispatcher itself is symlinked. Install a compatible Ruby SQLite dependency
 for inventory tracking.
 
+When deliberately switching a stopped bridge to another build through symlinks,
+the bridge resolves the registry's canonical path before requiring it. This
+avoids reusing the old build's registry from Ruby's require cache. It is not a
+general hot-reload guarantee for files edited in place; stop active operations
+and keep the sidecar, bridge dependencies and private manifest compatible.
+
 The public controller manifest is empty. Personal combat scripts, hunt profiles,
 and character policy are neither bundled nor required for the bridge.
 The optional [Quick trial example](../../examples/controllers/README.md) requires
