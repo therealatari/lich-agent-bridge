@@ -173,6 +173,26 @@ class WorldStateEvidenceAdapter:
             cursor=int(current["cursor"]),
         )
 
+    def verify_controller_recovery(self, *, character, controller, previous_generation,
+                                   generation, action_id, room_id, hands) -> bool:
+        """Read a player acknowledgement from the authenticated native event feed.
+
+        No receipt means no cross-generation recovery; expired ring entries must
+        be explicitly republished by the player, not inferred from current safety.
+        """
+        page = self._world_state.watch(character, cursor=0, timeout=0)
+        for event in page["events"]:
+            data = event.get("data")
+            if (event.get("kind") != "controller_recovery" or event.get("generation") != generation
+                    or not isinstance(data, Mapping)):
+                continue
+            if (data.get("controller") == controller and data.get("action_id") == action_id
+                    and data.get("previous_generation") == previous_generation
+                    and data.get("operator_confirmed") is True and data.get("room_id") == room_id
+                    and data.get("hands") == {"left": hands[0], "right": hands[1]}):
+                return True
+        return False
+
     def verify_controller(
         self,
         registration: object,

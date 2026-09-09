@@ -7,6 +7,10 @@ from lich_agent_bridge.actions import ActionBroker, ActionContext, ActionControl
 from lich_agent_bridge.errors import ConfigurationError, ValidationError
 from lich_agent_bridge.operations import CapabilityRunner, HandItem
 from lich_agent_bridge.session_hub import SessionHub
+from lich_agent_bridge.session_hub import WorldStateEvidenceAdapter
+from lich_agent_bridge.protocol import MeaningfulEvent
+from lich_agent_bridge.world_state import WorldState
+from .test_session_hub import publish_snapshot
 from unittest.mock import Mock
 from .test_operations import BrokerDriver, FakeClock, FakeEvidence, FakeState
 from .test_quick_area import area_manifest_raw, load_manifest
@@ -170,6 +174,47 @@ class RefugeOutingTests(unittest.TestCase):
         result = self.run_outing(expected_generation="generation-2")
         self.assertIn("previous session", result.explanation)
         self.assertEqual(len(self.driver.commands), 1)
+
+    def test_explicit_exact_native_recovery_receipt_allows_new_session_admission(self):
+        self.evidence.controller_result = None
+        failed = self.run_outing()
+        _, controller, original, action_id = self.runner._refuge_pending["testmage"]
+        self.state.generation = "generation-2"
+        self.state.sequence = 1  # a new generation starts its own counter
+        self.broker.admit_generation("Testmage", "generation-2")
+        world = WorldState()
+        publish_snapshot(world, generation="generation-2")
+        self.evidence.verify_controller_recovery = WorldStateEvidenceAdapter(world).verify_controller_recovery
+        receipt = {"controller": controller.name, "action_id": action_id,
+                   "previous_generation": original.generation, "operator_confirmed": True,
+                   "room_id": "1000", "hands": {"left": None, "right": "777"}}
+
+        def publish(data, kind="controller_recovery"):
+            world.publish_event(MeaningfulEvent.from_mapping({
+                "character": "Testmage", "generation": "generation-2",
+                "observed_at": "2026-08-31T12:00:02Z", "kind": kind,
+                "summary": "Synthetic operator recovery", "data": data}))
+
+        for field, wrong in (("controller", "other"), ("action_id", "other-action"),
+                             ("previous_generation", "other-generation"), ("operator_confirmed", False),
+                             ("room_id", "1001"), ("hands", {"left": None, "right": "999"})):
+            publish({**receipt, field: wrong})
+            result = self.run_outing(expected_generation="generation-2")
+            self.assertIn("previous session", result.explanation, field)
+            self.assertEqual(len(self.driver.commands), 1)
+        publish(receipt, kind="controller_result")
+        self.assertIn("previous session", self.run_outing(expected_generation="generation-2").explanation)
+        publish(receipt)
+        self.state.hands = {"left": HandItem("888", "knife"), "right": HandItem("777", "test weapon")}
+        self.assertIn("equipment", self.run_outing(expected_generation="generation-2").explanation)
+        self.assertEqual(len(self.driver.commands), 1)
+        self.state.hands = {"left": None, "right": HandItem("777", "test weapon")}
+        self.evidence.controller_result = self.facts
+        result = self.run_outing(expected_generation="generation-2")
+        self.assertEqual(result.status, "succeeded", result.explanation)
+        self.assertFalse(self.runner._refuge_pending)
+        self.assertEqual(failed.status, "failed")
+        self.assertTrue(failed.alerts)
 
     def test_reaching_refuge_with_wrong_hands_is_not_safe(self):
         self.verify_hook = lambda *_: setattr(self.state, "hands", {"left": HandItem("888", "knife"), "right": HandItem("777", "test weapon")})

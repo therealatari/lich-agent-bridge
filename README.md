@@ -141,8 +141,15 @@ Management:
 ;lab approve auto
 ;lab approve auto off
 ;lab operation stop
+;lab recover
 ;lab stop
 ```
+
+For a retained failed Quick handoff, `;lab recover` lists the exact run ID.
+After restoring the character, `;lab recover RUN_ID confirm` verifies refuge,
+original equipment and released ownership before acknowledging that one run.
+It sends no game commands and does not turn the failed test into a pass.
+See [recovery checks](wiki/project/Controller-Controls.md#player-confirmed-recovery-after-a-lab-restart).
 
 The default catalog contains five capabilities:
 

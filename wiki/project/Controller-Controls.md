@@ -274,6 +274,33 @@ report producer and LAB's event validator covers simple commands, grouped
 commands, oversized grouped transcripts, and long command text. This confirms
 transport compatibility, not live combat behavior.
 
+## Player-confirmed recovery after a LAB restart
+
+`;lab recover` lists retained native Quick handoff failures for the current
+character. After manually restoring the character, the player can use
+`;lab recover RUN_ID confirm` with the displayed 16-character launch action ID.
+There is no blanket reset and no advertised model capability for confirmation.
+
+The bridge verifies that exact child and monitor have exited, the current
+character is alive, unstunned and standing in the run's original refuge, both
+original hand IDs match, and movement/combat/inventory owners are released.
+It reads native state rather than trusting a prior HTTP snapshot. Only this
+explicit acknowledgement may reconcile a retained run from an earlier LAB
+generation; automatic recovery still requires the original generation.
+
+The existing authenticated event feed carries `controller_recovery`, binding
+the exact controller/action ID, previous generation, current event generation,
+refuge and hand identities, with `operator_confirmed: true`. Publication failure
+retains the lock. The bridge retains the acknowledged run until superseded so
+the same explicit command can republish a lost/expired receipt. LAB requires a
+matching receipt plus fresh safe current state before clearing its old-generation
+exclusion during the next admission. A receipt by itself is not current safety;
+an evicted receipt must be explicitly republished, never guessed.
+
+Recovery sends no game commands, cancels no scripts, renews no action authority,
+and does not change the original test result or remove its failure alerts.
+It acknowledges restored safety, not successful execution of the failed test.
+
 ## Verification boundary
 
 Tests use the production schemas, ActionBroker, CapabilityRunner, Ruby bridge

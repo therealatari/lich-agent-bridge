@@ -15,6 +15,15 @@ game, random bridge generation, increasing sequence, and timezone-aware
 observation time. A retired generation cannot become current again.
 `POST /v1/event` admits meaningful events for the current generation.
 
+The native player's `;lab recover RUN_ID confirm` command can publish a
+`controller_recovery` event after verifying safe recovery. Its data binds
+`controller`, `action_id`, `previous_generation`, `room_id`, exact `hands`
+(`left`/`right` IDs or null), and literal `operator_confirmed: true`. The event
+envelope identifies the current character/generation. LAB consumes this exact
+receipt only with independently verified current refuge/equipment/owner state;
+it is not a generic lock-reset request or a new MCP capability. See
+[player-confirmed recovery](Controller-Controls.md#player-confirmed-recovery-after-a-lab-restart).
+
 `GET /v1/state/CHARACTER` reads the snapshot;
 `GET /v1/watch/CHARACTER?cursor=N&timeout=30` waits for bounded events.
 Unknown values remain absent rather than being guessed.

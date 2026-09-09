@@ -79,7 +79,7 @@ class TravelTests(unittest.TestCase):
     def test_unresolved_outing_only_permits_its_refuge_and_does_not_forget_wrong_hands(self):
         controller = load_manifest(refuge_manifest_raw()).controllers[0]
         before = self.state.snapshot("Testmage")
-        self.runner._refuge_pending["testmage"] = ("old-run", controller, before)
+        self.runner._refuge_pending["testmage"] = ("old-run", controller, before, "old-action")
         rejected = self.runner.perform("Testmage", "travel.go2", {"destination": "1001"}, expected_generation="generation-1")
         self.assertEqual(rejected.status, "failed")
         self.assertEqual(self.driver.commands, [])

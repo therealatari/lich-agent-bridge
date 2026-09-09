@@ -254,6 +254,11 @@ class EvidenceAdapter(Protocol):
         timeout_seconds: float,
     ) -> EvidenceRecord | None: ...
 
+    def verify_controller_recovery(self, *, character: str, controller: str,
+                                   previous_generation: str, generation: str,
+                                   action_id: str, room_id: str,
+                                   hands: tuple[str | None, str | None]) -> bool: ...
+
 
 StepHook = Callable[[ActionBroker, Mapping[str, Any], SessionState], None]
 AlertSink = Callable[[Mapping[str, Any]], None]
@@ -341,7 +346,7 @@ class CapabilityRunner:
         self._graceful_stops: set[str] = set()
         # Survives terminal history eviction: an unsafe outing is not permission
         # to start another. The native bridge independently retains its owner.
-        self._refuge_pending: dict[str, tuple[str, ControllerDefinition, SessionState]] = {}
+        self._refuge_pending: dict[str, tuple[str, ControllerDefinition, SessionState, str]] = {}
         self._controller_controls: dict[str, set[str]] = {}
         self._cursor = 0
         self._lock = threading.RLock()
@@ -813,6 +818,10 @@ class CapabilityRunner:
         hands = self._hand_ids(start)
         with self._lock:
             pending = self._refuge_pending.get(operation.character.casefold())
+        if pending and pending[2].generation != start.generation:
+            self._resolve_prior_refuge(operation, start)
+            with self._lock:
+                pending = self._refuge_pending.get(operation.character.casefold())
         if pending and (pending[2].generation != start.generation
                         or pending[1].safe_handoff["room_id"] != destination):
             raise _OperationAbort("failed", "unresolved test handoff permits travel only to its original refuge in the same session")
@@ -1173,11 +1182,17 @@ class CapabilityRunner:
             pending = self._refuge_pending.get(operation.character.casefold())
             if pending is None:
                 return
-            _, controller, original = pending
-            if snapshot.generation != original.generation:
-                raise _OperationAbort("failed", "unresolved refuge handoff belongs to a previous session; operator resolution required")
+            _, controller, original, action_id = pending
+            changed_generation = snapshot.generation != original.generation
+            if changed_generation:
+                verify = getattr(self._evidence, "verify_controller_recovery", None)
+                if verify is None or verify(character=operation.character, controller=controller.name,
+                        previous_generation=original.generation, generation=snapshot.generation,
+                        action_id=action_id, room_id=controller.safe_handoff["room_id"],
+                        hands=self._hand_ids(original)) is not True:
+                    raise _OperationAbort("failed", "unresolved refuge handoff belongs to a previous session; use ;lab recover RUN_ID confirm after restoring safety")
             self._validate_controller_start(snapshot, controller)
-            if (snapshot.sequence is None or original.sequence is None or snapshot.sequence <= original.sequence
+            if (snapshot.sequence is None or original.sequence is None or (not changed_generation and snapshot.sequence <= original.sequence)
                     or self._hand_ids(snapshot) != self._hand_ids(original)):
                 raise _OperationAbort("failed", "previous refuge handoff still needs fresh equipment and owner resolution")
             self._refuge_pending.pop(operation.character.casefold())
@@ -1778,7 +1793,7 @@ class CapabilityRunner:
                 self._controller_actions.setdefault(operation.operation_id, (str(action["action_id"]), snapshot.generation))
                 if controller_match.controller.safe_handoff["kind"] == "quick_refuge":
                     self._refuge_pending[operation.character.casefold()] = (
-                        operation.operation_id, controller_match.controller, snapshot)
+                        operation.operation_id, controller_match.controller, snapshot, str(action["action_id"]))
                 if operation.operation_id in self._interruptions or self._clock() >= operation.deadline:
                     self._actions.revoke_controller_run(str(action["action_id"]), character=operation.character,
                                                         generation=snapshot.generation)
