@@ -493,7 +493,7 @@ def _controller_from_mapping(raw: Any, label: str) -> ControllerDefinition:
         required={"kind"},
     )
     kind = str(safe["kind"])
-    if kind not in {"owners_released", "room", "profile_room"}:
+    if kind not in {"owners_released", "room", "profile_room", "quick_area"}:
         raise ConfigurationError(f"{label}.safe_handoff.kind is unsupported")
     if kind == "room" and not str(safe.get("room_id", "")).isdigit():
         raise ConfigurationError(f"{label}.safe_handoff.room_id must be numeric")
@@ -526,6 +526,20 @@ def _controller_from_mapping(raw: Any, label: str) -> ControllerDefinition:
             raise ConfigurationError(f"{label} requires explicit control_owner_scripts within owner_scripts")
     elif control_owners:
         raise ConfigurationError(f"{label}.control_owner_scripts requires registered controls")
+    if kind == "quick_area":
+        launches = [item for item in actions if item.kind == "launch"]
+        if (set(safe) != {"kind"} or script != "bigshot" or not control_owners
+                or not launches):
+            raise ConfigurationError(f"{label}.quick_area requires native controlled Bigshot without caller room lists")
+        for launch in launches:
+            tokens = launch.script_args_template.split()
+            area_options = [index for index, token in enumerate(tokens) if token.startswith("--area")]
+            if (not tokens or tokens[0] != "quick" or len(area_options) != 1
+                    or tokens[area_options[0]:area_options[0] + 2] != ["--area", "profile"]
+                    or any(parameter.type == "flag_suffix" for parameter in launch.parameters)
+                    or any(token.startswith("--") and "{" in token for token in tokens)
+                    or "--" in tokens):
+                raise ConfigurationError(f"{label}.quick_area launches require explicit --area profile")
     if any(item.kind == "signal" for item in actions) and signal_global is None:
         raise ConfigurationError(f"{label}.signal_global is required")
     controller = ControllerDefinition(

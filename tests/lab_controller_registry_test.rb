@@ -5,6 +5,35 @@ require 'tempfile'
 load File.expand_path('../lich/lab-controller-registry.rb', __dir__)
 
 class LabControllerRegistryTest < Minitest::Test
+  def test_quick_area_requires_native_controlled_explicit_profile_launch_without_room_lists
+    raw = JSON.parse(File.read(File.expand_path('fixtures/controller-controls.json', __dir__)))['controllers'].first
+    raw['script'] = 'bigshot'
+    raw['safe_handoff'] = { 'kind' => 'quick_area' }
+    raw['control_owner_scripts'] = ['bigshot']
+    raw['actions'].first['script_args_template'] = 'quick watch --area profile'
+    assert_equal 'quick_area', LabControllerRegistry::Controller.new(raw, 'test').safe_handoff['kind']
+    mutations = [
+      ->(c) { c['script'] = 'lab-test-quick' },
+      ->(c) { c['control_owner_scripts'] = [] },
+      ->(c) { c['safe_handoff']['rooms'] = { 'test' => '1000' } },
+      ->(c) { c['actions'].first['script_args_template'] = 'quick use reviewed' },
+      ->(c) { c['actions'].first['script_args_template'] = 'quick watch --area off' },
+      ->(c) { c['actions'].first['script_args_template'] = 'quick watch --area profile --area off' },
+      ->(c) { c['actions'].first['script_args_template'] = 'quick watch --area=profile' },
+      ->(c) { c['actions'].first['script_args_template'] = 'quick watch -- --area profile' },
+      lambda { |c|
+        c['actions'].first.merge!('command_template' => 'lab-test-quick start{extra}',
+          'script_args_template' => 'quick watch --area profile {extra}',
+          'parameters' => [{ 'name' => 'extra', 'type' => 'flag_suffix', 'true_value' => ' --area off' }])
+      }
+    ]
+    mutations.each do |mutation|
+      changed = JSON.parse(JSON.generate(raw))
+      mutation.call(changed)
+      assert_raises(LabControllerRegistry::ManifestError) { LabControllerRegistry::Controller.new(changed, 'test') }
+    end
+  end
+
   def test_test_registration_rejects_changed_command_policy_and_metadata
     raw = {
       'name' => 'test-probe', 'script' => 'lab-test-runner', 'summary' => 'Synthetic lifecycle test.',

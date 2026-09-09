@@ -1023,8 +1023,11 @@ class CapabilityRunner:
             expected_generation=start.generation,
             after_sequence=current.sequence,
         )
-        self._verify_controller_handoff(end, controller, operation.arguments)
+        self._verify_controller_handoff(end, controller, operation.arguments,
+                                        evidence=evidence, launch_room_id=current.room_id)
         operation.end_state = end
+        if controller.safe_handoff["kind"] == "quick_area":
+            return f"{controller.name} bounded field handoff and owner release verified"
         return (
             f"{controller.name} controller reported {evidence.facts['code']} and "
             "safe owner release was verified"
@@ -1128,6 +1131,9 @@ class CapabilityRunner:
         snapshot: SessionState,
         controller: ControllerDefinition,
         arguments: Mapping[str, object],
+        *,
+        evidence: EvidenceRecord | None = None,
+        launch_room_id: str | None = None,
     ) -> None:
         if snapshot.owners is None:
             raise _OperationAbort("failed", "post-state ownership is unknown")
@@ -1146,6 +1152,28 @@ class CapabilityRunner:
                 "failed",
                 f"controller did not return to safe room {safe_room}",
             )
+        if controller.safe_handoff["kind"] == "quick_area":
+            if snapshot.dead is not False or snapshot.stunned is not False:
+                raise _OperationAbort("failed", "bounded field handoff requires alive and unstunned state")
+            details = evidence.facts.get("details", {}) if evidence is not None else {}
+            runtime = details.get("runtime")
+            area = runtime.get("area") if isinstance(runtime, Mapping) else None
+            if (evidence is None or details.get("run_id") != evidence.action_id
+                    or details.get("cleanup_complete") is not True
+                    or not isinstance(runtime, Mapping) or runtime.get("state") not in {"completed", "stopped"}
+                    or runtime.get("mode") not in {"watch", "assist", "clear", "trial"}
+                    or not isinstance(area, Mapping) or area.get("kind") != "profile"
+                    or area.get("in_bounds") is not True
+                    or type(area.get("room_id")) is not int or str(area["room_id"]) != snapshot.room_id
+                    or type(area.get("start_room_id")) is not int
+                    or type(area.get("room_count")) is not int or area["room_count"] <= 0
+                    or not isinstance(area.get("boundary_room_ids"), list)
+                    or any(type(room) is not int for room in area["boundary_room_ids"])
+                    or (runtime["mode"] in {"clear", "trial"} and snapshot.room_id != launch_room_id)):
+                raise _OperationAbort("failed", "bounded field handoff lacks matching exact-run terminal area proof")
+            if snapshot.scripts is None or set(name.casefold() for name in snapshot.scripts).intersection(
+                    name.casefold() for name in controller.owner_scripts):
+                raise _OperationAbort("failed", "bounded field handoff requires controller owner scripts to exit")
 
     def _admit_and_start(
         self,

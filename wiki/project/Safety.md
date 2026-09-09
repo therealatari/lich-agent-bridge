@@ -89,6 +89,14 @@ shows the character alive in the configured safe room with ownership released.
 Stopping a combat script in the field is not a safe handoff. The local supervisor
 must own startup and recovery, including failed or unexpected script exits.
 
+The explicit native Bigshot `quick_area` registration is a bounded field-handoff
+contract, separately chosen by the player. It requires the exact child's
+correlated terminal profile-area proof matching fresh room state, alive and
+unstunned survival, completed cleanup, and released ownership. It does not
+claim safe-town arrival or authorize wandering. Ordinary area exit stops the
+operation; an already admitted retreat retains its separate refuge authority.
+See [controller controls](Controller-Controls.md#optional-profile-area-field-handoff).
+
 Protect the account and protected equipment before routine progress. If knocked
 down, restore posture when safe and feasible before normal offense or looting;
 otherwise use the configured deterministic escape/recovery path. A remote model

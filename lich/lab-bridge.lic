@@ -1703,6 +1703,42 @@ module LichAgentBridge
     %w[completed stopped].include?(quick_runtime_status(run)[:state].to_s)
   end
 
+  # Bigshot alone resolves profile boundaries. Only its exact child's published
+  # proof can authorize following player movement; LAB never traverses the map.
+  def self.controlled_area_status?(status)
+    area = status[:area]
+    area.is_a?(Hash) && area[:kind].to_s == 'profile' && area.key?(:room_id) && [true, false].include?(area[:in_bounds]) &&
+      (area[:room_id].nil? || area[:room_id].is_a?(Integer)) &&
+      (area[:in_bounds] == false || area[:room_id].is_a?(Integer)) &&
+      area[:start_room_id].is_a?(Integer) && area[:room_count].is_a?(Integer) && area[:room_count].positive? &&
+      area[:boundary_room_ids].is_a?(Array) && area[:boundary_room_ids].all? { |id| id.is_a?(Integer) }
+  end
+
+  def self.controlled_area_in_bounds?(run, status = quick_runtime_status(run))
+    return false unless run[:controller].safe_handoff['kind'] == 'quick_area'
+    area = status[:area]
+    controlled_area_status?(status) && area[:in_bounds] == true &&
+      area[:room_id].is_a?(Integer) && area[:room_id].to_s == room_fingerprint
+  end
+
+  def self.controlled_monitor_room_available?(run)
+    return controlled_run_room_available?(run) unless run[:controller].safe_handoff['kind'] == 'quick_area'
+    status = quick_runtime_status(run)
+    # Cached publication can lag player movement while the owner unwinds work.
+    # Native --area profile guards every send. Stale proof denies controls, but
+    # does not itself revoke the entire run before its owner can publish again.
+    controlled_area_status?(status) && status[:area][:in_bounds] == true &&
+      (%w[watch assist].include?(status[:mode].to_s) ||
+        (%w[clear trial].include?(status[:mode].to_s) && run[:action][:expected_room_id].to_s == room_fingerprint))
+  end
+
+  def self.controlled_run_room_available?(run)
+    return run[:action][:expected_room_id].to_s == room_fingerprint unless run[:controller].safe_handoff['kind'] == 'quick_area'
+    status = quick_runtime_status(run)
+    %w[watch assist clear trial].include?(status[:mode].to_s) && controlled_area_in_bounds?(run, status) &&
+      (%w[watch assist].include?(status[:mode].to_s) || run[:action][:expected_room_id].to_s == room_fingerprint)
+  end
+
   def self.controlled_local_available?(run, action, check_room: true)
     return false unless @running && @actions_enabled && !@snapshot_generation_rejected
     return false unless action[:generation] == session_generation && action[:character].to_s.casecmp?(character_name)
@@ -1710,7 +1746,7 @@ module LichAgentBridge
     instance = run[:instance]
     return false unless instance && instance.running? && !instance.stopping?
     return false unless instance.respond_to?(:quick_combat_runtime) && instance.quick_combat_runtime.equal?(run[:runtime])
-    return false if check_room && (action[:expected_room_id].to_s != room_fingerprint || run[:action][:expected_room_id].to_s != room_fingerprint)
+    return false if check_room && (action[:expected_room_id].to_s != room_fingerprint || !controlled_run_room_available?(run))
     scripts = live_scripts.map(&:downcase)
     allowed = run[:controller].control_owner_scripts.map(&:downcase)
     excluded = run[:controller].owner_scripts.map(&:downcase) - allowed
@@ -1763,9 +1799,13 @@ module LichAgentBridge
           run[:binding]&.close
         elsif !run[:lease]&.refresh
           run[:failure] = 'controller_authority_lost'
-        elsif run[:action][:expected_room_id].to_s != room_fingerprint
+        elsif !controlled_monitor_room_available?(run)
           state = quick_runtime_status(run)
-          run[:failure] = 'controller_room_changed' unless state[:retreat_pending] || state[:reason].to_s == 'retreat_pending'
+          # An explicitly admitted retreat retains its separate refuge authority;
+          # controls close while cleanup runs, without claiming an area handoff.
+          unless state[:retreat_pending] || state[:reason].to_s == 'retreat_pending'
+            run[:failure] = run[:controller].safe_handoff['kind'] == 'quick_area' ? 'controller_area_unverified' : 'controller_room_changed'
+          end
           run[:binding]&.close
         else
           run[:binding].refresh

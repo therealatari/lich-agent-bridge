@@ -414,7 +414,7 @@ class LabBridgeTest < Minitest::Test
     end
   end
 
-  def with_controlled_quick(inventory: false)
+  def with_controlled_quick(inventory: false, area: false)
     originals = {}
     replace = lambda do |object, name, &implementation|
       originals[[object, name]] = object.respond_to?(name) ? object.method(name) : nil
@@ -422,6 +422,12 @@ class LabBridgeTest < Minitest::Test
     end
     raw = JSON.parse(File.read(File.expand_path('fixtures/controller-controls.json', __dir__)))
     raw['controllers'].first['lanes'] << 'inventory' if inventory
+    if area
+      raw['controllers'].first['script'] = 'bigshot'
+      raw['controllers'].first['safe_handoff'] = { 'kind' => 'quick_area' }
+      raw['controllers'].first['control_owner_scripts'] = ['bigshot']
+      raw['controllers'].first['actions'].first['script_args_template'] = 'quick watch --area profile'
+    end
     controllers = raw['controllers'].each_with_index.map { |item, index| LabControllerRegistry::Controller.new(item, "controllers[#{index}]") }
     registry = LabControllerRegistry::Registry.new(controllers, 'synthetic-controlled-fixture')
     old_registry, old_patterns = LichAgentBridge::CONTROLLER_REGISTRY, LichAgentBridge::SAFE_ACTIONS
@@ -432,8 +438,9 @@ class LabBridgeTest < Minitest::Test
     LichAgentBridge.send(:remove_const, :SAFE_ACTIONS)
     LichAgentBridge.const_set(:SAFE_ACTIONS, (old_patterns + registry.safe_patterns).freeze)
     LichAgentBridge.instance_variable_set(:@controlled_runs, {})
-    child = SyntheticQuickChild.new('lab-test-quick')
+    child = SyntheticQuickChild.new(area ? 'bigshot' : 'lab-test-quick')
     runtime = SyntheticQuickRuntime.new(child)
+    runtime.current_status = { mode: 'watch', state: :running, area: synthetic_quick_area } if area
     child.quick_combat_runtime = runtime
     action = { action_id: '0123456789abcdef', character: 'Testmage', generation: old_generation,
                command: 'lab-test-quick start', expected_room_id: '1000', expires_at: Time.now.to_f + 1,
@@ -480,6 +487,99 @@ class LabBridgeTest < Minitest::Test
                command: "lab-test-quick #{verb} #{token}", expected_room_id: '1000', expires_at: Time.now.to_f + 1 }
     fixture[:authority][action[:action_id]] = action.merge(status: 'dispatched', stop_requested: false)
     action
+  end
+
+  def synthetic_quick_area(room_id = 1000)
+    { kind: :profile, start_room_id: 1000, boundary_room_ids: [1009], room_count: 3,
+      room_id: room_id, in_bounds: true }
+  end
+
+  def test_area_watch_and_assist_follow_player_with_each_control_still_room_pinned
+    %w[watch assist].each do |mode|
+      with_controlled_quick(area: true) do |fixture|
+        LichAgentBridge.execute_action(fixture[:action])
+        run = LichAgentBridge.instance_variable_get(:@controlled_runs)['quick']
+        fixture[:runtime].current_status = { mode: mode, state: :running, area: synthetic_quick_area(1001) }
+        fixture[:room] = '1001'
+        action = quick_control_action(fixture)
+        action[:expected_room_id] = '1001'
+        fixture[:authority][action[:action_id]][:expected_room_id] = '1001'
+        LichAgentBridge.execute_action(action)
+        assert_equal 'hold', fixture[:runtime].requests.first.first
+        predicate = fixture[:runtime].requests.first[1]
+        assert predicate.call
+        assert run[:binding].open?
+        fixture[:room] = '1002'
+        fixture[:runtime].current_status = { mode: mode, state: :running, area: synthetic_quick_area(1002) }
+        refute predicate.call, 'queued control cannot follow further movement'
+      end
+    end
+  end
+
+  def test_area_proof_is_exact_current_room_and_clear_trial_remain_launch_pinned
+    with_controlled_quick(area: true) do |fixture|
+      LichAgentBridge.execute_action(fixture[:action])
+      run = LichAgentBridge.instance_variable_get(:@controlled_runs)['quick']
+      fixture[:room] = '1001'
+      refute LichAgentBridge.controlled_run_room_available?(run), 'old runtime room is not current proof'
+      %w[clear trial unknown].each do |mode|
+        fixture[:runtime].current_status = { mode: mode, state: :running, area: synthetic_quick_area(1001) }
+        refute LichAgentBridge.controlled_run_room_available?(run)
+      end
+      fixture[:runtime].current_status = { mode: 'watch', state: :running, area: synthetic_quick_area(1001) }
+      assert LichAgentBridge.controlled_run_room_available?(run)
+      fixture[:child].quick_combat_runtime = SyntheticQuickRuntime.new(fixture[:child])
+      refute LichAgentBridge.controlled_local_available?(run, fixture[:action].merge(expected_room_id: '1001'))
+    end
+  end
+
+  def test_area_cached_room_lag_denies_controls_without_closing_native_run
+    with_controlled_quick(area: true) do |fixture|
+      LichAgentBridge.execute_action(fixture[:action])
+      run = LichAgentBridge.instance_variable_get(:@controlled_runs)['quick']
+      fixture[:room] = '1001'
+      refute LichAgentBridge.controlled_run_room_available?(run)
+      assert LichAgentBridge.controlled_monitor_room_available?(run)
+      sleep 0.12 # Observe more than two actual bridge monitor iterations.
+      assert_nil run[:failure]
+      assert run[:binding].open?
+      assert_empty fixture[:runtime].requests
+      fixture[:runtime].current_status = { mode: 'watch', state: :running, area: synthetic_quick_area(1001) }
+      action = quick_control_action(fixture)
+      action[:expected_room_id] = '1001'
+      fixture[:authority][action[:action_id]][:expected_room_id] = '1001'
+      LichAgentBridge.execute_action(action)
+      assert_equal 'hold', fixture[:runtime].requests.first.first
+      assert fixture[:runtime].requests.first[1].call
+    end
+  end
+
+  def test_ordinary_area_exit_stops
+    with_controlled_quick(area: true) do |fixture|
+      LichAgentBridge.execute_action(fixture[:action])
+      run = LichAgentBridge.instance_variable_get(:@controlled_runs)['quick']
+      fixture[:runtime].current_status = { mode: 'watch', state: :running,
+        area: synthetic_quick_area(1009).merge(in_bounds: false) }
+      fixture[:room] = '1009'
+      assert run[:monitor].join(1)
+      assert_includes fixture[:runtime].requests.map(&:first), 'stop'
+      assert_equal 'controller_area_unverified', run[:failure]
+      refute run[:result][:ok]
+    end
+  end
+
+  def test_area_exit_during_admitted_retreat_preserves_separate_refuge_cleanup
+    with_controlled_quick(area: true) do |fixture|
+      LichAgentBridge.execute_action(fixture[:action])
+      run = LichAgentBridge.instance_variable_get(:@controlled_runs)['quick']
+      fixture[:runtime].current_status = { mode: 'watch', state: :held, retreat_pending: true,
+        area: synthetic_quick_area(1009).merge(in_bounds: false) }
+      fixture[:room] = '1009'
+      assert run[:monitor].join(1)
+      refute_includes fixture[:runtime].requests.map(&:first), 'stop'
+      refute run[:binding].open?
+      refute run[:result][:ok]
+    end
   end
 
   def test_controlled_inventory_lane_is_owned_by_the_registered_controller

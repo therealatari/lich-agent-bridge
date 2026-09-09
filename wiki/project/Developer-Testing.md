@@ -39,6 +39,9 @@ outcomes. Do not add retries that might repeat a non-idempotent game action.
    events, and read a fresh snapshot for handoff. A watch timeout means no event
    arrived in that interval, not that a command succeeded. After movement/combat,
    handoff requires the authorized safe room, survival, and released ownership.
+   A separately registered native `quick_area` operation instead requires the
+   exact terminal profile-area proof and fresh alive/unstunned, released-owner
+   field handoff described in [controller controls](Controller-Controls.md#optional-profile-area-field-handoff).
 
 MCP tools and their exact types are documented in the generated
 [SDK declarations](../../mcp/src/sdk-types.generated.ts). For example, after

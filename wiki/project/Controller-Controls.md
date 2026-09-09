@@ -67,9 +67,10 @@ immutable `quick_combat_result` snapshot instead. Older native lifecycle or
 Bigshot publication/guard implementations fail closed.
 
 The available predicate checks current local run/session/room/ownership pins
-without issuing commands. This slice is room-pinned trial support, not a generic
-moving watch/assist controller. An admitted retreat may change rooms while its
-controls are closed and bounded cleanup is observed.
+without issuing commands. Existing registrations retain the launch-room pin.
+An admitted retreat may change rooms while its controls are closed and bounded
+cleanup is observed. Explicit profile-area registrations support the bounded
+watch/assist behavior below.
 The separate authority reader uses the existing authenticated action-status
 transport on a bridge worker, never on Bigshot's owner thread.
 
@@ -103,8 +104,44 @@ join can be confirmed. No successor is killed or released by script name.
 
 Queued acknowledgements and cached status are not attributed application results.
 Terminal success still requires fresh survival, configured safe-room arrival,
-and owner release. The bridge preserves these distinctions and the existing
+and owner release, or the explicit bounded field handoff below. The bridge preserves these distinctions and the existing
 broker/independent Lich checks, without another listener or authentication path.
+
+### Optional profile-area field handoff
+
+`safe_handoff: {"kind": "quick_area"}` opts a locally registered native Bigshot
+controller into profile-area handoff. It requires registered native controls and
+explicit `--area profile` in every launch's fixed `quick` script arguments,
+including preset launches. Duplicate, variable, or suffix-supplied area options
+are rejected; this registration does not accept room lists or dynamic flag
+suffixes. The public registry remains empty and existing room registrations and
+the script-test pilot retain their room contracts.
+
+Bigshot resolves the selected profile's start room and boundaries. LAB consumes
+only the exact launched child's runtime `status.area`: `kind: "profile"`, integer
+`start_room_id`, integer `boundary_room_ids`, positive integer `room_count`,
+integer-or-null `room_id`, and boolean `in_bounds`. LAB never computes room
+membership or traverses a map. A usable proof requires `in_bounds: true` and
+`room_id` matching the current room observation. Missing or stale proof denies
+control application. Cached in-bounds publication may lag player movement;
+that lag does not terminate the native run. Bigshot's explicit profile-area
+guards enforce membership at each outgoing command, and LAB closes controls
+when the owner publishes outside-area status. Bigshot's `watch` and `assist` modes can retain control after player
+movement within that area; `clear` and `trial` keep the original room pin.
+
+Each newly admitted typed control still binds to its current room, exact launch,
+generation, native child/runtime, ownership, and short authority lease. Further
+movement invalidates that queued control even within the area. Ordinary area
+exit closes controls and requests cooperative stop. An already admitted retreat
+keeps its separate configured refuge authority and bounded cleanup; arrival
+outside the area cannot establish a `quick_area` handoff.
+
+Successful field handoff requires the exact correlated launch result to contain
+terminal runtime area proof matching a fresh same-generation snapshot, completed
+child cleanup, known alive and unstunned state, released lanes, and exited owner
+scripts. For `clear` and `trial`, that room must also match the launch room. This
+verifies a bounded field handoff; it does not claim safe-town arrival, verified
+combat effects, or permission to wander.
 
 ### Bounded status presentation
 
@@ -127,8 +164,8 @@ runtime's immutable snapshot is never modified. A summary which exceeds the
 limit even without transcript entries is still rejected, not silently rewritten.
 These presentation changes do not verify game effects or control application.
 
-Verified offline with 712 Python tests and 111 focused Ruby bridge/controller
-tests (675 assertions, no skips). A cross-check using Bigshot's actual controller
+Verified offline with 718 Python tests and 132 focused Ruby bridge/controller/test-runner
+tests (789 assertions, no skips). A cross-check using Bigshot's actual controller
 report producer and LAB's event validator covers simple commands, grouped
 commands, oversized grouped transcripts, and long command text. This confirms
 transport compatibility, not live combat behavior.

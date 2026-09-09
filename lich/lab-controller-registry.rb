@@ -255,6 +255,21 @@ module LabControllerRegistry
       elsif !@control_owner_scripts.empty?
         raise ManifestError, "#{context}.control_owner_scripts requires registered controls"
       end
+      if @safe_handoff['kind'] == 'quick_area'
+        launches = @actions.select { |item| item.kind == 'launch' }
+        unless @safe_handoff.keys == ['kind'] && @script == 'bigshot' && !@control_owner_scripts.empty? && !launches.empty?
+          raise ManifestError, "#{context}.quick_area requires native controlled Bigshot without caller room lists"
+        end
+        launches.each do |launch|
+          tokens = launch.script_args_template.split
+          area_options = tokens.each_index.select { |index| tokens[index].start_with?('--area') }
+          unless tokens.first == 'quick' && area_options.length == 1 && tokens[area_options.first, 2] == %w[--area profile] &&
+              launch.parameters.none? { |parameter| parameter.type == 'flag_suffix' } &&
+              tokens.none? { |token| token.start_with?('--') && token.include?('{') } && !tokens.include?('--')
+            raise ManifestError, "#{context}.quick_area launches require explicit --area profile"
+          end
+        end
+      end
       raise ManifestError, "#{context}.signal_global is required by signal action" if @actions.any? { |item| item.kind == 'signal' } && !@signal_global
       if raw.key?('test_suite')
         begin
@@ -394,7 +409,7 @@ module LabControllerRegistry
       def validate_safe_handoff(raw, context)
         strict_keys(raw, %w[kind room_id rooms], %w[kind], context)
         kind = raw.fetch('kind').to_s
-        raise ManifestError, "#{context}.kind is unsupported" unless %w[owners_released room profile_room].include?(kind)
+        raise ManifestError, "#{context}.kind is unsupported" unless %w[owners_released room profile_room quick_area].include?(kind)
         if kind == 'room'
           raise ManifestError, "#{context}.room_id must be numeric" unless raw['room_id'].to_s.match?(/\A[0-9]+\z/)
         elsif kind == 'profile_room'
