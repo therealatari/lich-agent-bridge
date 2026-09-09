@@ -66,6 +66,50 @@ The isolated `lab.execute_code` tool can combine small state/query operations,
 but permits only one mutation (perform or exact-operation stop) per execution and has a short execution limit.
 Use direct perform/watch for long operations; it is not a general script runner.
 
+## Direct native go2 travel
+
+`travel.go2` exposes existing Lich/go2 routing without starting a combat test.
+It is available through the existing capability interface, including MCP
+`lab.perform`, not a generic command or script execution tool. For example,
+after authorizing this exact character, destination and route scope:
+
+```text
+labctl perform Testmage travel.go2 --arg 'destination="1000"' --expected-generation GENERATION --operation-timeout 60
+```
+
+Use a numeric map room ID, not a go2 alias, settings command, or room 4 special
+selector. Default operation time is 30 seconds; callers may request up to 120.
+Native go2 sends are limited to 256 ordinary movement/door/posture/look commands.
+Go2 must support `--preserve-scripts`; Lich must support guarded native child
+startup and script-start restrictions. Missing support refuses before launch.
+One-trip options disable silver retrieval and typeahead, preserving unrelated
+scripts and persisted go2 settings. Routes requiring spending, equipment
+handling, spells, or nested scripts are not supported by this initial operation.
+This trusts installed go2/map code; it is not a Ruby sandbox.
+The broker uses a distinct supervised command selector so an older bridge
+rejects the request instead of silently launching its legacy unguarded go2 path.
+The selector is internal to LAB; it is not a new go2 command for players.
+
+Admission requires fresh same-generation state, known hands, survival, and
+released movement/combat/inventory owners. Existing go2 is never adopted or
+killed by name. The exact child receives a startup execution guard and uses the
+existing broker authority lease; guards do not make network revocation instant.
+Ordinary stop, actions-off, expiry or generation loss deny further sends. Only
+the exact child is cancelled, with at most two seconds to confirm teardown.
+Cancellation is not arrival and cannot undo an already sent movement.
+
+Success requires fresh destination arrival, survival, standing posture,
+unchanged hands, attributed go2 completion and released ownership. An already
+at-destination request is a verified no-op. If a test has an unresolved refuge
+handoff, travel is allowed only to its original refuge in the same session;
+the original equipment/owner recovery proof is still required to clear it.
+Travel does not override actions-off or gain authority from an earlier failure.
+
+This operation permits explicitly authorized recovery from the field. It does
+not relax the requirement for tests to begin/end in player-designated refuges,
+nor replace the test controller's own automatic return. Offline tests cover
+admission, cancellation and the bridge child seam; live acceptance is pending.
+
 ## Trusted script-test pilot
 
 The [approved plan](Script-Test-Pilot-Plan.md) limits this slice to one trusted

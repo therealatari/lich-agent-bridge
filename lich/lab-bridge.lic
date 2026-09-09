@@ -117,6 +117,7 @@ module LichAgentBridge
     /\A(?:north|northeast|east|southeast|south|southwest|west|northwest|out|up|down|n|ne|e|se|s|sw|w|nw|u|d)\z/i,
     /\A(?:go|climb|enter) [a-z0-9][a-z0-9 #'_-]{0,119}\z/i,
     /\Ago2 [0-9]+\z/i,
+    /\Ago2 supervised [1-9][0-9]{0,9}\z/i,
     /\A(?:say|whisper|tell|ask) [^\r\n]{1,140}\z/i,
     /\Ainspect item exact [^\r\n]{1,120}\z/i,
     /\Adiagnose item (?:405|735) exact [^\r\n]{1,120}\z/i,
@@ -2322,6 +2323,87 @@ module LichAgentBridge
     raise
   end
 
+  # One trusted native go2 child, not a pathfinder or arbitrary script runner.
+  # The native guard is installed before startup and remains active in cleanup.
+  def self.execute_go2(action, destination)
+    child = nil
+    closed = false
+    launching = false
+    unless destination.match?(/\A[1-9][0-9]{0,9}\z/) && destination != '4' && Map[destination.to_i]
+      raise ArgumentError, 'go2 requires an explicit mapped destination'
+    end
+    unless Script.const_defined?(:START_EXECUTION_GUARD_PROTOCOL) && Script::START_EXECUTION_GUARD_PROTOCOL == 1 &&
+           Script.const_defined?(:SCRIPT_START_RESTRICTION_PROTOCOL) && Script::SCRIPT_START_RESTRICTION_PROTOCOL == 1
+      raise ArgumentError, 'go2 requires native guarded child startup'
+    end
+    relative = Script.__send__(:__find_script_file, 'go2')
+    root = defined?(SCRIPT_DIR) ? SCRIPT_DIR : $script_dir
+    unless relative.is_a?(String) && root.is_a?(String) && File.read(File.join(root, relative)).include?('--preserve-scripts')
+      raise ArgumentError, 'go2 requires the one-trip preserve-scripts option'
+    end
+    prefix = $cmd_prefix
+    raise ArgumentError, 'game command prefix unavailable' unless prefix.is_a?(String)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + [action.fetch(:expires_at) - Time.now.to_f, 120].min
+    owner = Script.current
+    hands = -> { [GameObj.right_hand&.id&.to_s, GameObj.left_hand&.id&.to_s] }
+    original_hands = hands.call
+    available = lambda do |_request|
+      next false if closed || !@running || !@actions_enabled || @snapshot_generation_rejected || owner.stopping?
+      next false unless action[:generation] == session_generation && action[:character].to_s.casecmp?(character_name)
+      next false unless Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline && hands.call == original_hands
+      next false unless XMLData.indicator['IconDEAD'] == 'n' && XMLData.indicator['IconSTUNNED'] == 'n'
+      scripts = (Array(Script.running) + Array(Script.hidden)).uniq
+      scripts = scripts.reject { |candidate| child && candidate.equal?(child) && owner.child_scripts.any? { |owned| owned.equal?(child) } }
+      names = scripts.map { |script| script.name.to_s }
+      owners = script_owners(names)
+      %i[movement combat inventory].all? { |lane| owners[lane].nil? }
+    end
+    lease = LabControllerControls::Lease.new(action: action, available: available,
+      authority: method(:controlled_action_authority), clock: -> { Time.now.to_f })
+    raise ArgumentError, 'go2 authority or ownership unavailable' unless lease.refresh
+    sends = 0
+    lock = Mutex.new
+    command_pattern = /\A(?:(?:n|ne|e|se|s|sw|w|nw|u|d|o|north|northeast|east|southeast|south|southwest|west|northwest|up|down|out|stand|unhide|look)|(?:go|climb|swim|crawl|jump|open|close) [a-z0-9][a-z0-9 '\-]*)\z/i
+    guard = lambda do |wire|
+      sleep 0.001 while launching && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+      lock.synchronize do
+        next false unless child && lease.valid?
+        if wire
+          command = wire.delete_prefix(prefix) if wire.is_a?(String) && wire.start_with?(prefix)
+          next false unless command && command_pattern.match?(command) && room_fingerprint != 'unknown' && sends < 256
+          sends += 1
+        end
+        true
+      end
+    end
+    launching = true
+    child = Script.start_child('go2', "#{destination} --disable-confirm --typeahead=0 --get-silvers=off --stop-for-dead=off --preserve-scripts",
+                               {quiet: true, execution_guard: guard, allow_script_starts: false})
+    launching = false
+    raise ArgumentError, 'go2 native child startup failed' unless child && owner.child_scripts.any? { |owned| owned.equal?(child) }
+    until child.join(0)
+      raise ArgumentError, 'go2 authority, deadline or ownership lost' unless lease.refresh
+      sleep 0.05
+    end
+    unless child.completed_successfully? && lease.valid? && room_fingerprint == destination && hands.call == original_hands &&
+           XMLData.indicator['IconSTANDING'] == 'y'
+      raise ArgumentError, 'go2 arrival, survival or equipment handoff unverified'
+    end
+    set_script_status('go2', "completed:#{action.fetch(:action_id)}")
+    publish_snapshot(force: true)
+    report_action(action, 'completed', "go2 destination arrival and exact child exit verified (#{sends} sends)")
+  rescue StandardError => error
+    set_script_status('go2', "failed:#{action.fetch(:action_id)}")
+    report_action(action, 'failed', "go2 travel failed: #{error.message}")
+  ensure
+    launching, closed = false, true
+    lease&.revoke
+    if child && !child.join(0) && !child.kill_sync(timeout: 2)
+      display('go2 cleanup incomplete; do not start another operation until its owner has exited.')
+    end
+    publish_snapshot(force: true)
+  end
+
   def self.execute_action(action)
     @execution_mutex.synchronize do
       commands = action_commands(action)
@@ -2378,6 +2460,9 @@ module LichAgentBridge
         return
       elsif (exact_examination = command.match(/\A(look|inspect) #([0-9]+)\z/i))
         examine_exact_id(action, exact_examination[1].downcase, exact_examination[2])
+        return
+      elsif (go2_match = command.match(/\Ago2 supervised ([1-9][0-9]{0,9})\z/i))
+        execute_go2(action, go2_match[1])
         return
       elsif (go2_match = command.match(/\Ago2 ([0-9]+)\z/i))
         destination = go2_match[1]

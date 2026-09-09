@@ -144,9 +144,11 @@ Management:
 ;lab stop
 ```
 
-The default catalog contains four capabilities:
+The default catalog contains five capabilities:
 
 - `character.recon`: fixed INFO/SKILLS inspection with verified observations.
+- `travel.go2`: exact-room native go2 travel with bounded execution and verified
+  arrival; requires compatible guarded Lich/go2 builds and explicit player authorization.
 - `item.audit`: attributed diagnostics for an exact current item.
 - `room.loot`: a bounded ELoot sweep with admission and outcome checks.
 - `hunt.prepare`: unavailable without a configured character profile; no profiles
@@ -402,6 +404,7 @@ The core Ruby bridge tests require a Ruby runtime compatible with the installed 
 ```bash
 ruby tests/lab_dispatcher_test.rb
 ruby tests/lab_bridge_test.rb
+ruby tests/lab_go2_travel_test.rb
 ruby tests/lab_controller_registry_test.rb
 ruby tests/lab_controller_controls_test.rb
 ruby tests/lab_controller_control_binding_test.rb

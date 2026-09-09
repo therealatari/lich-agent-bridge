@@ -354,6 +354,7 @@ class CommandPolicy:
         re.compile(r"\A(?:north|northeast|east|southeast|south|southwest|west|northwest|out|up|down|n|ne|e|se|s|sw|w|nw|u|d)\Z"),
         re.compile(r"\A(?:go|climb|enter) [a-z0-9][a-z0-9 #'_-]{0,119}\Z"),
         re.compile(r"\Ago2 [0-9]+\Z"),
+        re.compile(r"\Ago2 supervised [1-9][0-9]{0,9}\Z"),
     )
     _COMMUNICATION = re.compile(r"\A(?:say|whisper|tell|ask) [^\r\n]{1,140}\Z")
     _LOCAL_INSPECTION = re.compile(
@@ -491,6 +492,10 @@ class _Action:
     stop_requested: bool = False
     return_requested: bool = False
 
+    @property
+    def travel_run(self) -> bool:
+        return len(self.commands) == 1 and re.fullmatch(r"go2 supervised [1-9][0-9]{0,9}", self.commands[0], re.IGNORECASE) is not None
+
     def public(self, *, instruction: str) -> dict[str, Any]:
         result = {
             "action_id": self.action_id,
@@ -513,7 +518,7 @@ class _Action:
         if self.controller_deadline is not None:
             result["controller_deadline"] = self.controller_deadline
             result["return_requested"] = self.return_requested
-        if self.test_run or self.controller_control or self.controller_deadline is not None:
+        if self.test_run or self.controller_control or self.controller_deadline is not None or self.travel_run:
             result["stop_requested"] = self.stop_requested
         return result
 
@@ -568,7 +573,7 @@ class ActionBroker:
             cancelled: list[str] = []
             if previous is not None and previous != admitted_generation:
                 for action in self._actions.values():
-                    if ((action.test_run or action.controller_control or action.controller_deadline is not None)
+                    if ((action.test_run or action.controller_control or action.controller_deadline is not None or action.travel_run)
                             and action.character.casefold() == character_key
                             and action.generation != admitted_generation
                             and action.status in {"dispatched", "completed", "failed"}):
@@ -614,7 +619,7 @@ class ActionBroker:
             else:
                 self._enabled.discard(character_key)
                 for action in self._actions.values():
-                    if ((action.test_run or action.controller_control or action.controller_deadline is not None)
+                    if ((action.test_run or action.controller_control or action.controller_deadline is not None or action.travel_run)
                             and action.character.casefold() == character_key
                             and action.status in {"dispatched", "completed", "failed"}):
                         action.stop_requested = True
@@ -878,6 +883,8 @@ class ActionBroker:
 
         Internal operation cleanup only: identity is checked against the action,
         not the current session, so old-generation owners can still clean up.
+        Dispatched supervised go2 additionally receives a stop marker for its
+        native guard; already-sent movement is never undone.
         """
 
         with self._lock:
@@ -888,6 +895,11 @@ class ActionBroker:
                 raise ValidationError("action belongs to another session generation")
             self._expire_locked()
             cancelled = action.status in {"confirmation_required", "queued"}
+            if action.travel_run and action.status == "dispatched":
+                action.stop_requested = True
+                self._audit({"event": "travel_stop_requested", "action_id": action.action_id,
+                             "character": action.character, "generation": action.generation})
+                self._changed.notify_all()
             if cancelled:
                 action.status = "cancelled"
                 self._audit({

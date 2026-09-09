@@ -113,6 +113,11 @@ The earlier experimental `quick_area` field-handoff exception is superseded:
 old registrations can load for migration but cannot launch Quick tests.
 Manually operated Bigshot Quick is not made dependent on LAB or this workflow.
 
+Direct `travel.go2` can perform separately authorized navigation or recovery
+without a combat launch. It uses existing native go2, exact child ownership,
+bounded authority and verified arrival. It does not override action revocation
+or declare an arbitrary destination safe. See [direct travel](Developer-Testing.md#direct-native-go2-travel).
+
 An authorized movement or combat operation is complete only when fresh evidence
 shows the character alive in the configured safe room with ownership released.
 Stopping a combat script in the field is not a safe handoff. The local supervisor

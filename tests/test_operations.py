@@ -294,6 +294,7 @@ class CapabilityRunnerTests(unittest.TestCase):
         self.assertEqual(
             set(catalog),
             {
+                "travel.go2",
                 "character.recon",
                 "item.audit",
                 "hunt.prepare",

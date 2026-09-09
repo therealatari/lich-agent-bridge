@@ -292,11 +292,12 @@ class SessionHubTests(unittest.TestCase):
         result = hub.capability_catalog({"character": "Testknight"})
 
         self.assertEqual(result["character"], "Testknight")
-        self.assertEqual(result["total"], 4)
+        self.assertEqual(result["total"], 5)
         self.assertFalse(any(item["name"].startswith("controller.") for item in result["items"]))
         self.assertEqual(
             {item["name"] for item in result["items"]},
             {
+                "travel.go2",
                 "character.recon",
                 "item.audit",
                 "hunt.prepare",

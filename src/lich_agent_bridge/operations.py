@@ -22,7 +22,7 @@ from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 from .actions import ActionBroker, ActionProposal
 from .controller_manifest import CONTROLLER_CONTROLS, ControllerDefinition, ControllerManifest
 from .errors import ValidationError
-from .script_adapters import BIGSHOT_ADAPTER, ELOOT_ADAPTER, ScriptAdapter
+from .script_adapters import BIGSHOT_ADAPTER, ELOOT_ADAPTER, GO2_ADAPTER, ScriptAdapter
 from .watchers import CharacterProfile
 from .timings import emit_timing
 
@@ -51,6 +51,13 @@ _EMPTY_ARGUMENTS: Mapping[str, Any] = {
     "additionalProperties": False,
 }
 CAPABILITY_DEFINITIONS = (
+    CapabilityDefinition(
+        name="travel.go2",
+        summary="Travel to one explicitly authorized mapped room with native go2; verify arrival and released ownership.",
+        arguments={"type": "object", "properties": {"destination": {"type": "string", "pattern": "^[1-9][0-9]{0,9}$"}},
+                   "required": ["destination"], "additionalProperties": False},
+        handler_name="_execute_go2",
+    ),
     CapabilityDefinition(
         name="character.recon",
         summary="Refresh INFO and/or SKILLS and verify newly observed character records.",
@@ -328,6 +335,7 @@ class CapabilityRunner:
         self._operations: OrderedDict[str, OperationRecord] = OrderedDict()
         self._interruptions: set[str] = set()
         self._recon_actions: dict[str, tuple[str, str]] = {}
+        self._travel_actions: dict[str, tuple[str, str]] = {}
         self._test_actions: dict[str, tuple[str, str]] = {}
         self._controller_actions: dict[str, tuple[str, str]] = {}
         self._graceful_stops: set[str] = set()
@@ -536,8 +544,9 @@ class CapabilityRunner:
             # Recon already caps its own deadline at 20 seconds; preserve that
             # existing clamping contract rather than changing its outcome.
             if (operation.deadline - operation.requested_at > 30 and operation.capability != "character.recon"
+                    and operation.capability != "travel.go2"
                     and self._refuge_controller(operation) is None):
-                raise _OperationAbort("failed", "only refuge outings can extend the existing 30-second operation envelope")
+                raise _OperationAbort("failed", "only refuge outings and direct travel can extend the existing 30-second operation envelope")
             explanation = handler(operation)
             operation.explanation = explanation
             # Resolve the final stop/success race while the same lock still
@@ -545,7 +554,7 @@ class CapabilityRunner:
             with self._lock:
                 if self.is_test_operation(operation):
                     self._check_test_stop(operation)
-                elif operation.operation_id in self._controller_actions:
+                elif operation.operation_id in self._controller_actions or operation.capability == "travel.go2":
                     self._check_deadline_and_interruption(operation)
                     if operation.operation_id in self._graceful_stops:
                         raise _OperationAbort("interrupted", "test stopped; return to refuge and equipment recovery verified")
@@ -649,6 +658,7 @@ class CapabilityRunner:
             if operation.status not in TERMINAL_OPERATION_STATES:
                 self._interruptions.add(operation_id)
         self._cancel_recon_action(operation)
+        self._cancel_travel_action(operation)
         self._stop_test_action(operation)
         self._cancel_controller_controls(operation)
 
@@ -767,6 +777,63 @@ class CapabilityRunner:
             self._progress(operation, f"cancelled owned pending recon action {action_id}")
         elif result["status"] == "dispatched":
             self._raise_alert(operation, "recon was already dispatched; sent commands cannot be unsent")
+
+    def _cancel_travel_action(self, operation: OperationRecord) -> None:
+        with self._lock:
+            owned = self._travel_actions.get(operation.operation_id)
+        if owned is not None:
+            self._actions.cancel(owned[0], character=operation.character, generation=owned[1])
+
+    @staticmethod
+    def _validate_travel_state(snapshot: SessionState) -> None:
+        if snapshot.dead is not False or snapshot.stunned is not False:
+            raise _OperationAbort("failed", "travel requires verified survival and no stun")
+        if snapshot.scripts is None or snapshot.owners is None:
+            raise _OperationAbort("failed", "travel requires known script ownership")
+        if "go2" in {name.casefold() for name in snapshot.scripts}:
+            raise _OperationAbort("failed", "an existing go2 cannot be adopted or replaced")
+        if any(lane not in snapshot.owners or snapshot.owners[lane] is not None
+               for lane in ("movement", "combat", "inventory")):
+            raise _OperationAbort("failed", "travel requires released movement, combat and inventory owners")
+
+    def _execute_go2(self, operation: OperationRecord) -> str:
+        if set(operation.arguments) != {"destination"}:
+            raise _OperationAbort("failed", "travel requires only destination")
+        destination = operation.arguments["destination"]
+        if (not isinstance(destination, str) or re.fullmatch(r"[1-9][0-9]{0,9}", destination) is None
+                or destination == "4"):
+            raise _OperationAbort("failed", "destination must be an explicit positive room ID, not a special go2 selector")
+        if operation.expected_generation is None:
+            raise _OperationAbort("failed", "travel requires expected_generation")
+        if operation.deadline - operation.requested_at > 120:
+            raise _OperationAbort("failed", "travel is limited to 120 seconds")
+        start = self._require_fresh_session(operation)
+        operation.start_state = start
+        self._validate_travel_state(start)
+        hands = self._hand_ids(start)
+        with self._lock:
+            pending = self._refuge_pending.get(operation.character.casefold())
+        if pending and (pending[2].generation != start.generation
+                        or pending[1].safe_handoff["room_id"] != destination):
+            raise _OperationAbort("failed", "unresolved test handoff permits travel only to its original refuge in the same session")
+        self._admit_and_start(operation, admitted_detail="exact-destination travel admitted",
+                             running_detail="native go2 travel running")
+        if start.room_id == destination:
+            self._resolve_prior_refuge(operation, start)
+            operation.end_state = start
+            return "already at destination with original equipment and released owners; no commands sent"
+        action = self._run_broker_step(operation, start, GO2_ADAPTER.command("supervised_travel", destination=destination),
+                                       "traveling to the authorized destination")
+        end = self._require_fresh_session(operation, expected_generation=start.generation,
+                                          after_sequence=start.sequence)
+        self._validate_travel_state(end)
+        if end.room_id != destination or self._hand_ids(end) != hands:
+            raise _OperationAbort("failed", "destination arrival or original equipment was not verified")
+        if end.script_status is None or end.script_status.get("go2") != f"completed:{action['action_id']}":
+            raise _OperationAbort("failed", "exact go2 completion was not verified")
+        operation.end_state = end
+        self._resolve_prior_refuge(operation, end)
+        return "go2 arrival, original equipment and exact owner release verified"
 
     def _execute_item_audit(self, operation: OperationRecord) -> str:
         methods = self._parse_item_audit_arguments(operation.arguments)
@@ -1685,13 +1752,17 @@ class CapabilityRunner:
                     expected_room_id=snapshot.room_id,
                     expected_generation=snapshot.generation,
                     ttl_seconds=ttl,
-                    deadline=operation.deadline if self.is_test_operation(operation) else None,
+                    deadline=operation.deadline if self.is_test_operation(operation) or operation.capability == "travel.go2" else None,
                     controller_deadline=operation.deadline if controlled_launch else None,
                 )
             )
         except ValidationError as error:
             raise _OperationAbort("failed", f"broker denied {detail}: {error}") from error
         recon = operation.capability == "character.recon"
+        travel = operation.capability == "travel.go2"
+        if travel:
+            with self._lock:
+                self._travel_actions[operation.operation_id] = (str(action["action_id"]), snapshot.generation)
         test_run = self.is_test_operation(operation)
         if recon:
             with self._lock:
@@ -1714,7 +1785,7 @@ class CapabilityRunner:
         try:
             # An interrupt can arrive while submit is returning, before its ID
             # can be associated with the operation. Recheck before dispatch.
-            if recon:
+            if recon or travel:
                 self._check_deadline_and_interruption(operation)
             if test_run:
                 with self._lock:
@@ -1744,6 +1815,12 @@ class CapabilityRunner:
                 self._check_deadline_and_interruption(operation, allow_interrupt=not cleanup and not test_run)
                 self._sleeper(self._action_poll_interval)
         finally:
+            if travel:
+                try:
+                    self._cancel_travel_action(operation)
+                finally:
+                    with self._lock:
+                        self._travel_actions.pop(operation.operation_id, None)
             if recon:
                 try:
                     self._cancel_recon_action(operation)
@@ -1938,6 +2015,8 @@ class CapabilityRunner:
 
     def _finish(self, operation: OperationRecord, status: str, detail: str) -> None:
         with self._lock:
+            if operation.capability == "travel.go2" and status != "succeeded":
+                self._raise_alert(operation, "Travel did not complete successfully; verify current location and ownership before further action.")
             pending = self._refuge_pending.get(operation.character.casefold())
             if pending is not None and pending[0] == operation.operation_id:
                 self._raise_alert(operation, "UNSAFE HANDOFF: refuge, equipment and owner release unverified; operator assistance required before another test")

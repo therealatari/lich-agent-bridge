@@ -63,6 +63,7 @@ jobs:
       - run: |
           ruby tests/lab_dispatcher_test.rb
           ruby tests/lab_bridge_test.rb
+          ruby tests/lab_go2_travel_test.rb
           ruby tests/despana_state_test.rb
           ruby tests/lab_controller_registry_test.rb
           ruby tests/lab_controller_controls_test.rb
