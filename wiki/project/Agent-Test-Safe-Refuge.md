@@ -2,7 +2,7 @@
 
 Status: single-outing implementation completed locally and offline regressions
 pass. Player-authorized live verification and final contribution-branch review
-remain gates before publication.
+remain gates before merge. A draft PR may run CI without claiming live acceptance.
 The earlier field-handoff exception is no longer an executable Quick test path.
 
 ## Delivery slices
