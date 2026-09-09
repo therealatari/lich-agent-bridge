@@ -183,7 +183,12 @@ class WorldStateEvidenceAdapter:
             raise ValidationError("controller evidence registration is invalid")
         if not action_id:
             raise ValidationError("controller action ID is unavailable")
-        timeout = max(0.0, min(float(timeout_seconds), MAX_WATCH_TIMEOUT_SECONDS))
+        timeout = float(timeout_seconds)
+        if not math.isfinite(timeout):
+            raise ValidationError("controller evidence timeout must be finite")
+        timeout = max(0.0, timeout)
+        # The caller supplies the operation's remaining lifetime. A watch is
+        # only one bounded transport wait, not a second operation deadline.
         deadline = time.monotonic() + timeout
         cursor = registration.cursor
         while True:
@@ -191,7 +196,7 @@ class WorldStateEvidenceAdapter:
             page = self._world_state.watch(
                 registration.character,
                 cursor=cursor,
-                timeout=max(0.0, remaining),
+                timeout=max(0.0, min(remaining, MAX_WATCH_TIMEOUT_SECONDS)),
             )
             cursor = int(page["cursor"])
             for event in page["events"]:
@@ -231,7 +236,7 @@ class WorldStateEvidenceAdapter:
                     },
                     action_id=action_id,
                 )
-            if remaining <= 0 or page["timed_out"]:
+            if time.monotonic() >= deadline:
                 return None
 
 

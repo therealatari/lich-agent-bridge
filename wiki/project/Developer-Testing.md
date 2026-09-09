@@ -108,7 +108,29 @@ Travel does not override actions-off or gain authority from an earlier failure.
 This operation permits explicitly authorized recovery from the field. It does
 not relax the requirement for tests to begin/end in player-designated refuges,
 nor replace the test controller's own automatic return. Offline tests cover
-admission, cancellation and the bridge child seam; live acceptance is pending.
+admission, cancellation and the bridge child seam. Initial live acceptance of
+LAB `9345157` passed an already-at-destination no-op and a short town round trip
+between two player-designated safe rooms. Both legs verified arrival, original
+equipment and released ownership without alerts. This does not verify long or
+special routes, live cancellation, combat recovery, or the separate Quick
+post-combat return path.
+
+### Controller-result wait regression
+
+A Quick outing exposed a LAB evidence-wait bug: the 30-second maximum for one
+state watch was incorrectly used as the entire controller-result deadline. A
+watch timeout then failed the operation and revoked its exact launch while
+native go2 was still returning, despite time remaining in the approved outing.
+Controller verification now repeats bounded watches, carrying its cursor
+forward, until matching terminal evidence or the operation's remaining deadline.
+This does not extend execution authority or change native go2 routing.
+
+The virtual-time regression exercises the real broker, operation runner and
+evidence adapter: a return after 40 seconds succeeds within a 90-second budget;
+missing evidence still fails and revokes at 90 seconds. Additional tests use
+the real state watcher to verify bounded waits, unrelated-result rejection,
+short/zero deadlines and already-published evidence. These are offline checks;
+post-combat return, loot cleanup and ordinary-stop live acceptance remain pending.
 
 ## Trusted script-test pilot
 
