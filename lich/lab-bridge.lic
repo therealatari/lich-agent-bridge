@@ -304,7 +304,8 @@ module LichAgentBridge
     combat_candidates = %w[bigshot] + CONTROLLER_REGISTRY.controller_scripts_for_lane('combat')
     movement = movement_candidates.uniq.find { |name| folded.include?(name) }
     combat = combat_candidates.uniq.find { |name| folded.include?(name) }
-    inventory = %w[eloot eherbs lab-inventory].find { |name| folded.include?(name) }
+    inventory_candidates = %w[eloot eherbs lab-inventory] + CONTROLLER_REGISTRY.controller_scripts_for_lane('inventory')
+    inventory = inventory_candidates.uniq.find { |name| folded.include?(name) }
     {
       movement: movement,
       combat: combat,

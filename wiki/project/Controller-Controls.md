@@ -21,6 +21,12 @@ native script and drawn from the existing `owner_scripts` exclusion list.
 An exclusion is not permission to control a competing owner. The shipped registry
 remains empty; synthetic fixtures are not active registrations.
 
+Declared controller lanes also participate in observed ownership. In particular,
+an inventory-capable controller must be recognized as the inventory owner while
+its exact runtime executes cleanup. Independent eLoot, healing, and inventory
+tracker scripts take precedence as conflicts; an unrecognized owner is not
+silently treated as permission to continue.
+
 `CapabilityRunner.control_controller(operation_id, character=...,
 expected_generation=..., control=...)` submits a control through ActionBroker for
 an existing active operation. It does not create another operation or relax the

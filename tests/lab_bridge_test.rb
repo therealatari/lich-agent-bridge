@@ -414,13 +414,16 @@ class LabBridgeTest < Minitest::Test
     end
   end
 
-  def with_controlled_quick
+  def with_controlled_quick(inventory: false)
     originals = {}
     replace = lambda do |object, name, &implementation|
       originals[[object, name]] = object.respond_to?(name) ? object.method(name) : nil
       object.define_singleton_method(name, &implementation)
     end
-    registry = LabControllerRegistry.load(File.expand_path('fixtures/controller-controls.json', __dir__))
+    raw = JSON.parse(File.read(File.expand_path('fixtures/controller-controls.json', __dir__)))
+    raw['controllers'].first['lanes'] << 'inventory' if inventory
+    controllers = raw['controllers'].each_with_index.map { |item, index| LabControllerRegistry::Controller.new(item, "controllers[#{index}]") }
+    registry = LabControllerRegistry::Registry.new(controllers, 'synthetic-controlled-fixture')
     old_registry, old_patterns = LichAgentBridge::CONTROLLER_REGISTRY, LichAgentBridge::SAFE_ACTIONS
     old_runs = LichAgentBridge.instance_variable_get(:@controlled_runs)
     old_generation = LichAgentBridge.session_generation
@@ -477,6 +480,21 @@ class LabBridgeTest < Minitest::Test
                command: "lab-test-quick #{verb} #{token}", expected_room_id: '1000', expires_at: Time.now.to_f + 1 }
     fixture[:authority][action[:action_id]] = action.merge(status: 'dispatched', stop_requested: false)
     action
+  end
+
+  def test_controlled_inventory_lane_is_owned_by_the_registered_controller
+    with_controlled_quick(inventory: true) do |fixture|
+      LichAgentBridge.execute_action(fixture[:action])
+      run = LichAgentBridge.instance_variable_get(:@controlled_runs)['quick']
+      assert run[:binding]&.open?, 'declared inventory ownership must not revoke a valid launch'
+      assert run[:lease].valid?
+      assert_equal 'lab-test-quick', LichAgentBridge.script_owners(['lab-test-quick'])[:inventory]
+      assert_equal 'completed', fixture[:results].last.last[:outcome]
+      assert_empty fixture[:runtime].requests, 'startup must not queue a spurious stop'
+      %w[eloot eherbs lab-inventory].each do |other|
+        assert_equal other, LichAgentBridge.script_owners(['lab-test-quick', other])[:inventory]
+      end
+    end
   end
 
   def test_controlled_bridge_pins_native_child_and_routes_control_without_owner_transport_calls
