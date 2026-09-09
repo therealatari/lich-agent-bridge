@@ -1,9 +1,8 @@
 # Agent tests: safe start and return
 
-Status: single-outing implementation completed locally and offline regressions
-pass. Player-authorized live verification and final contribution-branch review
-remain gates before merge. A draft PR may run CI without claiming live acceptance.
-The earlier field-handoff exception is no longer an executable Quick test path.
+Status: single-outing implementation, offline regressions, contribution-branch
+review and player-authorized live verification pass. The earlier field-handoff
+exception is no longer an executable Quick test path.
 
 ## Delivery slices
 
@@ -122,7 +121,24 @@ an exclusion on both sides; same-session fresh refuge, original equipment and
 released ownership can resolve it. A changed session cannot silently clear the
 old unresolved run. This is not a guarantee against game hazards or disconnects.
 
-Remaining: authorized coordinated deployment and live acceptance from a
-player-designated refuge; then a reviewed case-batch layer using the verified
-outing. Automated weapon swapping, generic test scripting, multi-character
-campaigns and parameter optimization are not implemented by this slice.
+Player-authorized live acceptance on 2026-09-10 began in a configured refuge
+with known equipment and free ownership. A bounded seek outing traversed 28
+rooms, issued four attributed attacks which the game transcript confirmed as
+four kills, and returned 28 rooms to the same refuge. Fresh terminal state
+verified the original held-item identity, full health, released movement,
+combat, and inventory ownership, and no alerts. A separate ordinary-stop run
+returned to the same refuge with equipment and ownership restored. These
+observations validate the one-outing lifecycle, not every route, creature,
+profile, or game hazard.
+
+A rejected native preflight before child creation now emits an exact-run
+`controlled_start_rejected` receipt. LAB clears only that new operation's
+handoff latch after independently verifying the same generation, refuge,
+equipment, and released owners; missing or ambiguous proof remains fail-closed.
+An older unresolved native run survived a bridge reload during acceptance and
+correctly required explicit `;lab recover RUN_ID confirm` acknowledgment.
+
+Remaining product work is the subsequent reviewed case-batch layer using this
+verified outing. Automated weapon swapping, generic test scripting,
+multi-character campaigns, and parameter optimization are not implemented by
+this slice.

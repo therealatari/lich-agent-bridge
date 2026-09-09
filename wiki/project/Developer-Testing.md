@@ -129,8 +129,12 @@ The virtual-time regression exercises the real broker, operation runner and
 evidence adapter: a return after 40 seconds succeeds within a 90-second budget;
 missing evidence still fails and revokes at 90 seconds. Additional tests use
 the real state watcher to verify bounded waits, unrelated-result rejection,
-short/zero deadlines and already-published evidence. These are offline checks;
-post-combat return, loot cleanup and ordinary-stop live acceptance remain pending.
+short/zero deadlines and already-published evidence. These are offline checks.
+Player-authorized live acceptance on 2026-09-10 then verified an ordinary-stop
+return and a full post-combat seek outing: four game-confirmed kills, return to
+the configured refuge, original equipment restored, all controller owners
+released, and no alerts. Loot cleanup remains a separate live acceptance case;
+the no-loot combat pass does not establish it.
 
 ## Trusted script-test pilot
 

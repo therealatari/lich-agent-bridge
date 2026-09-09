@@ -49,8 +49,12 @@ denies all further sends, including travel, and can leave recovery incomplete.
 
 Results separate work, actual observed effects, equipment recovery, refuge
 arrival and exact-owner release. Unverified recovery blocks another test.
-Offline suites pass; the coordinated safe-refuge live acceptance remains pending.
-Earlier field tests do not establish that this new return contract works live.
+Offline suites pass. Player-authorized safe-refuge acceptance on 2026-09-10
+verified both ordinary stop and a bounded seek/combat/return outing. The latter
+traversed 28 rooms each way, produced four game-confirmed kills, restored the
+original held item, released all owners, and ended without alerts. This is one
+low-risk lifecycle acceptance, not a general claim about arbitrary routes,
+profiles, creatures, or loot behavior.
 
 Reviewed weapon/creature case batches are a subsequent slice, not a shipped
 automated campaign. No automatic login, arbitrary equipment swapping or model-
