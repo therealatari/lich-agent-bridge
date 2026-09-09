@@ -27,7 +27,7 @@
   Their authors and contributors retain credit for the mature game-output
   knowledge that made this implementation practical.
 
-  project: https://github.com/therealatari/lich-agent-bridge
+  project: https://github.com/elanthia-online/lich-agent-bridge
   version: 0.1.0
      game: gs
 =end
@@ -105,8 +105,16 @@ module LabInventory
 
     def with_inventory_action
       owner = Script.current
-      unless owner.respond_to?(:with_execution_guard) && defined?(LichAgentBridge)
-        raise 'Inventory refresh requires LAB ownership checks and native execution guards'
+      unless owner && defined?(LichAgentBridge) && %i[script_owners live_scripts].all? { |name| LichAgentBridge.respond_to?(name) }
+        raise 'Inventory refresh requires available LAB ownership checks'
+      end
+      guarded = owner.respond_to?(:with_execution_guard)
+      unless guarded
+        registry = LichAgentBridge.const_get(:CONTROLLER_REGISTRY, false) if LichAgentBridge.const_defined?(:CONTROLLER_REGISTRY, false)
+        unless defined?(LabControllerRegistry::Registry) && registry.is_a?(LabControllerRegistry::Registry) &&
+               registry.controllers.is_a?(Array) && registry.controllers.empty?
+          raise 'Inventory refresh with registered or unknown controllers requires native execution guards'
+        end
       end
       acquired = @inventory_action_mutex.synchronize do
         next false if @inventory_action_active
@@ -114,12 +122,20 @@ module LabInventory
       end
       raise 'An inventory refresh is already active' unless acquired
 
-      owner.with_execution_guard(lambda do |_command|
+      permitted = lambda do |_command|
         owners = LichAgentBridge.script_owners(LichAgentBridge.live_scripts)
-        %i[movement combat inventory].all? { |lane| owners.key?(lane) } &&
+        owners.is_a?(Hash) && %i[movement combat inventory].all? { |lane| owners.key?(lane) } &&
           owners[:movement].nil? && owners[:combat].nil? &&
           [nil, 'lab-inventory'].include?(owners[:inventory])
-      end) { yield }
+      end
+      if guarded
+        owner.with_execution_guard(permitted) { yield }
+      else
+        # Preserve explicit refreshes on older Lich only when controller use is
+        # explicitly disabled. This admission check is not per-send revocation.
+        raise 'Inventory refresh ownership is unavailable or conflicting' unless permitted.call(nil)
+        yield
+      end
     ensure
       @inventory_action_mutex.synchronize { @inventory_action_active = false } if acquired
     end

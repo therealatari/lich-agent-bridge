@@ -68,13 +68,15 @@ class LabControllerControlBindingTest < Minitest::Test
 
   def test_opt_in_example_matches_direct_bigshot_trial_without_enabling_public_registry
     registry = LabControllerRegistry.load(File.expand_path('../examples/controllers/bigshot-quick-trial.json', __dir__))
-    match = registry.match('bigshot quick trial probe-sequence --target 12345')
+    match = registry.match('bigshot quick trial probe-sequence --target 12345 --area profile')
     assert_equal 'bigshot', match.controller.script
-    assert_equal 'quick trial probe-sequence --target 12345', match.script_args
+    assert_equal 'quick trial probe-sequence --target 12345 --area profile', match.script_args
+    assert_equal 'quick_refuge', match.controller.safe_handoff['kind']
     assert_equal ['bigshot'], match.controller.control_owner_scripts
-    refute registry.match('bigshot quick trial unreviewed --target 12345')
+    refute registry.match('bigshot quick trial unreviewed --target 12345 --area profile')
+    refute registry.match('bigshot quick trial probe-sequence --target 12345')
     public_registry = LabControllerRegistry.load(File.expand_path('../lich/lab-controllers.json', __dir__))
-    refute public_registry.match('bigshot quick trial probe-sequence --target 12345')
+    refute public_registry.match('bigshot quick trial probe-sequence --target 12345 --area profile')
   end
 
   def test_expired_and_stale_cached_authority_prevent_queued_application

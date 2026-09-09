@@ -1,5 +1,6 @@
 require 'minitest/autorun'
 require 'tmpdir'
+require_relative '../lich/lab-controller-registry'
 
 ENV['LAB_INVENTORY_LIBRARY_ONLY'] = '1'
 if ENV['LICH_EXECUTION_GUARD_ROOT']
@@ -38,7 +39,7 @@ def respond(_message) = nil
 load File.expand_path('../lich/lab-inventory.lic', __dir__)
 
 class LabInventoryTest < Minitest::Test
-  def with_refresh_fixture
+  def with_refresh_fixture(guarded: true, registry: LabControllerRegistry::Registry.new([], 'synthetic'))
     old_constants = %i[Script LichAgentBridge].to_h do |name|
       [name, (Object.const_get(name) if Object.const_defined?(name))]
     end
@@ -61,17 +62,19 @@ class LabInventoryTest < Minitest::Test
     owner.define_singleton_method(:emit) do |command|
       if guard
         guard.checkpoint!(command: command)
-      else
+      elsif guarded
         raise 'guard denied' unless policy && policy.call(command) == true
       end
       sent << command
     end
+    owner.singleton_class.send(:remove_method, :with_execution_guard) unless guarded
     script = Module.new
     script.define_singleton_method(:current) { owner }
     Object.const_set(:Script, script)
     bridge = Module.new
     bridge.define_singleton_method(:live_scripts) { ['lab-inventory'] }
     bridge.define_singleton_method(:script_owners) { |_scripts| owners }
+    bridge.const_set(:CONTROLLER_REGISTRY, registry) unless registry == :missing
     Object.const_set(:LichAgentBridge, bridge)
     yield owners, owner, sent
   ensure
@@ -91,6 +94,102 @@ class LabInventoryTest < Minitest::Test
         end
       end
       refute LabInventory.inventory_lane_active?
+    end
+  end
+
+  def test_empty_registry_preserves_legacy_refresh_without_native_guards
+    with_refresh_fixture(guarded: false) do |owners, owner, sent|
+      checked = false
+      LichAgentBridge.define_singleton_method(:script_owners) do |_scripts|
+        raise 'lane was not claimed before ownership check' unless LabInventory.inventory_lane_active?
+        checked = true
+        owners
+      end
+      LabInventory.with_inventory_action do
+        assert checked
+        assert LabInventory.inventory_lane_active?
+        owner.emit('inventory enhancive list')
+      end
+      assert_equal ['inventory enhancive list'], sent
+      refute LabInventory.inventory_lane_active?
+    end
+  end
+
+  def test_legacy_refresh_checks_ownership_before_sending_and_releases_the_lane
+    with_refresh_fixture(guarded: false) do |owners, owner, sent|
+      [{ movement: 'go2' }, { combat: 'bigshot' }, { inventory: 'eloot' }, {}].each do |conflict|
+        original = owners.dup
+        conflict.empty? ? owners.clear : owners.merge!(conflict)
+        assert_raises(StandardError) { LabInventory.with_inventory_action { owner.emit('must not send') } }
+        assert_empty sent
+        refute LabInventory.inventory_lane_active?
+        owners.replace(original)
+      end
+      assert_raises(RuntimeError) do
+        LabInventory.with_inventory_action do
+          assert LabInventory.inventory_lane_active?
+          raise 'synthetic refresh failure'
+        end
+      end
+      refute LabInventory.inventory_lane_active?
+    end
+  end
+
+  def test_legacy_refresh_requires_an_explicitly_empty_validated_registry
+    nonempty = LabControllerRegistry::Registry.new([Struct.new(:name, :script).new('test', 'test')], 'synthetic')
+    malformed = LabControllerRegistry::Registry.new([], 'synthetic')
+    malformed.define_singleton_method(:controllers) { nil }
+    [nonempty, :missing, nil, {}, Struct.new(:controllers).new([]), malformed].each do |registry|
+      with_refresh_fixture(guarded: false, registry: registry) do |_owners, owner, sent|
+        assert_raises(StandardError) { LabInventory.with_inventory_action { owner.emit('must not send') } }
+        assert_empty sent
+        refute LabInventory.inventory_lane_active?
+      end
+    end
+  end
+
+  def test_legacy_refresh_does_not_assume_missing_bridge_means_no_controllers
+    with_refresh_fixture(guarded: false) do |_owners, owner, sent|
+      Object.send(:remove_const, :LichAgentBridge)
+      assert_raises(StandardError) { LabInventory.with_inventory_action { owner.emit('must not send') } }
+      assert_empty sent
+      refute LabInventory.inventory_lane_active?
+    end
+  end
+
+  def test_legacy_refresh_keeps_the_exclusive_lane_claim
+    with_refresh_fixture(guarded: false) do |_owners, _owner, _sent|
+      LabInventory.with_inventory_action do
+        assert_raises(RuntimeError) { LabInventory.with_inventory_action { flunk 'concurrent refresh admitted' } }
+        assert LabInventory.inventory_lane_active?
+      end
+      refute LabInventory.inventory_lane_active?
+    end
+  end
+
+  def test_refresh_refuses_missing_current_script_even_with_empty_registry
+    with_refresh_fixture(guarded: false) do |_owners, owner, sent|
+      Script.define_singleton_method(:current) { nil }
+      assert_raises(StandardError) { LabInventory.with_inventory_action { owner.emit('must not send') } }
+      assert_empty sent
+      refute LabInventory.inventory_lane_active?
+    end
+  end
+
+  def test_native_guards_remain_active_regardless_of_registry_availability
+    nonempty = LabControllerRegistry::Registry.new([Struct.new(:name, :script).new('test', 'test')], 'synthetic')
+    [nonempty, :missing].each do |registry|
+      with_refresh_fixture(registry: registry) do |owners, owner, sent|
+        assert_raises(StandardError) do
+          LabInventory.with_inventory_action do
+            owner.emit('first')
+            owners[:combat] = 'bigshot'
+            owner.emit('must not send')
+          end
+        end
+        assert_equal ['first'], sent
+        refute LabInventory.inventory_lane_active?
+      end
     end
   end
 

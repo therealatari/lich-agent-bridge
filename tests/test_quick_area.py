@@ -147,10 +147,10 @@ class QuickAreaTests(unittest.TestCase):
                 self.handoff()
             setattr(self.state, field, old)
 
-    def test_actual_runner_returns_bounded_field_result_after_correlated_evidence(self):
+    def test_actual_runner_refuses_legacy_field_only_handoff(self):
         self.assert_runner_field_handoff()
 
-    def test_actual_seek_runner_hands_off_in_arrival_room_not_launch_room(self):
+    def test_actual_seek_runner_refuses_legacy_field_only_handoff(self):
         raw = area_manifest_raw()
         raw["controllers"][0]["actions"][0].update(
             command_template="bigshot quick seek --area profile",
@@ -163,7 +163,7 @@ class QuickAreaTests(unittest.TestCase):
     def test_shipped_seek_example_is_opt_in_and_uses_a_finite_preset_enum(self):
         manifest = ControllerManifest.load(Path(__file__).parents[1] / "examples/controllers/bigshot-quick-seek.json")
         controller = manifest.controller("quick-seek")
-        self.assertEqual(controller.safe_handoff, {"kind": "quick_area"})
+        self.assertEqual(controller.safe_handoff["kind"], "quick_refuge")
         self.assertEqual(set(controller.lanes), {"movement", "combat", "inventory"})
 
     def assert_runner_field_handoff(self):
@@ -187,6 +187,6 @@ class QuickAreaTests(unittest.TestCase):
                                   controller_manifest=self.manifest, clock=clock,
                                   sleeper=clock.sleep, step_hook=driver)
         operation = runner.perform("Testmage", "controller.quick", expected_generation="generation-1")
-        self.assertEqual(operation.status, "succeeded", operation.explanation)
-        self.assertIn("bounded field handoff", operation.explanation)
-        self.assertEqual(operation.end_state.room_id, "1001")
+        self.assertEqual(operation.status, "failed", operation.explanation)
+        self.assertIn("quick_refuge", operation.explanation)
+        self.assertEqual(driver.commands, [])

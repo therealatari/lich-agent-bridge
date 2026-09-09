@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from copy import deepcopy
 import hashlib
+import math
 import re
 import time
 from typing import Any, Mapping, Sequence
@@ -605,16 +606,20 @@ class SessionHub:
         return {"character": character, "items": items, "total": len(items)}
 
     def perform(self, payload: Mapping[str, Any]) -> dict[str, Any]:
-        character, capability, arguments, generation = self._perform_request(payload)
+        character, capability, arguments, generation, timeout = self._perform_request(payload)
         options = {} if generation is None else {"expected_generation": generation}
+        if timeout is not None:
+            options["timeout_seconds"] = timeout
         operation = self.capabilities.perform(character, capability, arguments, **options)
         return self._operation_mapping(operation)
 
     def start_operation(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         """Admit an operation and return immediately with its stable ID."""
 
-        character, capability, arguments, generation = self._perform_request(payload)
+        character, capability, arguments, generation, timeout = self._perform_request(payload)
         options = {} if generation is None else {"expected_generation": generation}
+        if timeout is not None:
+            options["timeout_seconds"] = timeout
         operation = self.capabilities.start(character, capability, arguments, **options)
         return self._operation_mapping(operation)
 
@@ -711,11 +716,11 @@ class SessionHub:
     @staticmethod
     def _perform_request(
         payload: Mapping[str, Any],
-    ) -> tuple[str, str, dict[str, Any], str | None]:
+    ) -> tuple[str, str, dict[str, Any], str | None, float | None]:
         request = _strict(
             payload,
             label="perform request",
-            allowed={"character", "capability", "args", "expected_generation"},
+            allowed={"character", "capability", "args", "expected_generation", "timeout_seconds"},
             required={"character", "capability"},
         )
         character = _character(request["character"])
@@ -727,7 +732,13 @@ class SessionHub:
             raise ValidationError("args must be an object")
         generation = (None if "expected_generation" not in request else
                       _text(request["expected_generation"], "expected_generation", maximum=128))
-        return character, capability, dict(arguments), generation
+        timeout = request.get("timeout_seconds")
+        if "timeout_seconds" in request:
+            if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                    or not math.isfinite(timeout) or not 0 < timeout <= 300):
+                raise ValidationError("timeout_seconds must be positive and at most 300")
+            timeout = float(timeout)
+        return character, capability, dict(arguments), generation, timeout
 
     @staticmethod
     def _knowledge_mapping(excerpt: KnowledgeExcerpt) -> dict[str, Any]:

@@ -6,6 +6,7 @@ import argparse
 from datetime import datetime, timezone
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -135,7 +136,10 @@ def parser() -> argparse.ArgumentParser:
         help="capability-specific JSON argument; may be repeated",
     )
     perform.add_argument("--wait", action="store_true")
-    perform.add_argument("--timeout", type=float, default=30.0)
+    perform.add_argument("--timeout", type=float, default=30.0,
+                         help="Watch long-poll seconds (0–30); does not extend the operation.")
+    perform.add_argument("--operation-timeout", type=float, default=30.0,
+                         help="Total operation seconds (default 30; refuge outings up to 300, including recovery).")
     perform.add_argument("--expected-generation", help="bind admission to the observed session generation")
 
     stop = commands.add_parser("stop", help="interrupt a character's active operation")
@@ -961,16 +965,17 @@ def main(argv: list[str] | None = None) -> None:
         ))
         return
     if args.command == "perform":
-        if not 0 <= args.timeout <= MAX_WATCH_TIMEOUT_SECONDS:
-            raise SystemExit(
-                f"--timeout must be between 0 and {MAX_WATCH_TIMEOUT_SECONDS:g}"
-            )
+        if not math.isfinite(args.timeout) or not 0 <= args.timeout <= MAX_WATCH_TIMEOUT_SECONDS:
+            raise SystemExit(f"--timeout must be between 0 and {MAX_WATCH_TIMEOUT_SECONDS:g}")
+        if not math.isfinite(args.operation_timeout) or not 0 < args.operation_timeout <= 300:
+            raise SystemExit("--operation-timeout must be positive and at most 300 seconds")
         operation = _post(
             "/v1/session/perform",
             {
                 "character": args.character,
                 "capability": args.capability,
                 "args": _perform_args(args),
+                "timeout_seconds": args.operation_timeout,
                 **({"expected_generation": args.expected_generation} if args.expected_generation else {}),
             },
             settings=settings,

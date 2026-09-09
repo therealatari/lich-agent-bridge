@@ -5,6 +5,33 @@ require 'tempfile'
 load File.expand_path('../lich/lab-controller-registry.rb', __dir__)
 
 class LabControllerRegistryTest < Minitest::Test
+  def test_quick_refuge_requires_exact_room_return_budget_and_native_area_contract
+    raw = JSON.parse(File.read(File.expand_path('fixtures/controller-controls.json', __dir__)))['controllers'].first
+    raw.merge!('script' => 'bigshot', 'control_owner_scripts' => ['bigshot'],
+      'safe_handoff' => { 'kind' => 'quick_refuge', 'room_id' => '1000', 'return_seconds' => 30 })
+    raw['actions'].first['script_args_template'] = 'quick seek --area profile'
+    assert LabControllerRegistry::Controller.new(raw, 'test')
+    changes = [
+      ->(c) { c['safe_handoff'].delete('return_seconds') },
+      ->(c) { c['safe_handoff']['return_seconds'] = 9 },
+      ->(c) { c['safe_handoff']['return_seconds'] = 121 },
+      ->(c) { c['safe_handoff']['return_seconds'] = '30' },
+      ->(c) { c['safe_handoff']['room_id'] = 0 },
+      ->(c) { c['safe_handoff']['room_id'] = '4' },
+      ->(c) { c['safe_handoff']['room_id'] = 1.5 },
+      ->(c) { c['safe_handoff']['rooms'] = {} },
+      ->(c) { c['lanes'] = ['combat'] },
+      ->(c) { c['script'] = 'lab-test-quick' },
+      ->(c) { c['actions'].first['script_args_template'] = 'quick clear' },
+      ->(c) { c['actions'].first['script_args_template'] = 'quick seek --area profile --supervised-refuge-v1 1,2' }
+    ]
+    changes.each do |change|
+      invalid = JSON.parse(JSON.generate(raw))
+      change.call(invalid)
+      assert_raises(LabControllerRegistry::ManifestError) { LabControllerRegistry::Controller.new(invalid, 'test') }
+    end
+  end
+
   def test_seek_requires_profile_area_and_both_movement_and_combat_lanes
     %w[seek SEEK {mode}].each do |mode|
       raw = JSON.parse(File.read(File.expand_path('fixtures/controller-controls.json', __dir__)))['controllers'].first

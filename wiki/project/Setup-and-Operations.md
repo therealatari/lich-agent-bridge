@@ -56,6 +56,16 @@ and character policy are neither bundled nor required for the bridge.
 The optional [Quick trial example](../../examples/controllers/README.md) requires
 explicit registration and compatible Bigshot/native Lich lifecycle support.
 
+Explicit inventory enhancive/charge refreshes retain compatibility with older
+Lich versions without native execution guards only when the loaded controller
+registry is valid and explicitly empty. The bridge must still be available:
+refreshes claim the inventory lane and check for competing owners before starting.
+This legacy path does not provide per-command revocation; avoid starting other
+equipment/combat/movement scripts during the refresh. Registering any controller
+requires native guards for these refreshes. Missing or malformed registry state
+does not enable the fallback. When native guards exist, they are always used,
+including with an empty registry. Passive inventory observation is unchanged.
+
 The optional trusted script-test pilot also needs `lich/lab-test-runner.lic`.
 Use real copies of the runner pair and reviewed suite files for that pilot:
 revision pinning rejects symlink substitutions. Merely installing these files

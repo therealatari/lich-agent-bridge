@@ -13,6 +13,7 @@ module LabControllerControls
       @available, @authority, @clock = available, authority, clock
       @deadline = deadline || @action.fetch(:expires_at)
       @mutex, @checked_at, @revoked = Mutex.new, nil, false
+      @return_requested = false
     end
 
     def refresh
@@ -23,6 +24,7 @@ module LabControllerControls
       @mutex.synchronize do
         @revoked = true unless valid
         @checked_at = @clock.call if valid && !@revoked
+        @return_requested = true if valid && observed[:return_requested] == true
       end
       valid?
     rescue StandardError
@@ -42,6 +44,10 @@ module LabControllerControls
 
     def expired?
       @clock.call >= @deadline
+    end
+
+    def return_requested?
+      @mutex.synchronize { @return_requested }
     end
 
     def revoke

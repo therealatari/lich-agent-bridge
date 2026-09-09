@@ -45,6 +45,12 @@ See [Architecture](wiki/project/Architecture.md), [Protocol](wiki/project/Protoc
 - A configured answer backend
 - The Ruby `sqlite3` gem for durable inventory tracking
 
+Optional Quick controllers require the companion native Lich support described
+in [controller setup](examples/controllers/README.md). With a valid, explicitly
+empty controller registry, older Lich builds can still run explicit inventory
+refreshes using initial ownership checks; native per-command guards are used
+whenever available. See [inventory compatibility](wiki/project/Setup-and-Operations.md#install-lich-dependencies).
+
 The current default backend is the locally installed Codex CLI using its existing ChatGPT login. A direct OpenAI Responses API adapter and an OpenAI-compatible Chat Completions adapter for local servers such as llama.cpp are also available. Named profiles select the provider, model, reasoning effort, timeout, and an optional bounded local instructions file.
 
 Current development and live testing are Linux-oriented. The optional MCP adapter additionally requires Node.js, npm, and the native build prerequisites used by `isolated-vm`.
@@ -54,7 +60,7 @@ Current development and live testing are Linux-oriented. The optional MCP adapte
 Clone the repository and install the Python package:
 
 ```bash
-git clone https://github.com/therealatari/lich-agent-bridge.git
+git clone https://github.com/elanthia-online/lich-agent-bridge.git
 cd lich-agent-bridge
 python3 -m venv .venv
 source .venv/bin/activate
@@ -170,7 +176,7 @@ those requests; the model cannot supply arbitrary commands, paths, or URLs.
 
 Known limitation: multi-part questions can find the right page but miss the
 specific interaction-rule passage. Further passage-selection tuning is tracked
-in [issue #7](https://github.com/therealatari/lich-agent-bridge/issues/7).
+in [issue #7](https://github.com/elanthia-online/lich-agent-bridge/issues/7).
 
 `character.read` reuses recent same-session INFO/SKILLS observations and can
 request missing or older-than-two-minute categories through the existing recon

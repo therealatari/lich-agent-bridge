@@ -10,7 +10,7 @@
   stays short-lived so management commands continue to work while the bridge
   is active.
 
-  project: https://github.com/therealatari/lich-agent-bridge
+  project: https://github.com/elanthia-online/lich-agent-bridge
   version: 0.1.0
      game: gs
 =end

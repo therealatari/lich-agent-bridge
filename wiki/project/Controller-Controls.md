@@ -32,6 +32,26 @@ and charge refreshes claim that lane until completion (including error cleanup)
 and use native execution guards to refuse competing movement, combat, or
 inventory owners before each send. An older tracker without this interface, or
 an unreadable flag, remains a conflict. No persistent user toggle is needed.
+On older Lich without native guards, explicit refreshes remain available only
+with a validated, explicitly empty controller registry and available bridge
+ownership checks. They retain the exclusive lane claim and initial owner check,
+not per-send revocation. Registering controllers or unavailable registry state
+disables this fallback. Native guards remain mandatory whenever present; see
+[setup compatibility](Setup-and-Operations.md#install-lich-dependencies).
+
+The bound Quick may briefly own an exact direct `eloot --load-room-api` native
+child to load definitions. Only that child's native identity and complete exact
+argument list are exempt from its local ownership conflict check. Ordinary,
+foreign, sibling and differently parameterized eLoot remain conflicts; snapshot
+visibility is unchanged. This is trusted-script ownership, not a Ruby sandbox.
+
+Supervised refuge transit similarly permits only an exact direct native `go2`
+child that the bound Quick owner currently identifies through
+`quick_refuge_travel_child?`. Both child-list identity and a literal `true` from
+that predicate are required. Foreign or sibling go2 scripts, inactive/stale
+travel markers, missing predicates, and unreadable observations remain conflicts.
+The child remains visible in snapshots; this is not a name-based movement
+exemption or permission to launch arbitrary travel.
 
 `CapabilityRunner.control_controller(operation_id, character=...,
 expected_generation=..., control=...)` submits a control through ActionBroker for
@@ -62,21 +82,38 @@ A dispatched control receives
 a `stop_requested` marker through existing action-status observations; it cannot
 be unsent. Unrelated actions are not revoked.
 
+For an already dispatched refuge outing, ordinary operation stop instead marks
+the launch `return_requested`. The bridge queues one local stop-to-return request
+while retaining the launch lease. Pending controls are revoked. Actions-off,
+explicit hard revocation, missing authority and generation loss still deny all
+further commands, including travel. Neither kind of stop proves safe arrival.
+
 ## Optional native Quick binding
 
 The bridge launches opted-in controllers with native `Script.start_child`, pins
 its exact returned Script object, original launch, character, and session, then
 binds only that instance's fixed `quick_combat_runtime` publication using
 `LabControllerControls::Binding`. No arbitrary method names or script-name
-rediscovery are accepted. A fast completed run can supply its exact-instance
-immutable `quick_combat_result` snapshot instead. Older native lifecycle or
-Bigshot publication/guard implementations fail closed.
+rediscovery are accepted. Supervised startup must publish and activate before
+any work; a terminal snapshot before activation is a startup failure, not an
+alternative successful launch. After activation, fast completion still retains
+its exact-instance immutable `quick_combat_result` snapshot.
 
-The available predicate checks current local run/session/room/ownership pins
-without issuing commands. Existing registrations retain the launch-room pin.
-An admitted retreat may change rooms while its controls are closed and bounded
-cleanup is observed. Explicit profile-area registrations support the bounded
-watch/assist behavior below.
+Before spawning, the bridge resolves the trusted local script using Lich and
+checks its literal `SUPERVISED_START_PROTOCOL = 1` and `REFUGE_START_PROTOCOL = 1`
+declarations. It then appends the private `--supervised-start-v1 WORK,CLEANUP`
+and `--supervised-refuge-v1 ROOM,RETURN_DEADLINE` selectors, never modifying the
+registered player command or persisted presets. Historical scripts without the
+declaration are refused before launch; older expanded Quick parsers also reject
+the unfamiliar selector. This is compatibility checking of trusted local code,
+not a Ruby sandbox, source authentication, or protection against concurrent file
+replacement. The declaration must not be added to incompatible scripts.
+
+The available predicate checks current local run/session/ownership pins without
+issuing commands. Native Quick enforces the approved outing's area/route edges
+while its phase is outbound, working, recovering or returning. Each newly queued
+control still binds to its current room and is invalid after further movement.
+The monitor does not mistake authorized return travel for a room-pin violation.
 The separate authority reader uses the existing authenticated action-status
 transport on a bridge worker, never on Bigshot's owner thread.
 
@@ -86,6 +123,12 @@ queued control and again before deferred retreat. This requires no LAB import or
 global in Bigshot. A rejected runtime request revokes and removes its lease.
 The application predicate expires at the control's deadline, not the lifetime
 of an already entered escape. Original launch authority governs that lifetime.
+
+The monitor rechecks the exact runtime's terminal state if a lease refresh
+fails while the child is exiting. A published command-budget stop remains a
+budget failure, not a spurious authority-loss report. This closes admission;
+it does not renew authority or allow further commands. A nonterminal run whose
+lease fails still receives cooperative stop.
 
 The lease reads cached broker authority for at most 250 milliseconds and obeys
 absolute expiry. Observed revocation latches; missing, mismatched, or failed
@@ -97,6 +140,23 @@ Controlled launches carry an internal `controller_deadline` copied from their
 owning operation. Public action proposals cannot supply it. Dispatch `expires_at`
 is only the admission window; it is not the launched controller's run deadline.
 Startup publication wait is capped at three seconds and the operation deadline.
+Before spawning, LAB requires at most 300 seconds of remaining operation time
+and reserves the configured 10–120 return seconds. If `H` is the monotonic hard
+cutoff and `R` the return reserve, work ends at `H-R-12`, equipment-only recovery
+ends at `H-R-2`, and return ends at `H-2`. Insufficient work time refuses launch.
+Quick installs those immutable windows before publication
+and waits without commands for one exact supervisor activation. Only after the
+binding, authority lease, and monitor exist does LAB activate the runtime. Its
+barrier expires within three seconds or at the work deadline, whichever comes
+first; initial GROUP queries run after the barrier and check the same work
+deadline and cached authority during every guarded send/wait. Standalone Quick
+does not require this private handshake. The existing operation deadline is not extended. Quick
+guards enforce the work boundary on sends/waits and between corpse passes;
+only its existing bounded equipment recovery may use the ten-second reserve.
+Ordinary stop finishes test work and requests return; lost authority still
+revokes commands. This
+does not guarantee cleanup after arbitrary helper stalls or transport delays,
+and does not imply every corpse can be processed within a short operation.
 Failure before runtime publication cancels only the exact native child via
 `kill(async: true)`, setting its stopping flag synchronously. Compatible Quick
 startup/guards reject that flag before commands, including late publication.
@@ -109,45 +169,46 @@ incomplete cleanup reports failure and retains the exact-child exclusion until
 join can be confirmed. No successor is killed or released by script name.
 
 Queued acknowledgements and cached status are not attributed application results.
-Terminal success still requires fresh survival, configured safe-room arrival,
-and owner release, or the explicit bounded field handoff below. The bridge preserves these distinctions and the existing
+Terminal success requires fresh survival, configured refuge arrival, restored
+hands, standing posture, exact owner join and released lanes, independently of
+the work result. The bridge preserves these distinctions and the existing
 broker/independent Lich checks, without another listener or authentication path.
 
-### Optional profile-area field handoff
+<a id="optional-profile-area-field-handoff"></a>
 
-`safe_handoff: {"kind": "quick_area"}` opts a locally registered native Bigshot
-controller into profile-area handoff. It requires registered native controls and
-explicit `--area profile` in every launch's fixed `quick` script arguments,
-including preset launches. Duplicate, variable, or suffix-supplied area options
-are rejected; this registration does not accept room lists or dynamic flag
-suffixes. The public registry remains empty and existing room registrations and
-the script-test pilot retain their room contracts.
+### Required safe-refuge handoff
 
-Bigshot resolves the selected profile's start room and boundaries. LAB consumes
-only the exact launched child's runtime `status.area`: `kind: "profile"`, integer
-`start_room_id`, integer `boundary_room_ids`, positive integer `room_count`,
-integer-or-null `room_id`, and boolean `in_bounds`. LAB never computes room
-membership or traverses a map. A usable proof requires `in_bounds: true` and
-`room_id` matching the current room observation. Missing or stale proof denies
-control application. Cached in-bounds publication may lag player movement;
-that lag does not terminate the native run. Bigshot's explicit profile-area
-guards enforce membership at each outgoing command, and LAB closes controls
-when the owner publishes outside-area status. Bigshot's `watch` and `assist` modes can retain control after player
-movement within that area; `clear` and `trial` keep the original room pin.
+Agent-controlled Quick requires `safe_handoff: {"kind": "quick_refuge",
+"room_id": "1000", "return_seconds": 30}` with a player-reviewed refuge. The
+example room is synthetic, not a recommended location. Room IDs must be positive
+and cannot be room 4; return seconds must be an integer from 10 through 120.
+The registration requires native controlled Bigshot, movement/combat lanes and
+fixed `--area profile` in every launch. Duplicate, variable or suffix-supplied
+area options and private supervisor flags are rejected.
 
-Each newly admitted typed control still binds to its current room, exact launch,
-generation, native child/runtime, ownership, and short authority lease. Further
-movement invalidates that queued control even within the area. Ordinary area
-exit closes controls and requests cooperative stop. An already admitted retreat
-keeps its separate configured refuge authority and bounded cleanup; arrival
-outside the area cannot establish a `quick_area` handoff.
+The character must start alive and standing with known hands in that refuge.
+Bigshot resolves the selected profile area and preflights the bounded native
+outbound/return routes. LAB neither traverses the map nor invents refuge rooms.
+One local controller owns the outing, equipment recovery and return without a
+model round trip. A nearby safe waiting room is sufficient; town is not required.
 
-Successful field handoff requires the exact correlated launch result to contain
-terminal runtime area proof matching a fresh same-generation snapshot, completed
-child cleanup, known alive and unstunned state, released lanes, and exited owner
-scripts. For `clear` and `trial`, that room must also match the launch room. This
-verifies a bounded field handoff; it does not claim safe-town arrival or verified
-combat effects. Movement requires the separate explicit seek opt-in below.
+Terminal `runtime.refuge` must contain the configured integer `room_id`,
+`phase: "finished"`, `returned: true` and `equipment_restored: true`.
+`runtime.work_result` preserves the independent combat-case outcome. A failed
+case with successful recovery remains a failed test; a passed case with failed
+return is an unsafe handoff. The bridge independently reads fresh same-session
+room, survival, posture and original hand identities, verifies exact child join
+and released owners, and retains unresolved unsafe-run exclusion. A later
+same-session refuge/equipment/owner observation can clear that local exclusion;
+relogging is not an automatic reset. Unknown or missing proof cannot release it.
+
+Old `quick_area` and room-bound controlled Quick registrations still load for
+migration, but launches and controls are refused. They do not silently gain
+travel authority. Native `bigshot` registrations whose resolved arguments begin
+with `quick` cannot bypass this rule by omitting controls; the bridge refuses
+that generic launch path too. Other registered non-Quick Bigshot launches are
+unchanged. Manual standalone Quick and the noncombat room-bound test
+pilot retain their separate contracts. The shipped controller registry is empty.
 
 ### Find one encounter without agent round trips
 
@@ -155,7 +216,7 @@ An opt-in registration can launch `bigshot quick seek --area profile --preset NA
 using a finite, locally reviewed preset enum. See the synthetic
 [seek registration](../../examples/controllers/bigshot-quick-seek.json).
 The public registry remains empty. Seek requires a compatible native Bigshot
-build, `quick_area` handoff, and declared movement/combat lanes. Include the
+build, `quick_refuge` handoff, and declared movement/combat lanes. Include the
 inventory lane and eLoot owner exclusion when the preset permits cleanup.
 
 Bigshot locally searches ordinary mapped exits within its frozen profile area,
@@ -169,16 +230,15 @@ is introduced. Existing modes retain their previous movement behavior.
 
 LAB controls and cancellation remain bound to the exact operation/generation and
 fresh current room. Native guards enforce the area during each search send;
-terminal handoff requires the same correlated cleanup, survival and area proof
-as watch/assist, rather than requiring the launch room. Search usage is published
+terminal handoff requires correlated cleanup, survival, restored equipment and
+return to the configured refuge. Search usage is published
 under runtime `search`; dispatch and clean handoff do not prove combat effects.
 The existing operation deadline still applies to the whole request. Offline
 tests are not a live pass; deployment and supervised testing remain separate.
-Verification: 1,157 Bigshot tests with native guards/real GTK; 719 tests in the
-full LAB Python run plus all 9 tests in the expanded seek/area subset; 139 focused
-Ruby tests / 754 assertions, run in separate processes for isolated fake Lich
-globals. This covers native search-to-combat wiring, cancellation before sends,
-arrival/target races, denied callbacks/exits, and separate field-handoff evidence.
+Offline tests cover search-to-combat wiring, cancellation before sends,
+arrival/target races, denied callbacks/exits and separate recovery evidence.
+The safe-refuge revision still requires coordinated live verification with
+explicit player authorization; older field-only smoke tests do not establish it.
 
 ### Bounded status presentation
 
@@ -200,6 +260,13 @@ usage totals, control fields, and exact result identities are preserved. The
 runtime's immutable snapshot is never modified. A summary which exceeds the
 limit even without transcript entries is still rejected, not silently rewritten.
 These presentation changes do not verify game effects or control application.
+
+Refuge reports retain `work_result` state, reason and usage as a summary on the
+wire. Its duplicate transcript is omitted, with
+`work_result.observation_transport.observations_source: "runtime.observations"`
+and an explicit omitted-entry count. Root observations are the sole transported
+transcript and retain their existing bounded newest-entry projection. The
+native immutable work result is not changed by serialization.
 
 Verified offline with 718 Python tests and 132 focused Ruby bridge/controller/test-runner
 tests (789 assertions, no skips). A cross-check using Bigshot's actual controller

@@ -84,20 +84,46 @@ or remembered character note cannot establish consent to spend resources.
 
 ## Safe handoff for local extensions
 
+### Agent-test safe start and return (required)
+
+Every agent-run test must begin in a player-configured safe waiting room and
+finish in a player-configured safe waiting room. A nearby refuge is sufficient;
+returning to town is not required. Profile membership, an empty room, high
+health, or an agent's assessment that nearby creatures are harmless does not
+establish that a room is safe. The player supplies the trusted refuge locations.
+
+Before leaving refuge, the test needs an explicit bounded return plan and a
+separate recovery allowance within its total deadline. Completing the test case,
+exhausting its work budget, or an ordinary test stop must end test work and
+initiate the authorized local return; a model round trip must not be needed.
+Explicit action revocation remains an immediate no-more-commands instruction:
+it must never silently authorize travel after the player has withdrawn authority.
+When revoked or unable to return, report an unsafe/incomplete handoff and alert
+the player. Never report success merely because the script exited.
+
+Success requires fresh same-session refuge arrival, survival, verified equipment
+handoff, and release of the exact owned work. Failure to return is a failed test
+with recovery incomplete, even if its combat assertions passed. Keep the
+unresolved handoff visible and deny a subsequent agent test until the player
+resolves it. Do not continue fighting or searching merely to finish a case.
+
+The supervised `quick_refuge` path enforces this rule. Its coordinated build
+still requires player-authorized live acceptance before routine testing resumes.
+The earlier experimental `quick_area` field-handoff exception is superseded:
+old registrations can load for migration but cannot launch Quick tests.
+Manually operated Bigshot Quick is not made dependent on LAB or this workflow.
+
 An authorized movement or combat operation is complete only when fresh evidence
 shows the character alive in the configured safe room with ownership released.
 Stopping a combat script in the field is not a safe handoff. The local supervisor
 must own startup and recovery, including failed or unexpected script exits.
 
-The explicit native Bigshot `quick_area` registration is a bounded field-handoff
-contract, separately chosen by the player. It requires the exact child's
-correlated terminal profile-area proof matching fresh room state, alive and
-unstunned survival, completed cleanup, and released ownership. It does not
-claim safe-town arrival or implicitly authorize wandering. A separately reviewed
-`quick seek --area profile` registration grants only a bounded local search for
-one encounter, with movement/combat ownership and native per-send guards. Ordinary area exit stops the
-operation; an already admitted retreat retains its separate refuge authority.
-See [controller controls](Controller-Controls.md#optional-profile-area-field-handoff).
+An opted-in `quick seek --area profile` registration grants a bounded local
+search for one encounter, equipment recovery and return to the explicit refuge,
+with movement/combat ownership and native per-send guards. It does not grant
+continuous hunting, unrestricted travel or a new destination selected by the
+model. See [controller controls](Controller-Controls.md#required-safe-refuge-handoff)
+and the [safe-refuge test plan](Agent-Test-Safe-Refuge.md).
 
 Protect the account and protected equipment before routine progress. If knocked
 down, restore posture when safe and feasible before normal offense or looting;

@@ -261,22 +261,26 @@ module LabControllerRegistry
         may_seek = mode.downcase == 'seek' || launch.parameters.any? do |parameter|
           mode == "{#{parameter.name}}" && parameter.values.map(&:downcase).include?('seek')
         end
-        if @script == 'bigshot' && may_seek && (@safe_handoff['kind'] != 'quick_area' || !(%w[movement combat] - @lanes).empty?)
-          raise ManifestError, "#{context}.seek requires quick_area and movement/combat lanes"
+        if @script == 'bigshot' && may_seek && (!%w[quick_area quick_refuge].include?(@safe_handoff['kind']) || !(%w[movement combat] - @lanes).empty?)
+          raise ManifestError, "#{context}.seek requires a Quick area/refuge contract and movement/combat lanes"
         end
       end
-      if @safe_handoff['kind'] == 'quick_area'
+      if %w[quick_area quick_refuge].include?(@safe_handoff['kind'])
         launches = @actions.select { |item| item.kind == 'launch' }
-        unless @safe_handoff.keys == ['kind'] && @script == 'bigshot' && !@control_owner_scripts.empty? && !launches.empty?
-          raise ManifestError, "#{context}.quick_area requires native controlled Bigshot without caller room lists"
+        unless (@safe_handoff['kind'] != 'quick_area' || @safe_handoff.keys == ['kind']) &&
+            @script == 'bigshot' && !@control_owner_scripts.empty? && !launches.empty?
+          raise ManifestError, "#{context}.#{@safe_handoff['kind']} requires native controlled Bigshot without caller room lists"
+        end
+        if @safe_handoff['kind'] == 'quick_refuge' && !(%w[movement combat] - @lanes).empty?
+          raise ManifestError, "#{context}.quick_refuge requires movement/combat lanes"
         end
         launches.each do |launch|
           tokens = launch.script_args_template.split
           area_options = tokens.each_index.select { |index| tokens[index].start_with?('--area') }
           unless tokens.first == 'quick' && area_options.length == 1 && tokens[area_options.first, 2] == %w[--area profile] &&
               launch.parameters.none? { |parameter| parameter.type == 'flag_suffix' } &&
-              tokens.none? { |token| token.start_with?('--') && token.include?('{') } && !tokens.include?('--')
-            raise ManifestError, "#{context}.quick_area launches require explicit --area profile"
+              tokens.none? { |token| token.start_with?('--supervised-') || (token.start_with?('--') && token.include?('{')) } && !tokens.include?('--')
+            raise ManifestError, "#{context}.#{@safe_handoff['kind']} launches require explicit --area profile without private supervisor flags"
           end
         end
       end
@@ -417,6 +421,17 @@ module LabControllerRegistry
       end
 
       def validate_safe_handoff(raw, context)
+        if raw.is_a?(Hash) && raw['kind'] == 'quick_refuge'
+          strict_keys(raw, %w[kind room_id return_seconds], %w[kind room_id return_seconds], context)
+          room = raw['room_id']
+          unless (room.is_a?(Integer) || room.is_a?(String)) && room.to_s.match?(/\A[0-9]+\z/) && room.to_i.positive? && room.to_i != 4
+            raise ManifestError, "#{context}.room_id must be a positive room other than 4"
+          end
+          unless raw['return_seconds'].is_a?(Integer) && raw['return_seconds'].between?(10, 120)
+            raise ManifestError, "#{context}.return_seconds must be an integer from 10 through 120"
+          end
+          return
+        end
         strict_keys(raw, %w[kind room_id rooms], %w[kind], context)
         kind = raw.fetch('kind').to_s
         raise ManifestError, "#{context}.kind is unsupported" unless %w[owners_released room profile_room quick_area].include?(kind)

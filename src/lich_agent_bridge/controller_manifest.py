@@ -367,7 +367,7 @@ class ControllerDefinition:
 
     def safe_room(self, arguments: Mapping[str, object]) -> str | None:
         kind = self.safe_handoff["kind"]
-        if kind == "room":
+        if kind in {"room", "quick_refuge"}:
             return str(self.safe_handoff["room_id"])
         if kind == "profile_room":
             profile = str(arguments.get("profile", ""))
@@ -489,12 +489,23 @@ def _controller_from_mapping(raw: Any, label: str) -> ControllerDefinition:
     safe = _strict(
         value["safe_handoff"],
         label=f"{label}.safe_handoff",
-        allowed={"kind", "room_id", "rooms"},
+        allowed={"kind", "room_id", "rooms", "return_seconds"},
         required={"kind"},
     )
     kind = str(safe["kind"])
-    if kind not in {"owners_released", "room", "profile_room", "quick_area"}:
+    if kind not in {"owners_released", "room", "profile_room", "quick_area", "quick_refuge"}:
         raise ConfigurationError(f"{label}.safe_handoff.kind is unsupported")
+    if "return_seconds" in safe and kind != "quick_refuge":
+        raise ConfigurationError(f"{label}.return_seconds requires quick_refuge")
+    if kind == "quick_refuge":
+        room = safe.get("room_id")
+        seconds = safe.get("return_seconds")
+        if (set(safe) != {"kind", "room_id", "return_seconds"}
+                or isinstance(room, bool) or not re.fullmatch(r"[1-9][0-9]*", str(room))
+                or str(room) == "4" or len(str(room)) > 12
+                or type(seconds) is not int or not 10 <= seconds <= 120
+                or not {"movement", "combat"}.issubset(lanes)):
+            raise ConfigurationError(f"{label}.quick_refuge requires an exact refuge and 10–120 return seconds")
     if kind == "room" and not str(safe.get("room_id", "")).isdigit():
         raise ConfigurationError(f"{label}.safe_handoff.room_id must be numeric")
     if kind == "profile_room":
@@ -533,13 +544,13 @@ def _controller_from_mapping(raw: Any, label: str) -> ControllerDefinition:
             mode == "{" + parameter.name + "}" and "seek" in {v.casefold() for v in parameter.values}
             for parameter in launch.parameters)
         if script == "bigshot" and may_seek and (
-                kind != "quick_area" or not {"movement", "combat"}.issubset(lanes)):
-            raise ConfigurationError(f"{label}.seek requires quick_area and movement/combat lanes")
-    if kind == "quick_area":
+                kind not in {"quick_area", "quick_refuge"} or not {"movement", "combat"}.issubset(lanes)):
+            raise ConfigurationError(f"{label}.seek requires quick_area/quick_refuge and movement/combat lanes")
+    if kind in {"quick_area", "quick_refuge"}:
         launches = [item for item in actions if item.kind == "launch"]
-        if (set(safe) != {"kind"} or script != "bigshot" or not control_owners
+        if ((kind == "quick_area" and set(safe) != {"kind"}) or script != "bigshot" or not control_owners
                 or not launches):
-            raise ConfigurationError(f"{label}.quick_area requires native controlled Bigshot without caller room lists")
+            raise ConfigurationError(f"{label}.{kind} requires native controlled Bigshot without caller room lists")
         for launch in launches:
             tokens = launch.script_args_template.split()
             area_options = [index for index, token in enumerate(tokens) if token.startswith("--area")]
@@ -548,7 +559,7 @@ def _controller_from_mapping(raw: Any, label: str) -> ControllerDefinition:
                     or any(parameter.type == "flag_suffix" for parameter in launch.parameters)
                     or any(token.startswith("--") and "{" in token for token in tokens)
                     or "--" in tokens):
-                raise ConfigurationError(f"{label}.quick_area launches require explicit --area profile")
+                raise ConfigurationError(f"{label}.{kind} launches require explicit --area profile")
     if any(item.kind == "signal" for item in actions) and signal_global is None:
         raise ConfigurationError(f"{label}.signal_global is required")
     controller = ControllerDefinition(

@@ -2,7 +2,7 @@
 
 Authorized 2026-09-06. Status: ranking and archive-neutral corrections deployed;
 maintainer accepted the current release on 2026-09-07. Remaining passage-selection
-quality is deferred to [issue #7](https://github.com/therealatari/lich-agent-bridge/issues/7).
+quality is deferred to [issue #7](https://github.com/elanthia-online/lich-agent-bridge/issues/7).
 See the research workspace plan for the release decision and historical results.
 
 ## Outcome and scope

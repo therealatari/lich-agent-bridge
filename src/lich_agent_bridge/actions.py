@@ -419,6 +419,12 @@ class CommandPolicy:
         return (matched is not None and matched.action.kind == "launch"
                 and bool(matched.controller.control_owner_scripts))
 
+    def is_refuge_launch(self, command: str) -> bool:
+        matched = self._controller_manifest.match_command(command)
+        return (matched is not None and matched.action.kind == "launch"
+                and bool(matched.controller.control_owner_scripts)
+                and matched.controller.safe_handoff["kind"] == "quick_refuge")
+
     def evaluate(self, command: str) -> tuple[str, PolicyDecision]:
         if any(character in command for character in ("\r", "\n", ";", "|", "&")):
             raise ValidationError("command chaining or control characters are forbidden")
@@ -483,6 +489,7 @@ class _Action:
     controller_control: bool = False
     controller_deadline: float | None = None
     stop_requested: bool = False
+    return_requested: bool = False
 
     def public(self, *, instruction: str) -> dict[str, Any]:
         result = {
@@ -505,6 +512,7 @@ class _Action:
             result["detail"] = self.detail
         if self.controller_deadline is not None:
             result["controller_deadline"] = self.controller_deadline
+            result["return_requested"] = self.return_requested
         if self.test_run or self.controller_control or self.controller_deadline is not None:
             result["stop_requested"] = self.stop_requested
         return result
@@ -928,6 +936,26 @@ class ActionBroker:
             self._audit({"event": "controller_control_revoked", "action_id": action.action_id,
                          "character": action.character, "generation": action.generation,
                          "status": action.status})
+            self._changed.notify_all()
+            return action.public(instruction=action.status)
+
+    def request_controller_return(self, action_id: str, *, character: str, generation: str) -> dict[str, Any]:
+        """End exact refuge test work without revoking its already approved return."""
+        with self._lock:
+            action = self._find_locked(_action_id(action_id))
+            if (action.character.casefold() != _character(character).casefold()
+                    or action.generation != _generation(generation) or action.controller_deadline is None
+                    or len(action.commands) != 1 or not self._policy.is_refuge_launch(action.commands[0])):
+                raise ValidationError("return request requires this character's exact refuge launch")
+            self._expire_locked()
+            self._require_active_generation_locked(action.character, action.generation)
+            if (action.stop_requested or action.status not in {"dispatched", "completed"}
+                    or action.character.casefold() not in self._enabled
+                    or self._clock() >= action.controller_deadline):
+                raise ValidationError("refuge launch is no longer authorized")
+            action.return_requested = True
+            self._audit({"event": "controller_return_requested", "action_id": action.action_id,
+                         "character": action.character, "generation": action.generation})
             self._changed.notify_all()
             return action.public(instruction=action.status)
 

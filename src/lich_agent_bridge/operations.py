@@ -330,6 +330,10 @@ class CapabilityRunner:
         self._recon_actions: dict[str, tuple[str, str]] = {}
         self._test_actions: dict[str, tuple[str, str]] = {}
         self._controller_actions: dict[str, tuple[str, str]] = {}
+        self._graceful_stops: set[str] = set()
+        # Survives terminal history eviction: an unsafe outing is not permission
+        # to start another. The native bridge independently retains its owner.
+        self._refuge_pending: dict[str, tuple[str, ControllerDefinition, SessionState]] = {}
         self._controller_controls: dict[str, set[str]] = {}
         self._cursor = 0
         self._lock = threading.RLock()
@@ -515,6 +519,7 @@ class CapabilityRunner:
                     raise ValidationError("operation history is full of active work")
                 self._operations.pop(evicted_id)
                 self._interruptions.discard(evicted_id)
+                self._graceful_stops.discard(evicted_id)
             self._operations[operation.operation_id] = operation
             self._emit_locked(operation, "requested", "operation requested")
         return operation
@@ -528,6 +533,11 @@ class CapabilityRunner:
                     "failed", f"unsupported capability: {operation.capability}"
                 )
             handler = getattr(self, definition.handler_name)
+            # Recon already caps its own deadline at 20 seconds; preserve that
+            # existing clamping contract rather than changing its outcome.
+            if (operation.deadline - operation.requested_at > 30 and operation.capability != "character.recon"
+                    and self._refuge_controller(operation) is None):
+                raise _OperationAbort("failed", "only refuge outings can extend the existing 30-second operation envelope")
             explanation = handler(operation)
             operation.explanation = explanation
             # Resolve the final stop/success race while the same lock still
@@ -537,6 +547,8 @@ class CapabilityRunner:
                     self._check_test_stop(operation)
                 elif operation.operation_id in self._controller_actions:
                     self._check_deadline_and_interruption(operation)
+                    if operation.operation_id in self._graceful_stops:
+                        raise _OperationAbort("interrupted", "test stopped; return to refuge and equipment recovery verified")
                 self._finish(operation, "succeeded", operation.explanation)
             return operation
         except _OperationAbort as error:
@@ -616,6 +628,24 @@ class CapabilityRunner:
     def interrupt(self, operation_id: str) -> None:
         operation = self.get(operation_id)
         with self._lock:
+            if operation.status in TERMINAL_OPERATION_STATES:
+                return
+            owned = self._controller_actions.get(operation_id)
+            if owned is not None and self._refuge_controller(operation) is not None:
+                launch = self._actions.get(owned[0])
+                if launch["status"] in {"dispatched", "completed"}:
+                    try:
+                        self._actions.request_controller_return(owned[0], character=operation.character,
+                                                                generation=owned[1])
+                    except ValidationError:
+                        # Hard revocation, replacement session or expiry cannot
+                        # be revived to perform even a return movement.
+                        pass
+                    else:
+                        self._graceful_stops.add(operation_id)
+                        self._cancel_controller_controls(operation, revoke_run=False)
+                        self._emit_locked(operation, operation.status, "stop requested; bounded local return to refuge pending")
+                        return
             if operation.status not in TERMINAL_OPERATION_STATES:
                 self._interruptions.add(operation_id)
         self._cancel_recon_action(operation)
@@ -641,7 +671,9 @@ class CapabilityRunner:
                     or owned is None or expected_generation != owned[1]):
                 raise ValidationError("control does not match an active controller operation")
             if (operation.status in TERMINAL_OPERATION_STATES
-                    or operation_id in self._interruptions or self._clock() >= operation.deadline):
+                    or operation_id in self._interruptions
+                    or (operation_id in self._graceful_stops and control != "status")
+                    or self._clock() >= operation.deadline):
                 raise ValidationError("controller operation is no longer accepting controls")
             controller = self._controller_manifest.controller(operation.capability.removeprefix("controller."))
             action = controller.action(control)
@@ -931,6 +963,18 @@ class CapabilityRunner:
         action = controller.action(controller.capability_action)
         command, _script_args, normalized = action.build(operation.arguments)
         operation.arguments = normalized
+        refuge = controller.safe_handoff["kind"] == "quick_refuge"
+        quick_launch = controller.script == "bigshot" and (
+            bool(controller.control_owner_scripts) or _script_args.casefold().split()[:1] == ["quick"])
+        if controller.safe_handoff["kind"] == "quick_area" or (quick_launch and not refuge):
+            raise _OperationAbort("failed", "controlled Quick tests require quick_refuge; migrate the field-only handoff")
+        if refuge:
+            if operation.expected_generation is None:
+                raise _OperationAbort("failed", "refuge tests require expected_generation at admission")
+            if operation.deadline - operation.requested_at > 300:
+                raise _OperationAbort("failed", "refuge tests are limited to 300 seconds including recovery and return")
+            if operation.deadline - self._clock() <= controller.safe_handoff["return_seconds"] + 12:
+                raise _OperationAbort("failed", "insufficient time for work, equipment recovery and reserved return")
         if controller.test_suite is not None and operation.expected_generation is None:
             raise _OperationAbort("failed", "test runs require expected_generation at admission")
         if controller.test_suite is not None and operation.deadline - operation.requested_at > 30:
@@ -938,6 +982,7 @@ class CapabilityRunner:
 
         start = self._require_fresh_session(operation)
         operation.start_state = start
+        self._resolve_prior_refuge(operation, start)
         self._validate_controller_start(start, controller)
         if controller.test_suite is not None:
             self._validate_test_state(start, controller)
@@ -959,6 +1004,8 @@ class CapabilityRunner:
             minimum_sequence=start.sequence,
         )
         self._validate_controller_start(current, controller)
+        if refuge and self._hand_ids(current) != self._hand_ids(start):
+            raise _OperationAbort("failed", "equipment changed before refuge launch")
         if controller.test_suite is not None:
             self._validate_test_state(current, controller)
         broker_error = None
@@ -970,10 +1017,10 @@ class CapabilityRunner:
                 f"starting registered {controller.name} controller",
             )
         except _OperationAbort as error:
-            if controller.test_suite is None:
+            if controller.test_suite is None and not refuge:
                 raise
             with self._lock:
-                owned = self._test_actions.get(operation.operation_id)
+                owned = (self._controller_actions if refuge else self._test_actions).get(operation.operation_id)
             if owned is None:
                 raise
             broker_result = self._actions.get(owned[0])
@@ -984,7 +1031,7 @@ class CapabilityRunner:
             broker_error = error
         action_id = str(broker_result.get("action_id", ""))
         remaining = operation.deadline - self._clock()
-        if remaining <= 0 and controller.test_suite is None:
+        if remaining <= 0 and controller.test_suite is None and not refuge:
             raise _OperationAbort(
                 "timed_out", "operation timed out waiting for controller result"
             )
@@ -1006,6 +1053,8 @@ class CapabilityRunner:
             if broker_error is not None:
                 raise broker_error
             return explanation
+        if refuge:
+            return self._complete_refuge_controller(operation, controller, evidence, action_id, current, broker_error)
         self._verify_controller_evidence(
             evidence,
             controller=controller,
@@ -1032,6 +1081,65 @@ class CapabilityRunner:
             f"{controller.name} controller reported {evidence.facts['code']} and "
             "safe owner release was verified"
         )
+
+    def _refuge_controller(self, operation):
+        if not operation.capability.startswith("controller."):
+            return None
+        controller = self._controller_manifest.controller(operation.capability.removeprefix("controller."))
+        return controller if controller.safe_handoff["kind"] == "quick_refuge" else None
+
+    @staticmethod
+    def _hand_ids(snapshot):
+        hands = snapshot.hands
+        if hands is None or "left" not in hands or "right" not in hands:
+            raise _OperationAbort("failed", "refuge tests require both hand identities to be known")
+        result = []
+        for hand in ("left", "right"):
+            item = hands[hand]
+            if item is not None and (not isinstance(item, HandItem) or not item.object_id):
+                raise _OperationAbort("failed", "refuge tests require exact held-item identities")
+            result.append(None if item is None else item.object_id)
+        return tuple(result)
+
+    def _resolve_prior_refuge(self, operation, snapshot):
+        with self._lock:
+            pending = self._refuge_pending.get(operation.character.casefold())
+            if pending is None:
+                return
+            _, controller, original = pending
+            if snapshot.generation != original.generation:
+                raise _OperationAbort("failed", "unresolved refuge handoff belongs to a previous session; operator resolution required")
+            self._validate_controller_start(snapshot, controller)
+            if (snapshot.sequence is None or original.sequence is None or snapshot.sequence <= original.sequence
+                    or self._hand_ids(snapshot) != self._hand_ids(original)):
+                raise _OperationAbort("failed", "previous refuge handoff still needs fresh equipment and owner resolution")
+            self._refuge_pending.pop(operation.character.casefold())
+
+    def _complete_refuge_controller(self, operation, controller, evidence, action_id, before, broker_error):
+        self._verify_controller_evidence(evidence, controller=controller, generation=before.generation,
+                                         action_id=action_id, require_success=False)
+        operation.evidence.append(evidence)
+        end = self._require_fresh_session(operation, expected_generation=before.generation,
+                                          after_sequence=before.sequence)
+        operation.end_state = end
+        self._verify_controller_handoff(end, controller, operation.arguments, evidence=evidence)
+        if self._hand_ids(end) != self._hand_ids(before):
+            raise _OperationAbort("failed", "refuge reached but original hand equipment was not restored")
+        with self._lock:
+            pending = self._refuge_pending.get(operation.character.casefold())
+            if pending is not None and pending[0] == operation.operation_id:
+                self._refuge_pending.pop(operation.character.casefold())
+            stopped = operation.operation_id in self._graceful_stops
+        self._progress(operation, "return to refuge, exact equipment and owner release verified")
+        if stopped:
+            raise _OperationAbort("interrupted", "test stopped; return to refuge and equipment recovery verified")
+        if broker_error is not None:
+            raise broker_error
+        runtime = evidence.facts["details"]["runtime"]
+        if (evidence.facts["ok"] is not True or runtime["state"] != "completed"
+                or runtime["work_result"].get("state") != "completed"):
+            raise _OperationAbort("failed", f"test work failed; safe return verified: {evidence.facts['code']}")
+        return "Quick test completed; return to refuge, original equipment and owner release verified"
 
     def _complete_test_controller(self, operation, controller, evidence, action_id, before):
         # Retain attributed terminal reports even when assertions, cleanup, or
@@ -1094,6 +1202,13 @@ class CapabilityRunner:
                 raise _OperationAbort(
                     "failed", f"ownership conflict in {lane}: {owner}"
                 )
+        if controller.safe_handoff["kind"] == "quick_refuge":
+            if snapshot.room_id != controller.safe_room({}):
+                raise _OperationAbort("failed", "refuge test must begin in the registered safe room")
+            CapabilityRunner._hand_ids(snapshot)
+            if snapshot.scripts is None or set(name.casefold() for name in snapshot.scripts).intersection(
+                    name.casefold() for name in controller.owner_scripts):
+                raise _OperationAbort("failed", "refuge test requires known, exited controller owner scripts")
 
     @staticmethod
     def _verify_controller_evidence(
@@ -1152,6 +1267,20 @@ class CapabilityRunner:
                 "failed",
                 f"controller did not return to safe room {safe_room}",
             )
+        if controller.safe_handoff["kind"] == "quick_refuge":
+            CapabilityRunner._validate_controller_start(snapshot, controller)
+            details = evidence.facts.get("details", {}) if evidence is not None else {}
+            runtime = details.get("runtime")
+            refuge = runtime.get("refuge") if isinstance(runtime, Mapping) else None
+            if (evidence is None or details.get("run_id") != evidence.action_id
+                    or details.get("cleanup_complete") is not True
+                    or not isinstance(runtime, Mapping) or runtime.get("state") not in {"completed", "stopped"}
+                    or not isinstance(runtime.get("work_result"), Mapping)
+                    or not isinstance(refuge, Mapping) or type(refuge.get("room_id")) is not int
+                    or str(refuge["room_id"]) != safe_room
+                    or refuge.get("phase") != "finished"
+                    or refuge.get("returned") is not True or refuge.get("equipment_restored") is not True):
+                raise _OperationAbort("failed", "refuge handoff lacks matching terminal return and equipment proof")
         if controller.safe_handoff["kind"] == "quick_area":
             if snapshot.dead is not False or snapshot.stunned is not False:
                 raise _OperationAbort("failed", "bounded field handoff requires alive and unstunned state")
@@ -1576,6 +1705,9 @@ class CapabilityRunner:
                 and operation.capability == f"controller.{controller_match.controller.name}"):
             with self._lock:
                 self._controller_actions.setdefault(operation.operation_id, (str(action["action_id"]), snapshot.generation))
+                if controller_match.controller.safe_handoff["kind"] == "quick_refuge":
+                    self._refuge_pending[operation.character.casefold()] = (
+                        operation.operation_id, controller_match.controller, snapshot)
                 if operation.operation_id in self._interruptions or self._clock() >= operation.deadline:
                     self._actions.revoke_controller_run(str(action["action_id"]), character=operation.character,
                                                         generation=snapshot.generation)
@@ -1805,6 +1937,10 @@ class CapabilityRunner:
             self._emit_locked(operation, operation.status, detail)
 
     def _finish(self, operation: OperationRecord, status: str, detail: str) -> None:
+        with self._lock:
+            pending = self._refuge_pending.get(operation.character.casefold())
+            if pending is not None and pending[0] == operation.operation_id:
+                self._raise_alert(operation, "UNSAFE HANDOFF: refuge, equipment and owner release unverified; operator assistance required before another test")
         operation.ended_at = self._clock()
         self._transition(operation, status, detail)
         with self._lock:

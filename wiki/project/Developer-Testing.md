@@ -39,9 +39,12 @@ outcomes. Do not add retries that might repeat a non-idempotent game action.
    events, and read a fresh snapshot for handoff. A watch timeout means no event
    arrived in that interval, not that a command succeeded. After movement/combat,
    handoff requires the authorized safe room, survival, and released ownership.
-   A separately registered native `quick_area` operation instead requires the
-   exact terminal profile-area proof and fresh alive/unstunned, released-owner
-   field handoff described in [controller controls](Controller-Controls.md#optional-profile-area-field-handoff).
+   Agent tests must start and finish in player-configured safe waiting rooms;
+   a nearby refuge is sufficient. The earlier experimental `quick_area` field
+   proof does not satisfy this requirement. The local
+   [safe-refuge implementation](Agent-Test-Safe-Refuge.md) still requires
+   coordinated deployment and an explicitly authorized acceptance test before
+   routine live testing resumes.
 
 MCP tools and their exact types are documented in the generated
 [SDK declarations](../../mcp/src/sdk-types.generated.ts). For example, after

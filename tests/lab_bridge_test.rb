@@ -31,7 +31,7 @@ module XMLData
   def self.encumbrance_value = 0
   def self.roundtime_end = 0
   def self.server_time_offset = 0
-  def self.indicator = { 'IconSTUNNED' => 'n', 'IconDEAD' => 'n' }
+  def self.indicator = { 'IconSTUNNED' => 'n', 'IconDEAD' => 'n', 'IconSTANDING' => 'y' }
   def self.injuries = { 'chest' => { 'wound' => 1, 'scar' => 0 } }
 end
 
@@ -331,7 +331,21 @@ class LabBridgeTest < Minitest::Test
       @child, @requests, @auto_stop = child, [], true
       @current_status = { mode: 'trial', state: :running, reason: nil }
     end
-    def status = @current_status.dup.freeze
+    def status
+      terminal = %w[completed stopped].include?(@current_status[:state].to_s)
+      { refuge: { room_id: 1000, phase: terminal ? 'finished' : 'working', returned: terminal,
+                  equipment_restored: terminal }, work_result: terminal ? @current_status.dup : nil }.merge(@current_status).freeze
+    end
+    attr_reader :execution_window
+    def activate_supervised(valid:)
+      return false if @activated || !@execution_window || valid.call != true
+      @activated = true
+    end
+    def bind_execution_window(**window)
+      return false if @execution_window
+      @execution_window = window
+      true
+    end
     def request(action, valid: nil)
       @requests << [action, valid, Thread.current]
       if action == 'stop' && !valid && @auto_stop
@@ -414,7 +428,29 @@ class LabBridgeTest < Minitest::Test
     end
   end
 
-  def with_controlled_quick(inventory: false, area: false)
+  def test_refuge_work_result_preserves_summary_without_duplicating_oversized_transcript
+    source = synthetic_large_quick_status
+    source[:work_result] = JSON.parse(JSON.generate(source), symbolize_names: true)
+    source[:refuge] = { room_id: 1000, phase: 'finished', returned: true, equipment_restored: true }
+    original = JSON.generate(source)
+    compact = LichAgentBridge.quick_status_payload(source)
+    assert_equal original, JSON.generate(source)
+    assert_equal 'completed', compact[:work_result][:state]
+    assert_equal 'sequence_dispatched', compact[:work_result][:reason]
+    assert_equal 110, compact[:work_result][:observations_total]
+    refute compact[:work_result].key?(:observations)
+    assert_equal 'runtime.observations', compact[:work_result][:observation_transport][:observations_source]
+    assert_equal 100, compact[:work_result][:observation_transport][:omitted_entries]
+    assert_operator JSON.generate(compact).bytesize, :<=, 32_768
+    payload = { character: 'Testmage', generation: 'synthetic-generation', observed_at: '2026-09-09T00:00:00Z',
+                kind: 'controller_result', summary: 'Synthetic refuge result', data: { details: { runtime: compact } } }
+    root = File.expand_path('..', __dir__)
+    output, error, result = Open3.capture3({ 'PYTHONPATH' => File.join(root, 'src') }, 'python3', '-c',
+      'import json,sys; from lich_agent_bridge.protocol import MeaningfulEvent; MeaningfulEvent.from_mapping(json.load(sys.stdin)); print("validated")', stdin_data: JSON.generate(payload))
+    assert result.success?, "Actual event validator rejected refuge result: #{output} #{error}"
+  end
+
+  def with_controlled_quick(inventory: false, area: false, legacy: nil, uncontrolled: false, script_args: nil)
     originals = {}
     replace = lambda do |object, name, &implementation|
       originals[[object, name]] = object.respond_to?(name) ? object.method(name) : nil
@@ -422,11 +458,15 @@ class LabBridgeTest < Minitest::Test
     end
     raw = JSON.parse(File.read(File.expand_path('fixtures/controller-controls.json', __dir__)))
     raw['controllers'].first['lanes'] << 'inventory' if inventory
-    if area
-      raw['controllers'].first['script'] = 'bigshot'
-      raw['controllers'].first['safe_handoff'] = { 'kind' => 'quick_area' }
-      raw['controllers'].first['control_owner_scripts'] = ['bigshot']
-      raw['controllers'].first['actions'].first['script_args_template'] = 'quick watch --area profile'
+    raw['controllers'].first['script'] = 'bigshot'
+    raw['controllers'].first['safe_handoff'] = { 'kind' => 'quick_refuge', 'room_id' => 1000, 'return_seconds' => 10 }
+    raw['controllers'].first['control_owner_scripts'] = ['bigshot']
+    raw['controllers'].first['actions'].first['script_args_template'] = "quick #{area ? 'watch' : 'trial'} --area profile"
+    raw['controllers'].first['safe_handoff'] = legacy if legacy
+    raw['controllers'].first['actions'].first['script_args_template'] = script_args if script_args
+    if uncontrolled
+      raw['controllers'].first.delete('control_owner_scripts')
+      raw['controllers'].first['actions'].reject! { |action| action['kind'] == 'control' }
     end
     controllers = raw['controllers'].each_with_index.map { |item, index| LabControllerRegistry::Controller.new(item, "controllers[#{index}]") }
     registry = LabControllerRegistry::Registry.new(controllers, 'synthetic-controlled-fixture')
@@ -438,20 +478,28 @@ class LabBridgeTest < Minitest::Test
     LichAgentBridge.send(:remove_const, :SAFE_ACTIONS)
     LichAgentBridge.const_set(:SAFE_ACTIONS, (old_patterns + registry.safe_patterns).freeze)
     LichAgentBridge.instance_variable_set(:@controlled_runs, {})
-    child = SyntheticQuickChild.new(area ? 'bigshot' : 'lab-test-quick')
+    child = SyntheticQuickChild.new('bigshot')
     runtime = SyntheticQuickRuntime.new(child)
     runtime.current_status = { mode: 'watch', state: :running, area: synthetic_quick_area } if area
     child.quick_combat_runtime = runtime
     action = { action_id: '0123456789abcdef', character: 'Testmage', generation: old_generation,
                command: 'lab-test-quick start', expected_room_id: '1000', expires_at: Time.now.to_f + 1,
-               controller_deadline: Time.now.to_f + 10 }
-    fixture = { child: child, runtime: runtime, action: action, http: [], results: [], starts: [], start_delay: 0, room: '1000' }
-    fixture[:authority] = { action[:action_id] => action.merge(status: 'dispatched', stop_requested: false) }
+               controller_deadline: Time.now.to_f + 30 }
+    fixture = { child: child, runtime: runtime, action: action, http: [], results: [], starts: [], ordinary_launches: [], start_delay: 0, room: '1000', state_overrides: {}, standing: true }
+    fixture[:authority] = { action[:action_id] => action.merge(status: 'dispatched', stop_requested: false, return_requested: false) }
     replace.call(Script, :running) { child.alive ? [child] : [] }
     replace.call(Script, :running?) { |name| fixture[:started] && child.alive && child.name == name }
+    replace.call(LichAgentBridge, :supervised_quick_supported?) { |_name| true }
+    replace.call(LichAgentBridge, :launch_controller) do |controller, action, arguments|
+      fixture[:ordinary_launches] << [controller.name, action.name, arguments]
+      false
+    end
     replace.call(Script, :start_child) do |name, arguments, options|
       fixture[:starts] << [name, arguments, options]
       fixture[:started] = true
+      tokens = arguments.split
+      work, cleanup = tokens[tokens.index('--supervised-start-v1') + 1].split(',').map { |part| Float(part) }
+      runtime.bind_execution_window(work_deadline: work, cleanup_deadline: cleanup)
       sleep fixture[:start_delay] if fixture[:start_delay].positive?
       child
     end
@@ -462,6 +510,12 @@ class LabBridgeTest < Minitest::Test
     replace.call(LichAgentBridge, :action_request) { |path, payload| fixture[:results] << [path, payload]; {} }
     replace.call(LichAgentBridge, :publish_snapshot) { |force: false| force }
     replace.call(LichAgentBridge, :room_fingerprint) { fixture[:room] }
+    original_snapshot = LichAgentBridge.method(:snapshot_state)
+    replace.call(LichAgentBridge, :snapshot_state) do |**options|
+      original_snapshot.call(**options).merge(room: { id: fixture[:room] }).merge(fixture[:state_overrides])
+    end
+    original_indicators = XMLData.method(:indicator)
+    replace.call(XMLData, :indicator) { original_indicators.call.merge('IconSTANDING' => fixture[:standing] ? 'y' : 'n') }
     original_monitor = LichAgentBridge.method(:monitor_controlled_run)
     replace.call(LichAgentBridge, :monitor_controlled_run) { |run| original_monitor.call(run, cleanup_timeout: 0.05) }
     yield fixture
@@ -487,6 +541,154 @@ class LabBridgeTest < Minitest::Test
                command: "lab-test-quick #{verb} #{token}", expected_room_id: '1000', expires_at: Time.now.to_f + 1 }
     fixture[:authority][action[:action_id]] = action.merge(status: 'dispatched', stop_requested: false)
     action
+  end
+
+  def with_quick_loader_ownership
+    with_controlled_quick(inventory: true) do |fixture|
+      match = LichAgentBridge::CONTROLLER_REGISTRY.match(fixture[:action][:command])
+      run = { instance: fixture[:child], runtime: fixture[:runtime], controller: match.controller, action: fixture[:action] }
+      LichAgentBridge.instance_variable_get(:@controlled_runs)[match.controller.name] = run
+      fixture[:children], fixture[:other_scripts] = [], []
+      fixture[:child].define_singleton_method(:child_scripts) { fixture[:children].dup }
+      Script.define_singleton_method(:running) { [fixture[:child]] + fixture[:other_scripts] }
+      yield fixture, -> { LichAgentBridge.controlled_local_available?(run, fixture[:action], check_room: false) }
+    end
+  end
+
+  def test_pending_exact_owned_eloot_definitions_loader_preserves_quick_ownership
+    with_quick_loader_ownership do |fixture, available|
+      assert available.call
+      # Native Script.vars contains the full argument string followed by parsed arguments.
+      loader = Struct.new(:name, :vars).new('eloot', ['--load-room-api', '--load-room-api'])
+      fixture[:children] << loader
+      fixture[:other_scripts] << loader
+      3.times { assert available.call, 'the pending owned definitions loader must not revoke Quick' }
+      assert_includes LichAgentBridge.live_scripts, 'eloot', 'snapshot visibility is unchanged'
+
+      # Struct equality is deliberately insufficient: only exact native child identity counts.
+      foreign = loader.dup
+      assert_equal loader, foreign
+      fixture[:other_scripts] << foreign
+      refute available.call, 'a simultaneous foreign definitions loader must still conflict'
+      fixture[:other_scripts].delete_at(1)
+      assert available.call
+      fixture[:children].clear
+      refute available.call, 'a no-longer-owned loader is not exempt'
+    end
+  end
+
+  def test_eloot_loader_exemption_requires_direct_ownership_and_complete_native_arguments
+    variants = [
+      [false, ['--load-room-api', '--load-room-api']],
+      [true, []],
+      [true, ['--load-room-api']],
+      [true, ['--load-room-api normal', '--load-room-api', 'normal']],
+      [true, ['normal --load-room-api', 'normal', '--load-room-api']],
+      [true, ['--load-room-api ', '--load-room-api']],
+      [true, ['loot', 'loot']]
+    ]
+    variants.each do |direct, args|
+      with_quick_loader_ownership do |fixture, available|
+        loader = Struct.new(:name, :vars).new('eloot', args)
+        fixture[:other_scripts] << loader
+        fixture[:children] << loader if direct
+        # A child of another child is not the bound Quick's direct definitions loader.
+        unless direct
+          sibling = Struct.new(:name, :child_scripts).new('helper', [loader])
+          fixture[:children] << sibling
+        end
+        refute available.call, "unexpected exemption: direct=#{direct}, vars=#{args.inspect}"
+      end
+    end
+  end
+
+  def test_hidden_eloot_loader_uses_the_same_exact_identity_check
+    original_hidden = Script.method(:hidden) if Script.respond_to?(:hidden)
+    with_quick_loader_ownership do |fixture, available|
+      loader = Struct.new(:name, :vars).new('eloot', ['--load-room-api', '--load-room-api'])
+      fixture[:children] << loader
+      hidden = [loader]
+      Script.define_singleton_method(:hidden) { hidden }
+      assert available.call
+      hidden << Struct.new(:name, :vars).new('eloot', [])
+      refute available.call, 'normal hidden eLoot remains an inventory conflict'
+    end
+  ensure
+    original_hidden ? Script.define_singleton_method(:hidden, original_hidden) : Script.singleton_class.send(:remove_method, :hidden)
+  end
+
+  def test_exact_active_owned_go2_preserves_quick_ownership_without_hiding_foreign_go2
+    with_quick_loader_ownership do |fixture, available|
+      traveler = Struct.new(:name).new('go2')
+      fixture[:children] << traveler
+      fixture[:other_scripts] << traveler
+      fixture[:active_traveler] = traveler
+      fixture[:child].define_singleton_method(:quick_refuge_travel_child?) do |candidate|
+        candidate.equal?(fixture[:active_traveler])
+      end
+      assert available.call, 'the exact owned active transit child belongs to Quick'
+      assert_includes LichAgentBridge.live_scripts, 'go2', 'snapshot visibility is unchanged'
+
+      foreign = traveler.dup
+      assert_equal traveler, foreign
+      fixture[:other_scripts] << foreign
+      refute available.call, 'same name/value is not exact child identity'
+      fixture[:other_scripts].delete_at(1)
+      assert available.call
+
+      fixture[:active_traveler] = nil
+      refute available.call, 'a stale child-list entry cannot authorize an inactive traveler'
+      fixture[:active_traveler] = traveler
+      fixture[:children].clear
+      refute available.call, 'a stale predicate cannot authorize a no-longer-owned child'
+    end
+  end
+
+  def test_go2_exemption_requires_direct_child_exact_name_and_literal_positive_predicate
+    [nil, false, :active, 'true', :raises].each do |decision|
+      with_quick_loader_ownership do |fixture, available|
+        traveler = Struct.new(:name).new('go2')
+        fixture[:children] << traveler
+        fixture[:other_scripts] << traveler
+        fixture[:child].define_singleton_method(:quick_refuge_travel_child?) do |_candidate|
+          raise 'unavailable travel observation' if decision == :raises
+          decision
+        end
+        refute available.call, "non-positive/unreadable predicate must conflict: #{decision.inspect}"
+      end
+    end
+    with_quick_loader_ownership do |fixture, available|
+      traveler = Struct.new(:name).new('go2')
+      fixture[:other_scripts] << traveler
+      fixture[:child].define_singleton_method(:quick_refuge_travel_child?) { |_candidate| true }
+      fixture[:children] << Struct.new(:name, :child_scripts).new('helper', [traveler])
+      refute available.call, 'even a positive predicate cannot exempt a sibling/foreign child'
+      fixture[:children].replace([traveler])
+      traveler.name = 'eloot'
+      refute available.call, 'the travel predicate cannot whitelist another script'
+    end
+    with_quick_loader_ownership do |fixture, available|
+      traveler = Struct.new(:name).new('go2')
+      fixture[:children] << traveler
+      fixture[:other_scripts] << traveler
+      refute available.call, 'older owners without the travel predicate must fail closed'
+    end
+  end
+
+  def test_hidden_go2_requires_the_same_exact_owned_active_traveler
+    original_hidden = Script.method(:hidden) if Script.respond_to?(:hidden)
+    with_quick_loader_ownership do |fixture, available|
+      traveler = Struct.new(:name).new('go2')
+      fixture[:children] << traveler
+      fixture[:child].define_singleton_method(:quick_refuge_travel_child?) { |candidate| candidate.equal?(traveler) }
+      hidden = [traveler]
+      Script.define_singleton_method(:hidden) { hidden }
+      assert available.call
+      hidden << traveler.dup
+      refute available.call, 'a hidden foreign go2 remains a movement conflict'
+    end
+  ensure
+    original_hidden ? Script.define_singleton_method(:hidden, original_hidden) : Script.singleton_class.send(:remove_method, :hidden)
   end
 
   def synthetic_quick_area(room_id = 1000)
@@ -516,15 +718,15 @@ class LabBridgeTest < Minitest::Test
     end
   end
 
-  def test_area_proof_is_exact_current_room_and_clear_trial_remain_launch_pinned
+  def test_refuge_outing_tracks_phase_while_each_control_remains_room_pinned
     with_controlled_quick(area: true) do |fixture|
       LichAgentBridge.execute_action(fixture[:action])
       run = LichAgentBridge.instance_variable_get(:@controlled_runs)['quick']
       fixture[:room] = '1001'
-      refute LichAgentBridge.controlled_run_room_available?(run), 'old runtime room is not current proof'
-      %w[clear trial unknown].each do |mode|
-        fixture[:runtime].current_status = { mode: mode, state: :running, area: synthetic_quick_area(1001) }
-        refute LichAgentBridge.controlled_run_room_available?(run)
+      refute LichAgentBridge.controlled_local_available?(run, fixture[:action]), 'an old-room control cannot follow movement'
+      %w[outbound working recovering returning].each do |phase|
+        fixture[:runtime].current_status = { state: :running, refuge: { room_id: 1000, phase: phase } }
+        assert LichAgentBridge.controlled_run_room_available?(run)
       end
       fixture[:runtime].current_status = { mode: 'watch', state: :running, area: synthetic_quick_area(1001) }
       assert LichAgentBridge.controlled_run_room_available?(run)
@@ -538,7 +740,7 @@ class LabBridgeTest < Minitest::Test
       LichAgentBridge.execute_action(fixture[:action])
       run = LichAgentBridge.instance_variable_get(:@controlled_runs)['quick']
       fixture[:room] = '1001'
-      refute LichAgentBridge.controlled_run_room_available?(run)
+      refute LichAgentBridge.controlled_local_available?(run, fixture[:action])
       assert LichAgentBridge.controlled_monitor_room_available?(run)
       sleep 0.12 # Observe more than two actual bridge monitor iterations.
       assert_nil run[:failure]
@@ -554,17 +756,18 @@ class LabBridgeTest < Minitest::Test
     end
   end
 
-  def test_ordinary_area_exit_stops
+  def test_unknown_refuge_phase_stops_without_claiming_a_safe_handoff
     with_controlled_quick(area: true) do |fixture|
       LichAgentBridge.execute_action(fixture[:action])
       run = LichAgentBridge.instance_variable_get(:@controlled_runs)['quick']
       fixture[:runtime].current_status = { mode: 'watch', state: :running,
-        area: synthetic_quick_area(1009).merge(in_bounds: false) }
+        area: synthetic_quick_area(1009).merge(in_bounds: false), refuge: { room_id: 1000, phase: 'unknown' } }
       fixture[:room] = '1009'
       assert run[:monitor].join(1)
       assert_includes fixture[:runtime].requests.map(&:first), 'stop'
-      assert_equal 'controller_area_unverified', run[:failure]
+      assert_equal 'controller_room_changed', run[:failure]
       refute run[:result][:ok]
+      assert_equal 'unsafe_handoff', run[:result][:code]
     end
   end
 
@@ -573,12 +776,16 @@ class LabBridgeTest < Minitest::Test
       LichAgentBridge.execute_action(fixture[:action])
       run = LichAgentBridge.instance_variable_get(:@controlled_runs)['quick']
       fixture[:runtime].current_status = { mode: 'watch', state: :held, retreat_pending: true,
-        area: synthetic_quick_area(1009).merge(in_bounds: false) }
+        area: synthetic_quick_area(1009).merge(in_bounds: false), refuge: { room_id: 1000, phase: 'returning' } }
       fixture[:room] = '1009'
-      assert run[:monitor].join(1)
+      sleep 0.12
+      assert run[:binding].open?
       refute_includes fixture[:runtime].requests.map(&:first), 'stop'
-      refute run[:binding].open?
-      refute run[:result][:ok]
+      fixture[:room] = '1000'
+      fixture[:runtime].current_status = { state: :completed, reason: 'room_clear' }
+      fixture[:child].alive = false
+      assert run[:monitor].join(1)
+      assert run[:result][:details][:recovery_complete]
     end
   end
 
@@ -588,11 +795,11 @@ class LabBridgeTest < Minitest::Test
       run = LichAgentBridge.instance_variable_get(:@controlled_runs)['quick']
       assert run[:binding]&.open?, 'declared inventory ownership must not revoke a valid launch'
       assert run[:lease].valid?
-      assert_equal 'lab-test-quick', LichAgentBridge.script_owners(['lab-test-quick'])[:inventory]
+      assert_equal 'bigshot', LichAgentBridge.script_owners(['bigshot'])[:inventory]
       assert_equal 'completed', fixture[:results].last.last[:outcome]
       assert_empty fixture[:runtime].requests, 'startup must not queue a spurious stop'
       %w[eloot eherbs lab-inventory].each do |other|
-        assert_equal other, LichAgentBridge.script_owners(['lab-test-quick', other])[:inventory]
+        assert_equal other, LichAgentBridge.script_owners(['bigshot', other])[:inventory]
       end
     end
   end
@@ -621,7 +828,9 @@ class LabBridgeTest < Minitest::Test
       run = LichAgentBridge.instance_variable_get(:@controlled_runs)['quick']
       assert_same fixture[:child], run[:instance]
       assert_same fixture[:runtime], run[:runtime]
-      assert_equal [['lab-test-quick', '', { quiet: true }]], fixture[:starts]
+      assert_equal 'bigshot', fixture[:starts].first[0]
+      assert_match(/--supervised-start-v1 \d+\.\d+,\d+\.\d+ --supervised-refuge-v1 1000,\d+\.\d+\z/, fixture[:starts].first[1])
+      assert_equal({ quiet: true }, fixture[:starts].first[2])
       LichAgentBridge.execute_action(quick_control_action(fixture))
       assert_equal 'hold', fixture[:runtime].requests.first.first
       callback = fixture[:runtime].requests.first[1]
@@ -698,18 +907,245 @@ class LabBridgeTest < Minitest::Test
     end
   end
 
-  def test_fast_completed_child_uses_its_exact_terminal_snapshot_without_runtime_binding
+  def test_old_room_and_field_only_quick_registrations_load_but_cannot_launch
+    [{ 'kind' => 'room', 'room_id' => '1000' }, { 'kind' => 'quick_area' }].each do |legacy|
+      with_controlled_quick(legacy: legacy) do |fixture|
+        LichAgentBridge.execute_action(fixture[:action])
+        assert_empty fixture[:starts]
+        assert_equal 'failed', fixture[:results].last.last[:outcome]
+        LichAgentBridge.execute_action(quick_control_action(fixture))
+        assert_equal 'failed', fixture[:results].last.last[:outcome]
+      end
+    end
+  end
+
+  def test_uncontrolled_quick_cannot_use_ordinary_controller_launch_but_non_quick_still_can
+    %w[quick QUICK hunt].each do |mode|
+      with_controlled_quick(legacy: { 'kind' => 'room', 'room_id' => '1000' },
+                           uncontrolled: true, script_args: "#{mode} clear") do |fixture|
+        LichAgentBridge.execute_action(fixture[:action])
+        assert_empty fixture[:starts]
+        assert_equal mode == 'hunt' ? 1 : 0, fixture[:ordinary_launches].length
+      end
+    end
+  end
+
+  def test_refuge_start_requires_fresh_refuge_survival_posture_and_known_hands
+    mutations = [
+      ->(f) { f[:room] = '1001'; f[:action][:expected_room_id] = '1001' },
+      ->(f) { f[:state_overrides][:generation] = 'stale-session' },
+      ->(f) { f[:state_overrides][:dead] = true },
+      ->(f) { f[:state_overrides][:stunned] = true },
+      ->(f) { f[:state_overrides][:hands] = { right: { name: 'unknown identity' }, left: nil } },
+      ->(f) { f[:standing] = false },
+      ->(f) { f[:action][:controller_deadline] = Time.now.to_f + 301 },
+      ->(f) { f[:action][:controller_deadline] = Time.now.to_f + 20 }
+    ]
+    mutations.each do |mutate|
+      with_controlled_quick do |fixture|
+        mutate.call(fixture)
+        fixture[:authority][fixture[:action][:action_id]].merge!(fixture[:action])
+        LichAgentBridge.execute_action(fixture[:action])
+        assert_empty fixture[:starts]
+        assert_equal 'failed', fixture[:results].last.last[:outcome]
+      end
+    end
+  end
+
+  def test_ordinary_return_request_keeps_cached_authority_and_is_queued_once
+    with_controlled_quick do |fixture|
+      fixture[:runtime].auto_stop = false
+      LichAgentBridge.execute_action(fixture[:action])
+      run = LichAgentBridge.instance_variable_get(:@controlled_runs)['quick']
+      fixture[:authority][fixture[:action][:action_id]][:return_requested] = true
+      Timeout.timeout(1) { sleep 0.005 until run[:return_requested] }
+      sleep 0.12
+      assert run[:lease].valid?
+      assert run[:binding].open?
+      assert_equal ['stop'], fixture[:runtime].requests.map(&:first)
+      assert fixture[:runtime].requests.first[1].call
+      fixture[:authority][fixture[:action][:action_id]][:stop_requested] = true
+      assert run[:monitor].join(1)
+      refute fixture[:runtime].requests.first[1].call, 'hard revocation still denies return commands'
+      refute run[:result][:ok]
+      assert run[:unsafe_handoff]
+    end
+  end
+
+  def test_refuge_recovery_does_not_turn_failed_or_missing_work_into_test_success
+    [{ state: :held, reason: 'wounded' }, nil].each do |work|
+      with_controlled_quick do |fixture|
+        LichAgentBridge.execute_action(fixture[:action])
+        run = LichAgentBridge.instance_variable_get(:@controlled_runs)['quick']
+        fixture[:runtime].current_status = { state: :completed, reason: 'returned', work_result: work }
+        fixture[:child].alive = false
+        assert run[:monitor].join(1)
+        assert run[:result][:details][:recovery_complete]
+        refute run[:result][:ok]
+        refute run[:unsafe_handoff]
+      end
+    end
+  end
+
+  def test_refuge_terminal_proof_is_not_a_substitute_for_fresh_hands_posture_and_location
+    mutations = [
+      ->(f) { f[:room] = '1001' },
+      ->(f) { f[:standing] = false },
+      ->(f) { f[:state_overrides][:hands] = { right: nil, left: { id: '999' } } },
+      ->(f) { f[:state_overrides][:dead] = true },
+      ->(f) { f[:state_overrides][:generation] = 'replacement' },
+      ->(f) { f[:runtime].current_status[:refuge] = { room_id: 1000, phase: 'finished', returned: true, equipment_restored: false } },
+      ->(f) { f[:runtime].current_status[:refuge] = { room_id: 1001, phase: 'finished', returned: true, equipment_restored: true } }
+    ]
+    mutations.each do |mutate|
+      with_controlled_quick do |fixture|
+        LichAgentBridge.execute_action(fixture[:action])
+        run = LichAgentBridge.instance_variable_get(:@controlled_runs)['quick']
+        fixture[:runtime].current_status = { state: :completed, reason: 'room_clear' }
+        mutate.call(fixture)
+        fixture[:child].alive = false
+        assert run[:monitor].join(1)
+        refute run[:result][:ok]
+        assert run[:unsafe_handoff]
+        assert_same run, LichAgentBridge.instance_variable_get(:@controlled_runs)['quick']
+      end
+    end
+  end
+
+  def test_joined_unsafe_handoff_blocks_new_quick_until_same_session_refuge_hands_and_owners_are_verified
+    with_controlled_quick do |fixture|
+      LichAgentBridge.execute_action(fixture[:action])
+      run = LichAgentBridge.instance_variable_get(:@controlled_runs)['quick']
+      fixture[:runtime].current_status = { state: :stopped, reason: 'return_blocked',
+        refuge: { room_id: 1000, phase: 'finished', returned: false, equipment_restored: false } }
+      fixture[:room] = '1001'
+      fixture[:child].alive = false
+      assert run[:monitor].join(1)
+      assert LichAgentBridge.unresolved_controlled_handoff?
+      match = LichAgentBridge::CONTROLLER_REGISTRY.match(fixture[:action][:command])
+      LichAgentBridge.launch_controlled_controller(fixture[:action], match)
+      assert_equal 1, fixture[:starts].length
+      fixture[:room] = '1000'
+      fixture[:state_overrides][:hands] = { right: { id: '999' }, left: nil }
+      assert LichAgentBridge.unresolved_controlled_handoff?
+      fixture[:state_overrides].clear
+      foreign = Struct.new(:name).new('eloot')
+      Script.define_singleton_method(:running) { [foreign] }
+      assert LichAgentBridge.unresolved_controlled_handoff?
+      Script.define_singleton_method(:running) { [] }
+      old_generation = LichAgentBridge.session_generation
+      LichAgentBridge.instance_variable_set(:@session_generation, 'new-session')
+      assert LichAgentBridge.unresolved_controlled_handoff?
+      LichAgentBridge.instance_variable_set(:@session_generation, old_generation)
+      refute LichAgentBridge.unresolved_controlled_handoff?
+      assert_empty LichAgentBridge.instance_variable_get(:@controlled_runs)
+    end
+  end
+
+  def test_monitor_exception_retains_joined_unsafe_latch_and_reports_failure
+    with_controlled_quick do |fixture|
+      LichAgentBridge.execute_action(fixture[:action])
+      run = LichAgentBridge.instance_variable_get(:@controlled_runs)['quick']
+      LichAgentBridge.define_singleton_method(:publish_snapshot) { |**| raise 'synthetic snapshot failure' }
+      fixture[:runtime].current_status = { state: :completed, reason: 'room_clear' }
+      fixture[:child].alive = false
+      assert run[:monitor].join(1)
+      assert run[:unsafe_handoff]
+      refute run[:result][:ok]
+      assert_equal 'controller_monitor_failed', run[:result][:code]
+      assert_same run, LichAgentBridge.instance_variable_get(:@controlled_runs)['quick']
+      event = fixture[:http].find { |entry| entry[1] == '/v1/event' && entry[2][:data][:code] == 'controller_monitor_failed' }
+      refute_nil event
+    end
+  end
+
+  def test_controlled_launch_binds_fixed_work_and_cleanup_deadlines
+    with_controlled_quick do |fixture|
+      fixture[:action][:controller_deadline] = Time.now.to_f + 30
+      fixture[:authority][fixture[:action][:action_id]][:controller_deadline] = fixture[:action][:controller_deadline]
+      before = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      LichAgentBridge.execute_action(fixture[:action])
+      window = fixture[:runtime].execution_window
+      refute_nil window
+      assert_in_delta 10, window[:cleanup_deadline] - window[:work_deadline], 0.01
+      assert_operator window[:work_deadline], :>, before + 7
+      assert_operator window[:cleanup_deadline], :<=, before + 18.1
+    end
+  end
+
+  def test_controlled_launch_refuses_unsupported_historical_script_before_spawning
+    with_controlled_quick do |fixture|
+      LichAgentBridge.define_singleton_method(:supervised_quick_supported?) { |_| false }
+      LichAgentBridge.execute_action(fixture[:action])
+      assert_empty fixture[:starts]
+      assert_equal 'failed', fixture[:results].last.last[:outcome]
+    end
+  end
+
+  def test_supervised_preflight_reads_only_the_script_resolved_by_lich
+    previous_root = $script_dir
+    previous_resolver = Script.method(:__find_script_file) if Script.respond_to?(:__find_script_file, true)
+    Dir.mktmpdir('supervised-quick-protocol') do |root|
+      $script_dir = root
+      FileUtils.mkdir_p(File.join(root, 'custom'))
+      path = File.join(root, 'custom', 'bigshot.lic')
+      Script.define_singleton_method(:__find_script_file) { |_| 'custom/bigshot.lic' }
+      File.write(path, "raise 'never evaluate preflight source'\n")
+      refute LichAgentBridge.supervised_quick_supported?('bigshot')
+      File.write(path, "    SUPERVISED_START_PROTOCOL = 1\r\nraise 'never evaluate preflight source'\n")
+      refute LichAgentBridge.supervised_quick_supported?('bigshot')
+      File.write(path, "    SUPERVISED_START_PROTOCOL = 1\r\n    REFUGE_START_PROTOCOL = 1\r\nraise 'never evaluate preflight source'\n")
+      assert LichAgentBridge.supervised_quick_supported?('bigshot')
+    end
+  ensure
+    $script_dir = previous_root
+    if previous_resolver
+      Script.define_singleton_method(:__find_script_file, previous_resolver)
+    elsif Script.respond_to?(:__find_script_file, true)
+      Script.singleton_class.remove_method(:__find_script_file)
+    end
+  end
+
+  def test_controlled_launch_stops_a_runtime_that_refuses_deadline_coordination
+    with_controlled_quick do |fixture|
+      fixture[:runtime].define_singleton_method(:activate_supervised) { |**| false }
+      LichAgentBridge.execute_action(fixture[:action])
+      assert_equal 'failed', fixture[:results].last.last[:outcome]
+      assert_includes fixture[:runtime].requests.map(&:first), 'stop'
+      refute fixture[:child].running?
+    end
+  end
+
+  def test_child_finishing_during_lease_refresh_preserves_its_budget_failure
+    with_controlled_quick do |fixture|
+      match = LichAgentBridge::CONTROLLER_REGISTRY.match(fixture[:action][:command])
+      lease = Object.new
+      lease.define_singleton_method(:refresh) do
+        fixture[:runtime].current_status = { state: :stopped, reason: 'command_limit' }
+        fixture[:child].alive = false
+        false
+      end
+      binding = Object.new
+      binding.define_singleton_method(:close) { nil }
+      binding.define_singleton_method(:open?) { false }
+      run = { instance: fixture[:child], runtime: fixture[:runtime], action: fixture[:action],
+              controller: match.controller, lease: lease, binding: binding, start_hands: { right: nil, left: nil } }
+      assert LichAgentBridge.monitor_controlled_run(run).join(1)
+      assert_equal 'quick_command_limit', run[:result][:code]
+      refute run[:result][:ok]
+      assert run[:result][:details][:cleanup_complete]
+      assert_empty fixture[:runtime].requests
+    end
+  end
+
+  def test_child_finishing_before_supervised_activation_is_not_admitted_as_a_success
     with_controlled_quick do |fixture|
       fixture[:child].quick_combat_runtime = nil
       fixture[:child].quick_combat_result = { state: :completed, reason: 'sequence_dispatched' }.freeze
       fixture[:child].alive = false
       match = LichAgentBridge::CONTROLLER_REGISTRY.match(fixture[:action][:command])
-      run = LichAgentBridge.launch_controlled_controller(fixture[:action], match)
-      assert run[:monitor].join(1)
-      assert_equal 'quick_sequence_dispatched', run[:result][:code]
-      assert_equal false, run[:result][:details][:effects_verified]
-      assert_empty fixture[:child].kills
-      assert_empty fixture[:runtime].requests
+      assert_nil LichAgentBridge.launch_controlled_controller(fixture[:action], match)
+      assert_equal 'failed', fixture[:results].last.last[:outcome]
     end
   end
 
@@ -770,11 +1206,16 @@ class LabBridgeTest < Minitest::Test
     with_controlled_quick do |fixture|
       LichAgentBridge.execute_action(fixture[:action])
       run = LichAgentBridge.instance_variable_get(:@controlled_runs)['quick']
-      fixture[:runtime].current_status = { state: :held, reason: 'retreat_pending', retreat_pending: true }
+      fixture[:runtime].current_status = { state: :running, reason: 'retreat_pending', retreat_pending: true,
+        refuge: { room_id: 1000, phase: 'returning' } }
       fixture[:room] = '1001'
+      sleep 0.12
+      assert run[:binding].open?
+      fixture[:child].cleanup_blocked = true
+      fixture[:child].alive = false
       assert run[:monitor].join(1)
       refute_includes fixture[:runtime].requests.map(&:first), 'stop'
-      assert_equal 'cleanup_incomplete', run[:result][:code]
+      assert_equal 'unsafe_handoff', run[:result][:code]
       assert_equal false, run[:result][:details][:cleanup_complete]
       assert_same run, LichAgentBridge.instance_variable_get(:@controlled_runs)['quick']
     end

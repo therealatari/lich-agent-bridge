@@ -88,7 +88,7 @@ class ControllerControlSchemaTests(unittest.TestCase):
         controller = example.controller("quick-trial")
         command, arguments, _ = controller.action("start").build({"sequence": "probe-sequence", "target_id": 12345})
         self.assertEqual(controller.script, "bigshot")
-        self.assertEqual(arguments, "quick trial probe-sequence --target 12345")
+        self.assertEqual(arguments, "quick trial probe-sequence --target 12345 --area profile")
         self.assertEqual(command, "bigshot " + arguments)
         self.assertEqual(controller.control_owner_scripts, ("bigshot",))
         for args in ({"sequence": "unreviewed", "target_id": 12345},
