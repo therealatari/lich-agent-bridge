@@ -85,6 +85,9 @@ class ActionProposal:
     ttl_seconds: int = DEFAULT_TTL_SECONDS
     # Internal owner deadline; the HTTP proposal schema deliberately omits it.
     deadline: float | None = None
+    # Exact owning operation deadline for opted-in controlled launches only.
+    # Unlike expires_at, this remains relevant after dispatch.
+    controller_deadline: float | None = None
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "ActionProposal":
@@ -351,6 +354,7 @@ class CommandPolicy:
         re.compile(r"\A(?:north|northeast|east|southeast|south|southwest|west|northwest|out|up|down|n|ne|e|se|s|sw|w|nw|u|d)\Z"),
         re.compile(r"\A(?:go|climb|enter) [a-z0-9][a-z0-9 #'_-]{0,119}\Z"),
         re.compile(r"\Ago2 [0-9]+\Z"),
+        re.compile(r"\Ago2 supervised [1-9][0-9]{0,9}\Z"),
     )
     _COMMUNICATION = re.compile(r"\A(?:say|whisper|tell|ask) [^\r\n]{1,140}\Z")
     _LOCAL_INSPECTION = re.compile(
@@ -406,6 +410,21 @@ class CommandPolicy:
     def is_test_launch(self, command: str) -> bool:
         matched = self._controller_manifest.match_command(command)
         return matched is not None and matched.controller.test_suite is not None
+
+    def is_controller_control(self, command: str) -> bool:
+        matched = self._controller_manifest.match_command(command)
+        return matched is not None and matched.action.kind == "control"
+
+    def is_controlled_launch(self, command: str) -> bool:
+        matched = self._controller_manifest.match_command(command)
+        return (matched is not None and matched.action.kind == "launch"
+                and bool(matched.controller.control_owner_scripts))
+
+    def is_refuge_launch(self, command: str) -> bool:
+        matched = self._controller_manifest.match_command(command)
+        return (matched is not None and matched.action.kind == "launch"
+                and bool(matched.controller.control_owner_scripts)
+                and matched.controller.safe_handoff["kind"] == "quick_refuge")
 
     def evaluate(self, command: str) -> tuple[str, PolicyDecision]:
         if any(character in command for character in ("\r", "\n", ";", "|", "&")):
@@ -468,7 +487,14 @@ class _Action:
     completion: str | None = None
     detail: str | None = None
     test_run: bool = False
+    controller_control: bool = False
+    controller_deadline: float | None = None
     stop_requested: bool = False
+    return_requested: bool = False
+
+    @property
+    def travel_run(self) -> bool:
+        return len(self.commands) == 1 and re.fullmatch(r"go2 supervised [1-9][0-9]{0,9}", self.commands[0], re.IGNORECASE) is not None
 
     def public(self, *, instruction: str) -> dict[str, Any]:
         result = {
@@ -489,7 +515,10 @@ class _Action:
             result["completion"] = self.completion
         if self.detail is not None:
             result["detail"] = self.detail
-        if self.test_run:
+        if self.controller_deadline is not None:
+            result["controller_deadline"] = self.controller_deadline
+            result["return_requested"] = self.return_requested
+        if self.test_run or self.controller_control or self.controller_deadline is not None or self.travel_run:
             result["stop_requested"] = self.stop_requested
         return result
 
@@ -544,7 +573,8 @@ class ActionBroker:
             cancelled: list[str] = []
             if previous is not None and previous != admitted_generation:
                 for action in self._actions.values():
-                    if (action.test_run and action.character.casefold() == character_key
+                    if ((action.test_run or action.controller_control or action.controller_deadline is not None or action.travel_run)
+                            and action.character.casefold() == character_key
                             and action.generation != admitted_generation
                             and action.status in {"dispatched", "completed", "failed"}):
                         action.stop_requested = True
@@ -589,7 +619,8 @@ class ActionBroker:
             else:
                 self._enabled.discard(character_key)
                 for action in self._actions.values():
-                    if (action.test_run and action.character.casefold() == character_key
+                    if ((action.test_run or action.controller_control or action.controller_deadline is not None or action.travel_run)
+                            and action.character.casefold() == character_key
                             and action.status in {"dispatched", "completed", "failed"}):
                         action.stop_requested = True
                     if (
@@ -623,6 +654,16 @@ class ActionBroker:
             if character_key not in self._enabled:
                 raise ValidationError(f"actions are disabled for {proposal.character}")
             now = self._clock()
+            controlled_launch = len(normalized_commands) == 1 and self._policy.is_controlled_launch(normalized_commands[0])
+            if controlled_launch:
+                if (isinstance(proposal.controller_deadline, bool)
+                        or not isinstance(proposal.controller_deadline, (int, float))
+                        or not math.isfinite(proposal.controller_deadline)
+                        or proposal.controller_deadline <= now
+                        or proposal.expected_generation is None):
+                    raise ValidationError("controlled launch requires a finite future operation deadline and generation")
+            elif proposal.controller_deadline is not None:
+                raise ValidationError("controller deadline is only valid for a registered controlled launch")
             expires_at = now + proposal.ttl_seconds
             if proposal.deadline is not None:
                 if (isinstance(proposal.deadline, bool) or not isinstance(proposal.deadline, (int, float))
@@ -641,6 +682,8 @@ class ActionBroker:
                 expires_at=expires_at,
                 confirmation_required=confirmation_required,
                 test_run=(len(normalized_commands) == 1 and self._policy.is_test_launch(normalized_commands[0])),
+                controller_control=(len(normalized_commands) == 1 and self._policy.is_controller_control(normalized_commands[0])),
+                controller_deadline=proposal.controller_deadline if controlled_launch else None,
             )
             self._audit(
                 {
@@ -653,6 +696,7 @@ class ActionBroker:
                     "status": action.status,
                     "expected_room_id": action.expected_room_id,
                     "expires_at": action.expires_at,
+                    **({"controller_deadline": action.controller_deadline} if controlled_launch else {}),
                 }
             )
             self._actions[action.action_id] = action
@@ -690,6 +734,8 @@ class ActionBroker:
                 command, f"commands[{index}]", maximum=MAX_COMMAND_LENGTH
             )
             normalized, decision = self._policy.evaluate(checked)
+            if self._policy.is_controller_control(normalized):
+                raise ValidationError("controller controls cannot be batched")
             if decision.kind not in {"inspection", "inventory", "crafting"}:
                 raise ValidationError(
                     "command sequences are limited to inspection, inventory, and crafting"
@@ -837,6 +883,8 @@ class ActionBroker:
 
         Internal operation cleanup only: identity is checked against the action,
         not the current session, so old-generation owners can still clean up.
+        Dispatched supervised go2 additionally receives a stop marker for its
+        native guard; already-sent movement is never undone.
         """
 
         with self._lock:
@@ -847,6 +895,11 @@ class ActionBroker:
                 raise ValidationError("action belongs to another session generation")
             self._expire_locked()
             cancelled = action.status in {"confirmation_required", "queued"}
+            if action.travel_run and action.status == "dispatched":
+                action.stop_requested = True
+                self._audit({"event": "travel_stop_requested", "action_id": action.action_id,
+                             "character": action.character, "generation": action.generation})
+                self._changed.notify_all()
             if cancelled:
                 action.status = "cancelled"
                 self._audit({
@@ -874,6 +927,64 @@ class ActionBroker:
             self._audit({"event": "test_stop_requested", "action_id": action.action_id,
                          "character": action.character, "generation": action.generation,
                          "status": action.status, "stop_requested": action.stop_requested})
+            self._changed.notify_all()
+            return action.public(instruction=action.status)
+
+    def revoke_controller_control(self, action_id: str, *, character: str, generation: str) -> dict[str, Any]:
+        """Revoke exact owned control; queued native application observes a stop marker.
+
+        Dispatched controls cannot be unsent. The bridge's off-thread status
+        observation and local queued validity predicate govern later application.
+        """
+        with self._lock:
+            action = self._find_locked(_action_id(action_id))
+            if (action.character.casefold() != _character(character).casefold()
+                    or action.generation != _generation(generation) or not action.controller_control):
+                raise ValidationError("control does not belong to this character and generation")
+            self._expire_locked()
+            if action.status in {"confirmation_required", "queued"}:
+                action.status = "cancelled"
+            action.stop_requested = True
+            self._audit({"event": "controller_control_revoked", "action_id": action.action_id,
+                         "character": action.character, "generation": action.generation,
+                         "status": action.status})
+            self._changed.notify_all()
+            return action.public(instruction=action.status)
+
+    def request_controller_return(self, action_id: str, *, character: str, generation: str) -> dict[str, Any]:
+        """End exact refuge test work without revoking its already approved return."""
+        with self._lock:
+            action = self._find_locked(_action_id(action_id))
+            if (action.character.casefold() != _character(character).casefold()
+                    or action.generation != _generation(generation) or action.controller_deadline is None
+                    or len(action.commands) != 1 or not self._policy.is_refuge_launch(action.commands[0])):
+                raise ValidationError("return request requires this character's exact refuge launch")
+            self._expire_locked()
+            self._require_active_generation_locked(action.character, action.generation)
+            if (action.stop_requested or action.status not in {"dispatched", "completed"}
+                    or action.character.casefold() not in self._enabled
+                    or self._clock() >= action.controller_deadline):
+                raise ValidationError("refuge launch is no longer authorized")
+            action.return_requested = True
+            self._audit({"event": "controller_return_requested", "action_id": action.action_id,
+                         "character": action.character, "generation": action.generation})
+            self._changed.notify_all()
+            return action.public(instruction=action.status)
+
+    def revoke_controller_run(self, action_id: str, *, character: str, generation: str) -> dict[str, Any]:
+        """Mark the exact controlled launch revoked; never kill a script by name."""
+        with self._lock:
+            action = self._find_locked(_action_id(action_id))
+            if (action.character.casefold() != _character(character).casefold()
+                    or action.generation != _generation(generation) or action.controller_deadline is None):
+                raise ValidationError("controlled launch does not belong to this character and generation")
+            self._expire_locked()
+            if action.status in {"confirmation_required", "queued"}:
+                action.status = "cancelled"
+            action.stop_requested = True
+            self._audit({"event": "controller_run_revoked", "action_id": action.action_id,
+                         "character": action.character, "generation": action.generation,
+                         "status": action.status})
             self._changed.notify_all()
             return action.public(instruction=action.status)
 

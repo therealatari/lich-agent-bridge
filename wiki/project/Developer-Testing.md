@@ -39,6 +39,12 @@ outcomes. Do not add retries that might repeat a non-idempotent game action.
    events, and read a fresh snapshot for handoff. A watch timeout means no event
    arrived in that interval, not that a command succeeded. After movement/combat,
    handoff requires the authorized safe room, survival, and released ownership.
+   Agent tests must start and finish in player-configured safe waiting rooms;
+   a nearby refuge is sufficient. The earlier experimental `quick_area` field
+   proof does not satisfy this requirement. The local
+   [safe-refuge implementation](Agent-Test-Safe-Refuge.md) still requires
+   coordinated deployment and an explicitly authorized acceptance test before
+   routine live testing resumes.
 
 MCP tools and their exact types are documented in the generated
 [SDK declarations](../../mcp/src/sdk-types.generated.ts). For example, after
@@ -59,6 +65,76 @@ independent Lich checks.
 The isolated `lab.execute_code` tool can combine small state/query operations,
 but permits only one mutation (perform or exact-operation stop) per execution and has a short execution limit.
 Use direct perform/watch for long operations; it is not a general script runner.
+
+## Direct native go2 travel
+
+`travel.go2` exposes existing Lich/go2 routing without starting a combat test.
+It is available through the existing capability interface, including MCP
+`lab.perform`, not a generic command or script execution tool. For example,
+after authorizing this exact character, destination and route scope:
+
+```text
+labctl perform Testmage travel.go2 --arg 'destination="1000"' --expected-generation GENERATION --operation-timeout 60
+```
+
+Use a numeric map room ID, not a go2 alias, settings command, or room 4 special
+selector. Default operation time is 30 seconds; callers may request up to 120.
+Native go2 sends are limited to 256 ordinary movement/door/posture/look commands.
+Go2 must support `--preserve-scripts`; Lich must support guarded native child
+startup and script-start restrictions. Missing support refuses before launch.
+One-trip options disable silver retrieval and typeahead, preserving unrelated
+scripts and persisted go2 settings. Routes requiring spending, equipment
+handling, spells, or nested scripts are not supported by this initial operation.
+This trusts installed go2/map code; it is not a Ruby sandbox.
+The broker uses a distinct supervised command selector so an older bridge
+rejects the request instead of silently launching its legacy unguarded go2 path.
+The selector is internal to LAB; it is not a new go2 command for players.
+
+Admission requires fresh same-generation state, known hands, survival, and
+released movement/combat/inventory owners. Existing go2 is never adopted or
+killed by name. The exact child receives a startup execution guard and uses the
+existing broker authority lease; guards do not make network revocation instant.
+Ordinary stop, actions-off, expiry or generation loss deny further sends. Only
+the exact child is cancelled, with at most two seconds to confirm teardown.
+Cancellation is not arrival and cannot undo an already sent movement.
+
+Success requires fresh destination arrival, survival, standing posture,
+unchanged hands, attributed go2 completion and released ownership. An already
+at-destination request is a verified no-op. If a test has an unresolved refuge
+handoff, travel is allowed only to its original refuge in the same session;
+the original equipment/owner recovery proof is still required to clear it.
+Travel does not override actions-off or gain authority from an earlier failure.
+
+This operation permits explicitly authorized recovery from the field. It does
+not relax the requirement for tests to begin/end in player-designated refuges,
+nor replace the test controller's own automatic return. Offline tests cover
+admission, cancellation and the bridge child seam. Initial live acceptance of
+LAB `9345157` passed an already-at-destination no-op and a short town round trip
+between two player-designated safe rooms. Both legs verified arrival, original
+equipment and released ownership without alerts. This does not verify long or
+special routes, live cancellation, combat recovery, or the separate Quick
+post-combat return path.
+
+### Controller-result wait regression
+
+A Quick outing exposed a LAB evidence-wait bug: the 30-second maximum for one
+state watch was incorrectly used as the entire controller-result deadline. A
+watch timeout then failed the operation and revoked its exact launch while
+native go2 was still returning, despite time remaining in the approved outing.
+Controller verification now repeats bounded watches, carrying its cursor
+forward, until matching terminal evidence or the operation's remaining deadline.
+This does not extend execution authority or change native go2 routing.
+
+The virtual-time regression exercises the real broker, operation runner and
+evidence adapter: a return after 40 seconds succeeds within a 90-second budget;
+missing evidence still fails and revokes at 90 seconds. Additional tests use
+the real state watcher to verify bounded waits, unrelated-result rejection,
+short/zero deadlines and already-published evidence. These are offline checks.
+Player-authorized live acceptance on 2026-09-10 then verified an ordinary-stop
+return and a full post-combat seek outing: four game-confirmed kills, return to
+the configured refuge, original equipment restored, all controller owners
+released, and no alerts. Loot cleanup remains a separate live acceptance case;
+the no-loot combat pass does not establish it.
 
 ## Trusted script-test pilot
 
@@ -182,6 +258,13 @@ slot per character, four globally, and the selected profile's deadline. Busy or
 timeout is an explicit error, not permission to enqueue endless retries.
 
 ## Adding a supported test operation
+
+The [exact-operation controller controls](Controller-Controls.md) document
+authenticated HTTP/CLI admission for typed controls of a registered active
+controller. The bridge binds opted-in Quick controllers to the exact native
+child/runtime; public installation alone does not register a capability. The
+[direct trial example](../../examples/controllers/README.md) is opt-in and
+requires separately authorized live verification.
 
 If discovery has no suitable operation, propose the smallest capability needed
 with its admission checks, exact target binding, evidence, restoration, and

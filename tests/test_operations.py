@@ -183,7 +183,7 @@ class BrokerDriver:
         if command in self.no_result_for:
             return
         action = broker.poll(
-            ActionContext(character=snapshot.character, room_id=snapshot.room_id)
+            ActionContext(character=snapshot.character, room_id=snapshot.room_id, generation=snapshot.generation)
         )
         if action["status"] == "confirmation_required":
             broker.approve(
@@ -192,10 +192,11 @@ class BrokerDriver:
                     character=snapshot.character,
                     room_id=snapshot.room_id,
                     approval_mode="auto",
+                    generation=snapshot.generation,
                 )
             )
             action = broker.poll(
-                ActionContext(character=snapshot.character, room_id=snapshot.room_id)
+                ActionContext(character=snapshot.character, room_id=snapshot.room_id, generation=snapshot.generation)
             )
         if command in self.fail_for:
             outcome = "failed"
@@ -249,6 +250,7 @@ class BrokerDriver:
                 character=snapshot.character,
                 outcome=outcome,
                 detail="command sent" if outcome == "completed" else "rejected",
+                generation=snapshot.generation,
             )
         )
         if self.after_command is not None:
@@ -294,6 +296,7 @@ class CapabilityRunnerTests(unittest.TestCase):
         self.assertEqual(
             set(catalog),
             {
+                "travel.go2",
                 "character.recon",
                 "item.audit",
                 "hunt.prepare",

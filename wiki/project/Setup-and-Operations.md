@@ -37,6 +37,7 @@ Copy or symlink each file into the active Lich scripts directory:
 - `lich/lab-inventory.lic`
 - `lich/lich-state-core.rb`
 - `lich/lab-controller-registry.rb`
+- `lich/lab-controller-controls.rb`
 - `lich/lab-test-runner.rb`
 - `lich/lab-controllers.json`
 
@@ -44,8 +45,26 @@ Lich resolves these dependencies in its scripts directory even when the
 dispatcher itself is symlinked. Install a compatible Ruby SQLite dependency
 for inventory tracking.
 
+When deliberately switching a stopped bridge to another build through symlinks,
+the bridge resolves the registry's canonical path before requiring it. This
+avoids reusing the old build's registry from Ruby's require cache. It is not a
+general hot-reload guarantee for files edited in place; stop active operations
+and keep the sidecar, bridge dependencies and private manifest compatible.
+
 The public controller manifest is empty. Personal combat scripts, hunt profiles,
 and character policy are neither bundled nor required for the bridge.
+The optional [Quick trial example](../../examples/controllers/README.md) requires
+explicit registration and compatible Bigshot/native Lich lifecycle support.
+
+Explicit inventory enhancive/charge refreshes retain compatibility with older
+Lich versions without native execution guards only when the loaded controller
+registry is valid and explicitly empty. The bridge must still be available:
+refreshes claim the inventory lane and check for competing owners before starting.
+This legacy path does not provide per-command revocation; avoid starting other
+equipment/combat/movement scripts during the refresh. Registering any controller
+requires native guards for these refreshes. Missing or malformed registry state
+does not enable the fallback. When native guards exist, they are always used,
+including with an empty registry. Passive inventory observation is unchanged.
 
 The optional trusted script-test pilot also needs `lich/lab-test-runner.lic`.
 Use real copies of the runner pair and reviewed suite files for that pilot:

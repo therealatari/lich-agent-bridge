@@ -17,6 +17,16 @@ request is not proof that local script cleanup has completed. Inspect the termin
 operation evidence. Registered script suites require `expected_generation` on
 perform as well; discover approved arguments through `lab.capabilities`.
 
+`lab.perform` accepts optional `timeout_seconds` for the total execution budget,
+including equipment recovery and return. It defaults to 30 seconds; only
+configured refuge outings may request more, up to 300 seconds. SessionHub
+enforces the capability-specific limit. For example, an authorized refuge test
+may pass `timeout_seconds: 120` alongside its character, capability, arguments,
+and current `expected_generation`. The adapter waits for that budget plus five
+seconds to collect the terminal result, using the existing bounded watch calls.
+This does not extend the separate ten-second `lab.execute_code` limit; use direct
+`lab.perform` for an outing.
+
 ## Development
 
 ```sh

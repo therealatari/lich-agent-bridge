@@ -3,7 +3,7 @@
 Approved architecture and implementation direction: 2026-09-06.
 Status: implemented, deployed, and accepted by the maintainer for the current
 release on 2026-09-07, with remaining multi-part passage-selection quality
-explicitly deferred to [issue #7](https://github.com/therealatari/lich-agent-bridge/issues/7).
+explicitly deferred to [issue #7](https://github.com/elanthia-online/lich-agent-bridge/issues/7).
 The latest live comparison remains incomplete; acceptance to ship is not a claim
 that every requested mechanics facet is answered. Publication to main is
 authorized. The dated sections below retain the investigation history.
@@ -320,7 +320,7 @@ no game-command proposals or executions. No additional scope, commit, or push.
 
 The maintainer accepted the deployed behavior as good enough for now and requested
 publication to main. Remaining passage-selection tuning is a non-blocking follow-up
-in [issue #7](https://github.com/therealatari/lich-agent-bridge/issues/7), with
+in [issue #7](https://github.com/elanthia-online/lich-agent-bridge/issues/7), with
 privacy-safe reproduction guidance, multi-topic coverage criteria, and the existing
 scope/budget fence. This supersedes the earlier quality gate as a release blocker,
 not its recorded findings. Do not close the issue merely because this work ships.

@@ -45,6 +45,12 @@ See [Architecture](wiki/project/Architecture.md), [Protocol](wiki/project/Protoc
 - A configured answer backend
 - The Ruby `sqlite3` gem for durable inventory tracking
 
+Optional Quick controllers require the companion native Lich support described
+in [controller setup](examples/controllers/README.md). With a valid, explicitly
+empty controller registry, older Lich builds can still run explicit inventory
+refreshes using initial ownership checks; native per-command guards are used
+whenever available. See [inventory compatibility](wiki/project/Setup-and-Operations.md#install-lich-dependencies).
+
 The current default backend is the locally installed Codex CLI using its existing ChatGPT login. A direct OpenAI Responses API adapter and an OpenAI-compatible Chat Completions adapter for local servers such as llama.cpp are also available. Named profiles select the provider, model, reasoning effort, timeout, and an optional bounded local instructions file.
 
 Current development and live testing are Linux-oriented. The optional MCP adapter additionally requires Node.js, npm, and the native build prerequisites used by `isolated-vm`.
@@ -54,7 +60,7 @@ Current development and live testing are Linux-oriented. The optional MCP adapte
 Clone the repository and install the Python package:
 
 ```bash
-git clone https://github.com/therealatari/lich-agent-bridge.git
+git clone https://github.com/elanthia-online/lich-agent-bridge.git
 cd lich-agent-bridge
 python3 -m venv .venv
 source .venv/bin/activate
@@ -135,12 +141,21 @@ Management:
 ;lab approve auto
 ;lab approve auto off
 ;lab operation stop
+;lab recover
 ;lab stop
 ```
 
-The default catalog contains four capabilities:
+For a retained failed Quick handoff, `;lab recover` lists the exact run ID.
+After restoring the character, `;lab recover RUN_ID confirm` verifies refuge,
+original equipment and released ownership before acknowledging that one run.
+It sends no game commands and does not turn the failed test into a pass.
+See [recovery checks](wiki/project/Controller-Controls.md#player-confirmed-recovery-after-a-lab-restart).
+
+The default catalog contains five capabilities:
 
 - `character.recon`: fixed INFO/SKILLS inspection with verified observations.
+- `travel.go2`: exact-room native go2 travel with bounded execution and verified
+  arrival; requires compatible guarded Lich/go2 builds and explicit player authorization.
 - `item.audit`: attributed diagnostics for an exact current item.
 - `room.loot`: a bounded ELoot sweep with admission and outcome checks.
 - `hunt.prepare`: unavailable without a configured character profile; no profiles
@@ -170,7 +185,7 @@ those requests; the model cannot supply arbitrary commands, paths, or URLs.
 
 Known limitation: multi-part questions can find the right page but miss the
 specific interaction-rule passage. Further passage-selection tuning is tracked
-in [issue #7](https://github.com/therealatari/lich-agent-bridge/issues/7).
+in [issue #7](https://github.com/elanthia-online/lich-agent-bridge/issues/7).
 
 `character.read` reuses recent same-session INFO/SKILLS observations and can
 request missing or older-than-two-minute categories through the existing recon
@@ -396,7 +411,10 @@ The core Ruby bridge tests require a Ruby runtime compatible with the installed 
 ```bash
 ruby tests/lab_dispatcher_test.rb
 ruby tests/lab_bridge_test.rb
+ruby tests/lab_go2_travel_test.rb
 ruby tests/lab_controller_registry_test.rb
+ruby tests/lab_controller_controls_test.rb
+ruby tests/lab_controller_control_binding_test.rb
 ruby tests/lab_test_runner_test.rb
 ruby tests/lab_inventory_test.rb
 bash tests/play_gemstone_detach_test.sh

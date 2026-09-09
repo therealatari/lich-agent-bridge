@@ -22,7 +22,7 @@ from .settings import Settings
 
 DEFAULT_API_URL = "https://gswiki.play.net/api.php"
 DEFAULT_NAMESPACES = (0, 4, 10, 12, 14, 102, 104, 106, 108, 112, 828)
-USER_AGENT = "lich-agent-bridge/0.2 (+https://github.com/therealatari/lich-agent-bridge)"
+USER_AGENT = "lich-agent-bridge/0.2 (+https://github.com/elanthia-online/lich-agent-bridge)"
 
 _COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
 _REF = re.compile(r"<ref\b[^>]*>.*?</ref\s*>", re.IGNORECASE | re.DOTALL)

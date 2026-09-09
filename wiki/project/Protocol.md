@@ -15,6 +15,15 @@ game, random bridge generation, increasing sequence, and timezone-aware
 observation time. A retired generation cannot become current again.
 `POST /v1/event` admits meaningful events for the current generation.
 
+The native player's `;lab recover RUN_ID confirm` command can publish a
+`controller_recovery` event after verifying safe recovery. Its data binds
+`controller`, `action_id`, `previous_generation`, `room_id`, exact `hands`
+(`left`/`right` IDs or null), and literal `operator_confirmed: true`. The event
+envelope identifies the current character/generation. LAB consumes this exact
+receipt only with independently verified current refuge/equipment/owner state;
+it is not a generic lock-reset request or a new MCP capability. See
+[player-confirmed recovery](Controller-Controls.md#player-confirmed-recovery-after-a-lab-restart).
+
 `GET /v1/state/CHARACTER` reads the snapshot;
 `GET /v1/watch/CHARACTER?cursor=N&timeout=30` waits for bounded events.
 Unknown values remain absent rather than being guessed.
@@ -51,6 +60,7 @@ Authenticated JSON POST routes provide the shared CLI/MCP facade:
 - `/v1/session/perform`
 - `/v1/session/operation/watch`
 - `/v1/session/operation/stop`
+- `/v1/session/operation/control` (HTTP/CLI only; no MCP control tool yet)
 
 Capability discovery returns registered names and strict schemas. The bundled
 controller manifest is empty; a client must not assume personal controller or
@@ -66,6 +76,16 @@ the legacy character-only stop remains available for non-test operations. A
 successful stop request records intent, not verified child cleanup. For dispatched
 test launches, the existing action-status response exposes `stop_requested`
 without rewriting the launch as an unsent cancellation.
+
+Control requires exactly `character`, `operation_id`, `expected_generation`, and
+`control` (`status`, `hold`, `resume`, or `retreat`). It attaches an independently
+broker-gated command to the existing operation, not another competing operation.
+HTTP 202 means admission only; the response includes the broker action and
+`applied: null`. Missing/wrong authentication returns 401; malformed, unknown,
+stale, expired, or conflicting requests return 400. The optional local Quick
+binding pins the exact native child/runtime; no controller is enabled by default.
+See [controller-control limitations](Controller-Controls.md).
+
 Sources reports supplied references and diagnostics, not raw prompts.
 Forget clears temporary dialogue and invalidates owned in-flight work without
 deleting durable inventory or character knowledge.

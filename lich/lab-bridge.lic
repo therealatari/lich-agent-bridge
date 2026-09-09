@@ -12,7 +12,7 @@
   independently rechecks a small allowlist before sending one command at a
   time.
 
-  project: https://github.com/therealatari/lich-agent-bridge
+  project: https://github.com/elanthia-online/lich-agent-bridge
   version: 0.3.0
      game: gs
 =end
@@ -32,7 +32,10 @@ controller_registry_core = if defined?($script_dir) && $script_dir
                            else
                              File.expand_path('lab-controller-registry', __dir__)
                            end
-require controller_registry_core
+# Resolve the installed symlink so a deliberate build switch does not reuse
+# the previous build's cached registry in this long-lived Lich process.
+require File.realpath("#{controller_registry_core}.rb")
+require File.join(File.dirname(controller_registry_core), 'lab-controller-controls')
 if ENV['LAB_BRIDGE_LIBRARY_ONLY'] == '1'
   require lich_state_core
 else
@@ -114,6 +117,7 @@ module LichAgentBridge
     /\A(?:north|northeast|east|southeast|south|southwest|west|northwest|out|up|down|n|ne|e|se|s|sw|w|nw|u|d)\z/i,
     /\A(?:go|climb|enter) [a-z0-9][a-z0-9 #'_-]{0,119}\z/i,
     /\Ago2 [0-9]+\z/i,
+    /\Ago2 supervised [1-9][0-9]{0,9}\z/i,
     /\A(?:say|whisper|tell|ask) [^\r\n]{1,140}\z/i,
     /\Ainspect item exact [^\r\n]{1,120}\z/i,
     /\Adiagnose item (?:405|735) exact [^\r\n]{1,120}\z/i,
@@ -297,17 +301,29 @@ module LichAgentBridge
 
   def self.script_owners(scripts)
     folded = scripts.map(&:downcase)
+    tracker_activity = inventory_tracker_activity
+    folded << 'lab-inventory' if tracker_activity == true
     movement_candidates = %w[go2 bigshot ebounty escortgo2 echild] + CONTROLLER_REGISTRY.controller_scripts_for_lane('movement')
     combat_candidates = %w[bigshot] + CONTROLLER_REGISTRY.controller_scripts_for_lane('combat')
     movement = movement_candidates.uniq.find { |name| folded.include?(name) }
     combat = combat_candidates.uniq.find { |name| folded.include?(name) }
-    inventory = %w[eloot eherbs lab-inventory].find { |name| folded.include?(name) }
+    inventory_candidates = %w[eloot eherbs lab-inventory] + CONTROLLER_REGISTRY.controller_scripts_for_lane('inventory')
+    inventory_candidates.delete('lab-inventory') if tracker_activity == false
+    inventory = inventory_candidates.uniq.find { |name| folded.include?(name) }
     {
       movement: movement,
       combat: combat,
       inventory: inventory,
       communication: nil
     }
+  end
+
+  def self.inventory_tracker_activity
+    return nil unless defined?(LabInventory) && LabInventory.respond_to?(:inventory_lane_active?)
+    value = LabInventory.inventory_lane_active?
+    [true, false].include?(value) ? value : nil
+  rescue StandardError
+    nil
   end
 
   def self.live_script_status(scripts)
@@ -1635,6 +1651,501 @@ module LichAgentBridge
     false
   end
 
+  # Opted-in Quick controllers retain exact native Script/runtime identities.
+  # These are bridge-local lifecycle records, never a public global registry.
+  @controlled_run_mutex ||= Mutex.new
+  @controlled_runs ||= {}
+
+  def self.controlled_action_authority(action_id)
+    request(:post, '/v1/actions/status', { action_id: action_id }, authorized: true, read_timeout: 0.2)
+  end
+
+  def self.quick_runtime_status(run)
+    value = run[:runtime]&.status || run[:terminal_status]
+    quick_status_payload(value)
+  end
+
+  # Presentation only: retain summaries/identity and newest outcome records
+  # within the existing result budget. Never mutate the owner's cached status
+  # or turn transport completion into evidence that game effects occurred.
+  def self.quick_status_payload(value)
+    return {} unless value.is_a?(Hash)
+    copy = JSON.parse(JSON.generate(value), symbolize_names: true)
+    observations = copy[:observations]
+    projected = false
+    work = copy[:work_result]
+    if work.is_a?(Hash) && work[:observations].is_a?(Array)
+      work[:observation_transport] = { omitted_entries: work.delete(:observations).length,
+                                       observations_source: 'runtime.observations' }
+      projected = true
+    end
+    if observations.is_a?(Array)
+      observations.each do |entry|
+        next unless entry.is_a?(Hash)
+        command = entry[:command]
+        if command.is_a?(Array)
+          # An array inside an outcome exceeds the event envelope's depth cap.
+          # JSON text preserves grouping without creating executable commands.
+          command = JSON.generate(command)
+          entry[:command_presentation] = 'json'
+          projected = true
+        end
+        next unless command.is_a?(String)
+        if command.length > 4000
+          entry[:command_omitted_characters] = command.length - 4000
+          command = command[0, 4000]
+          projected = true
+        end
+        entry[:command] = command
+      end
+    end
+    encoded = JSON.generate(copy)
+    return copy if !projected && encoded.bytesize <= 32_768
+
+    omitted = 0
+    loop do
+      if observations.is_a?(Array)
+        copy[:observation_transport] = {
+          omitted_entries: omitted,
+          retained_sequence_range: { first: observations.first&.dig(:sequence), last: observations.last&.dig(:sequence) }
+        }
+      end
+      return copy if JSON.generate(copy).bytesize <= 32_768
+      raise LabControllerControls::Invalid, 'Quick status summary exceeds result limit' unless observations.is_a?(Array) && !observations.empty?
+      observations.shift
+      omitted += 1
+    end
+  end
+
+  def self.quick_runtime_terminal?(run)
+    %w[completed stopped].include?(quick_runtime_status(run)[:state].to_s)
+  end
+
+  # Bigshot alone resolves profile boundaries. Only its exact child's published
+  # proof can authorize following player movement; LAB never traverses the map.
+  def self.controlled_area_status?(status)
+    area = status[:area]
+    area.is_a?(Hash) && area[:kind].to_s == 'profile' && area.key?(:room_id) && [true, false].include?(area[:in_bounds]) &&
+      (area[:room_id].nil? || area[:room_id].is_a?(Integer)) &&
+      (area[:in_bounds] == false || area[:room_id].is_a?(Integer)) &&
+      area[:start_room_id].is_a?(Integer) && area[:room_count].is_a?(Integer) && area[:room_count].positive? &&
+      area[:boundary_room_ids].is_a?(Array) && area[:boundary_room_ids].all? { |id| id.is_a?(Integer) }
+  end
+
+  def self.controlled_area_in_bounds?(run, status = quick_runtime_status(run))
+    return false unless run[:controller].safe_handoff['kind'] == 'quick_area'
+    area = status[:area]
+    controlled_area_status?(status) && area[:in_bounds] == true &&
+      area[:room_id].is_a?(Integer) && area[:room_id].to_s == room_fingerprint
+  end
+
+  def self.controlled_monitor_room_available?(run)
+    if run[:controller].safe_handoff['kind'] == 'quick_refuge'
+      refuge = quick_runtime_status(run)[:refuge]
+      return refuge.is_a?(Hash) && refuge[:room_id] == run[:controller].safe_handoff['room_id'].to_i &&
+        %w[outbound working recovering returning finished].include?(refuge[:phase].to_s)
+    end
+    return controlled_run_room_available?(run) unless run[:controller].safe_handoff['kind'] == 'quick_area'
+    status = quick_runtime_status(run)
+    # Cached publication can lag player movement while the owner unwinds work.
+    # Native --area profile guards every send. Stale proof denies controls, but
+    # does not itself revoke the entire run before its owner can publish again.
+    controlled_area_status?(status) && status[:area][:in_bounds] == true &&
+      (%w[watch assist seek].include?(status[:mode].to_s) ||
+        (%w[clear trial].include?(status[:mode].to_s) && run[:action][:expected_room_id].to_s == room_fingerprint))
+  end
+
+  def self.controlled_run_room_available?(run)
+    return controlled_monitor_room_available?(run) if run[:controller].safe_handoff['kind'] == 'quick_refuge'
+    return run[:action][:expected_room_id].to_s == room_fingerprint unless run[:controller].safe_handoff['kind'] == 'quick_area'
+    status = quick_runtime_status(run)
+    %w[watch assist seek clear trial].include?(status[:mode].to_s) && controlled_area_in_bounds?(run, status) &&
+      (%w[watch assist seek].include?(status[:mode].to_s) || run[:action][:expected_room_id].to_s == room_fingerprint)
+  end
+
+  def self.controlled_script_names(instance)
+    scripts = Array(Script.running)
+    scripts.concat(Array(Script.hidden)) if Script.respond_to?(:hidden)
+    children = instance.respond_to?(:child_scripts) ? instance.child_scripts : []
+    scripts.filter_map do |script|
+      next unless script.respond_to?(:name)
+      name = script.name.to_s.downcase
+      # Native start_child adopts before releasing the worker. vars[0] is the
+      # complete argument string; remaining entries are its parsed arguments.
+      # Only this exact direct definitions-loader child belongs to Quick's
+      # inventory work. A foreign/sibling loader or ordinary eLoot still conflicts.
+      next if name == 'eloot' && children.any? { |child| child.equal?(script) } &&
+              script.respond_to?(:vars) && script.vars == ['--load-room-api', '--load-room-api']
+      # Supervised refuge transit delegates to native go2. Only the exact
+      # direct child pinned by the active travel adapter shares this ownership;
+      # another go2, a stale child entry, or an unreadable predicate still fails
+      # the caller's local availability check. Names alone never grant transit.
+      next if name == 'go2' && children.any? { |child| child.equal?(script) } &&
+              instance.respond_to?(:quick_refuge_travel_child?) &&
+              instance.quick_refuge_travel_child?(script) == true
+      name unless name.empty?
+    end.uniq
+  end
+
+  def self.controlled_local_available?(run, action, check_room: true)
+    return false unless @running && @actions_enabled && !@snapshot_generation_rejected
+    return false unless action[:generation] == session_generation && action[:character].to_s.casecmp?(character_name)
+    return false unless @controlled_run_mutex.synchronize { @controlled_runs[run[:controller].name].equal?(run) }
+    instance = run[:instance]
+    return false unless instance && instance.running? && !instance.stopping?
+    return false unless instance.respond_to?(:quick_combat_runtime) && instance.quick_combat_runtime.equal?(run[:runtime])
+    return false if check_room && (action[:expected_room_id].to_s != room_fingerprint || !controlled_run_room_available?(run))
+    scripts = controlled_script_names(instance)
+    allowed = run[:controller].control_owner_scripts.map(&:downcase)
+    excluded = run[:controller].owner_scripts.map(&:downcase) - allowed
+    return false unless (scripts & excluded).empty?
+    owners = script_owners(scripts)
+    run[:controller].lanes.all? { |lane| allowed.include?(owners[lane.to_sym].to_s.downcase) }
+  rescue StandardError
+    false
+  end
+
+  def self.cooperatively_close_controlled_run(run)
+    run[:binding]&.close
+    runtime = run[:runtime]
+    if !runtime && run[:instance]&.respond_to?(:quick_combat_runtime)
+      runtime = run[:instance].quick_combat_runtime
+    end
+    return if !runtime || run[:stop_requested]
+    status = runtime.status
+    # Movement during admitted retreat may finish within the cleanup budget;
+    # revoked launch authority still requests stop, including during retreat.
+    return if run[:failure] != 'controller_authority_lost' && (status[:retreat_pending] || status[:reason].to_s == 'retreat_pending')
+    return if %w[completed stopped].include?(status[:state].to_s)
+    response = runtime.request('stop')
+    run[:stop_requested] = response.is_a?(Hash) && response[:accepted] == true
+  rescue StandardError
+    run[:failure] ||= 'cooperative_stop_unavailable'
+  end
+
+  # Read native state now, not a prior HTTP snapshot. Empty hands are known only
+  # when the native hand readers exist; unknown item identity is not restoration.
+  def self.controlled_refuge_hands!(run, expected_generation: run[:action][:generation])
+    state = snapshot_state
+    raise LabControllerControls::Invalid, 'current character does not match the controlled action' unless state[:character].to_s.casecmp?(run[:action][:character])
+    raise LabControllerControls::Invalid, 'current session generation does not match the controlled action' unless state[:generation] == session_generation && state[:generation] == expected_generation
+    raise LabControllerControls::Invalid, 'current room is not the configured Quick refuge' unless state.dig(:room, :id).to_s == run[:controller].safe_handoff['room_id'].to_i.to_s
+    raise LabControllerControls::Invalid, 'character must be alive before Quick starts' unless state[:dead] == false && state.dig(:vitals, :health, :current).to_f.positive?
+    raise LabControllerControls::Invalid, 'character must be unstunned before Quick starts' unless state[:stunned] == false
+    raise LabControllerControls::Invalid, 'character must be standing before Quick starts' unless XMLData.indicator['IconSTANDING'] == 'y'
+    raise LabControllerControls::Invalid, 'native hand readers are unavailable' unless GameObj.respond_to?(:right_hand) && GameObj.respond_to?(:left_hand)
+    hands = state[:hands]
+    raise LabControllerControls::Invalid, 'both hand identities must be known before Quick starts' unless hands.is_a?(Hash) && %i[right left].all? { |side| hands.key?(side) }
+    hands.transform_values do |item|
+      next nil if item.nil?
+      raise LabControllerControls::Invalid, 'held-item identity must be known before Quick starts' unless item.is_a?(Hash) && item[:id].to_s.match?(/\A[0-9]+\z/)
+      item[:id].to_s
+    end
+  end
+
+  def self.controlled_refuge_hands(run, expected_generation: run[:action][:generation])
+    controlled_refuge_hands!(run, expected_generation: expected_generation)
+  rescue StandardError
+    nil
+  end
+
+  def self.controlled_refuge_restored?(run, expected_generation: run[:action][:generation])
+    hands = controlled_refuge_hands(run, expected_generation: expected_generation)
+    hands && hands == run[:start_hands] && script_owners(live_scripts).values.compact.empty?
+  end
+
+  def self.unresolved_controlled_handoff?
+    runs = @controlled_run_mutex.synchronize { @controlled_runs.values.dup }
+    runs.any? do |previous|
+      next false unless previous[:unsafe_handoff]
+      restored = previous[:instance]&.join(0) && controlled_refuge_restored?(previous)
+      if restored
+        @controlled_run_mutex.synchronize do
+          @controlled_runs.delete(previous[:controller].name) if @controlled_runs[previous[:controller].name].equal?(previous)
+        end
+      end
+      !restored
+    end
+  end
+
+  # Local player acknowledgement, deliberately absent from broker capabilities.
+  # Retain the original run/result for audit and receipt retry until superseded.
+  # No movement, equipment commands, child cancellation or authority renewal.
+  def self.recover_controlled_handoff(action_id = nil, confirm: false)
+    @execution_mutex.synchronize do
+      runs = @controlled_run_mutex.synchronize { @controlled_runs.values.dup }
+      if action_id.nil?
+        pending = runs.select { |run| run[:unsafe_handoff] && run[:action][:character].to_s.casecmp?(character_name) }
+        display('no unresolved native Quick handoffs') if pending.empty?
+        pending.each do |run|
+          display("unresolved Quick #{run[:action][:action_id]}: refuge #{run[:controller].safe_handoff['room_id']}; after restoring equipment, use ;lab recover #{run[:action][:action_id]} confirm")
+        end
+        return
+      end
+      raise ArgumentError, 'use ;lab recover RUN_ID confirm' unless confirm == true && action_id.match?(/\A[0-9a-f]{16}\z/)
+      run = runs.find { |candidate| candidate[:action][:action_id] == action_id }
+      raise ArgumentError, 'no matching unresolved or acknowledged Quick run' unless run && (run[:unsafe_handoff] || run[:operator_recovered])
+      raise ArgumentError, 'recovery requires a Quick refuge run' unless run[:controller].safe_handoff['kind'] == 'quick_refuge'
+      raise ArgumentError, 'owned Quick child or monitor has not exited' unless run[:instance]&.join(0) && run[:monitor]&.join(0)
+      generation = session_generation
+      hands = controlled_refuge_hands(run, expected_generation: generation)
+      unless hands && hands == run[:start_hands] && script_owners(live_scripts).values.compact.empty?
+        raise ArgumentError, 'recovery requires the same character, configured refuge, standing survival, original hands and released owners'
+      end
+      publish_snapshot(force: true)
+      # A replacement LAB instance must not confirm a check begun by this one.
+      raise ArgumentError, 'session changed during recovery' unless generation == session_generation
+      receipt = { controller: run[:controller].name, action_id: action_id,
+                  previous_generation: run[:action][:generation], operator_confirmed: true,
+                  room_id: run[:controller].safe_handoff['room_id'].to_s, hands: hands }
+      unless publish_event('controller_recovery', 'Player verified safe recovery; original test result unchanged', receipt)
+        raise ArgumentError, 'recovery receipt was not acknowledged; lock retained, retry the same command'
+      end
+      unless controlled_refuge_restored?(run, expected_generation: generation)
+        raise ArgumentError, 'handoff changed during acknowledgement; lock retained'
+      end
+      @controlled_run_mutex.synchronize do
+        raise ArgumentError, 'run or session changed during recovery' unless @controlled_runs[run[:controller].name].equal?(run) && generation == session_generation
+        run[:unsafe_handoff] = false
+        run[:operator_recovered] = true
+      end
+      display("recovery acknowledged for #{action_id}; original test remains failed. LAB rechecks current state before another test.")
+    end
+  rescue StandardError => error
+    display("recovery refused: #{error.message}")
+  end
+
+  def self.request_controlled_return(run)
+    return if run[:return_requested] || !run[:lease]&.return_requested?
+    response = run[:runtime].request('stop', valid: -> { run[:lease].valid? })
+    raise LabControllerControls::Invalid, 'Quick refused authorized return' unless response.is_a?(Hash) && response[:accepted] == true
+    run[:return_requested] = true
+  end
+
+  def self.controlled_terminal_result(run, joined)
+    status = quick_runtime_status(run)
+    successful_exit = joined && run[:instance].completed_successfully? && !run[:instance].exit_error
+    reason = status[:reason].to_s
+    complete = status[:state].to_s == 'completed' || (status[:state].to_s == 'stopped' && %w[retreated already_at_refuge].include?(reason))
+    code = !joined ? 'cleanup_incomplete' : run[:failure] || (!successful_exit ? 'script_failed' : "quick_#{reason.empty? ? 'unverified' : reason}")
+    recovery = nil
+    if run[:controller]&.safe_handoff&.fetch('kind', nil) == 'quick_refuge'
+      work = status[:work_result]
+      complete = work.is_a?(Hash) && (work[:state].to_s == 'completed' ||
+        (work[:state].to_s == 'stopped' && %w[retreated already_at_refuge].include?(work[:reason].to_s)))
+      refuge = status[:refuge]
+      recovery = (joined && %w[completed stopped].include?(status[:state].to_s) && refuge.is_a?(Hash) && refuge[:room_id] == run[:controller].safe_handoff['room_id'].to_i &&
+        refuge[:phase].to_s == 'finished' && refuge[:returned] == true && refuge[:equipment_restored] == true &&
+        controlled_refuge_restored?(run)) == true
+      run[:unsafe_handoff] = recovery != true
+      code = 'unsafe_handoff' unless recovery
+    end
+    { ok: successful_exit && complete && !run[:failure], code: code.to_s[0, 128],
+      message: "Quick runtime ended: #{code}. Game effects and safe handoff require separate evidence."[0, 500],
+      details: { run_id: run[:action][:action_id], runtime: status, cleanup_complete: joined,
+                 effects_verified: false, recovery_complete: recovery } }.tap { |result| result[:ok] = false if recovery == false }
+  rescue StandardError
+    run[:unsafe_handoff] = true if run[:controller]&.safe_handoff&.fetch('kind', nil) == 'quick_refuge'
+    { ok: false, code: 'malformed_runtime_result', message: 'Quick runtime result unavailable.', details: { cleanup_complete: joined } }
+  end
+
+  def self.monitor_controlled_run(run, cleanup_timeout: 3)
+    Thread.new do
+      cleanup_deadline = nil
+      loop do
+        break if run[:instance].join(0)
+        terminal = quick_runtime_terminal?(run)
+        if run[:failure] || terminal || !run[:instance].running?
+          run[:binding]&.close
+        elsif !run[:lease]&.refresh
+          # Refresh includes local child liveness. The owner may have published
+          # its terminal result and exited during the authority request. Close
+          # admission, but do not replace that result with a false revocation.
+          terminal = quick_runtime_terminal?(run)
+          run[:binding]&.close
+          run[:failure] = 'controller_authority_lost' unless terminal
+        elsif !controlled_monitor_room_available?(run)
+          state = quick_runtime_status(run)
+          # An explicitly admitted retreat retains its separate refuge authority;
+          # controls close while cleanup runs, without claiming an area handoff.
+          unless state[:retreat_pending] || state[:reason].to_s == 'retreat_pending'
+            run[:failure] = run[:controller].safe_handoff['kind'] == 'quick_area' ? 'controller_area_unverified' : 'controller_room_changed'
+          end
+          run[:binding]&.close
+        else
+          run[:binding].refresh
+          request_controlled_return(run)
+        end
+        if run[:failure] || terminal || !run[:binding]&.open?
+          cooperatively_close_controlled_run(run) if run[:failure]
+          cleanup_deadline ||= Process.clock_gettime(Process::CLOCK_MONOTONIC) + cleanup_timeout
+          break if Process.clock_gettime(Process::CLOCK_MONOTONIC) >= cleanup_deadline
+        end
+        sleep 0.05
+      end
+      run[:binding]&.close
+      joined = !!run[:instance].join(0)
+      result = controlled_terminal_result(run, joined)
+      run[:result] = result
+      display('Quick test ended without verified refuge/equipment handoff. Resolve it before another agent test.') if run[:unsafe_handoff]
+      # Do not relabel an old run's evidence as a replacement session.
+      if run[:action][:generation] == session_generation && run[:action][:character].to_s.casecmp?(character_name)
+        set_script_status(run[:controller].script, "#{result[:code]}:#{run[:action][:action_id]}")
+        publish_snapshot(force: true)
+        publish_controller_result(run[:controller], run[:action][:action_id], result)
+      end
+    rescue StandardError => error
+      run[:failure] ||= 'controller_monitor_failed'
+      run[:unsafe_handoff] = true if run[:controller].safe_handoff['kind'] == 'quick_refuge'
+      cooperatively_close_controlled_run(run)
+      run[:result] = { ok: false, code: 'controller_monitor_failed',
+        message: 'Quick supervision failed; safe handoff remains unverified.',
+        details: { run_id: run[:action][:action_id], recovery_complete: false, effects_verified: false } }
+      display('Quick supervisor failed; refuge/equipment handoff is unresolved. Do not start another agent test.') if run[:unsafe_handoff]
+      if run[:action][:generation] == session_generation && run[:action][:character].to_s.casecmp?(character_name)
+        publish_controller_result(run[:controller], run[:action][:action_id], run[:result])
+      end
+      Lich.log("lab controlled monitor failed: #{error.class}") if defined?(Lich)
+    ensure
+      run[:binding]&.close
+      # A missing/incomplete join retains exclusion; never release by name.
+      if run[:instance]&.join(0) && !run[:unsafe_handoff]
+        @controlled_run_mutex.synchronize { @controlled_runs.delete(run[:controller].name) if @controlled_runs[run[:controller].name].equal?(run) }
+      end
+    end
+  end
+
+  # Inspect the trusted local script selected by Lich before spawning it. This
+  # compatibility declaration prevents historical permissive Quick parsers from
+  # ignoring our private selector; it is not a sandbox or hostile-code proof.
+  def self.supervised_quick_supported?(script)
+    return false unless Script.respond_to?(:__find_script_file, true)
+    relative = Script.__send__(:__find_script_file, script)
+    root = defined?(SCRIPT_DIR) ? SCRIPT_DIR : $script_dir
+    return false unless relative.is_a?(String) && root.is_a?(String)
+    markers = File.foreach(File.join(root, relative)).filter_map do |line|
+      line[/\A    (SUPERVISED_START_PROTOCOL|REFUGE_START_PROTOCOL) = 1\r?\n?\z/, 1]
+    end
+    %w[SUPERVISED_START_PROTOCOL REFUGE_START_PROTOCOL].all? { |marker| markers.include?(marker) }
+  rescue SystemCallError, IOError
+    false
+  end
+
+  def self.launch_controlled_controller(action, match, startup_timeout: 3)
+    controller = match.controller
+    run = { controller: controller, action: action.transform_values { |value| value.is_a?(String) ? value.dup.freeze : value }.freeze,
+      spawn_attempted: false, preflight_receipt_allowed: false }
+    unless controller.safe_handoff['kind'] == 'quick_refuge'
+      raise LabControllerControls::Invalid, 'agent Quick requires quick_refuge safe start/return configuration; migrate the old handoff registration'
+    end
+    raise LabControllerControls::Invalid, 'previous Quick has unresolved unsafe handoff' if unresolved_controlled_handoff?
+    run[:preflight_receipt_allowed] = true
+    deadline = action[:controller_deadline]
+    raise LabControllerControls::Invalid, 'controlled launch requires an operation deadline within 300 seconds' unless deadline.is_a?(Numeric) && deadline.finite? && (deadline - Time.now.to_f).between?(0.001, 300)
+    raise LabControllerControls::Invalid, 'controlled launch requires exact current session and room' unless
+      action[:generation] == session_generation && action[:expected_room_id].to_s == room_fingerprint && room_fingerprint != 'unknown'
+    raise LabControllerControls::Invalid, 'native child lifecycle unavailable' unless Script.respond_to?(:start_child) && Script.current
+    unless supervised_quick_supported?(controller.script) && !match.script_args.include?('--supervised-')
+      raise LabControllerControls::Invalid, 'controlled launch requires supervised Quick startup and refuge protocols v1'
+    end
+    observed = controlled_action_authority(action.fetch(:action_id))
+    raise LabControllerControls::Invalid, 'controlled launch was revoked or replaced' unless
+      %i[action_id character generation command expected_room_id controller_deadline].all? { |key| observed[key] == action[key] } &&
+      observed[:status] == 'dispatched' && observed[:stop_requested] == false && observed[:return_requested] == false
+    # Fix both restrictions before the child can execute, not after publication.
+    monotonic_deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + (deadline - Time.now.to_f)
+    reserve = controller.safe_handoff['return_seconds']
+    work_deadline, cleanup_deadline = monotonic_deadline - reserve - 12, monotonic_deadline - reserve - 2
+    raise LabControllerControls::Invalid, 'insufficient time for controlled startup' unless work_deadline > Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    window = format('%.9f,%.9f', work_deadline, cleanup_deadline)
+    arguments = "#{match.script_args} --supervised-start-v1 #{window} --supervised-refuge-v1 #{controller.safe_handoff['room_id'].to_i},#{format('%.9f', monotonic_deadline - 2)}"
+    run[:start_hands] = controlled_refuge_hands!(run)
+    @controlled_run_mutex.synchronize do
+      previous = @controlled_runs[controller.name]
+      if previous && (!previous[:instance] || !previous[:instance].join(0))
+        run[:preflight_receipt_allowed] = false
+        raise LabControllerControls::Invalid, 'previous controlled child cleanup is incomplete'
+      end
+      @controlled_runs[controller.name] = run
+    end
+    run[:spawn_attempted] = true
+    instance = Script.start_child(controller.script, arguments, { quiet: true })
+    raise LabControllerControls::Invalid, 'controlled child did not start' unless instance
+    run[:instance] = instance
+    raise LabControllerControls::Invalid, 'native child lifecycle unavailable' unless %i[join running? stopping? completed_successfully? exit_error].all? { |name| instance.respond_to?(name) }
+    startup_deadline = [Time.now.to_f + startup_timeout, deadline].min
+    loop do
+      run[:runtime] = instance.quick_combat_runtime if instance.respond_to?(:quick_combat_runtime)
+      break if run[:runtime]
+      if instance.respond_to?(:quick_combat_result)
+        run[:terminal_status] = instance.quick_combat_result
+        break if quick_runtime_terminal?(run)
+      end
+      raise LabControllerControls::Invalid, 'Quick runtime publication was not observed' if instance.join(0) || Time.now.to_f >= startup_deadline
+      sleep 0.01
+    end
+    raise LabControllerControls::Invalid, 'Quick exited before supervised activation' unless run[:runtime]
+    run[:lease] = LabControllerControls::Lease.new(action: run[:action], deadline: deadline,
+      available: ->(request) { controlled_local_available?(run, request, check_room: false) },
+      authority: method(:controlled_action_authority), clock: -> { Time.now.to_f })
+    run[:binding] = LabControllerControls::Binding.new(controller: controller, launch: run[:action], instance: instance,
+      available: ->(request) { run[:lease].valid? && controlled_local_available?(run, request) },
+      authority: method(:controlled_action_authority))
+    run[:binding].bind(instance, run[:runtime])
+    raise LabControllerControls::Invalid, 'controlled launch authority unavailable' unless run[:lease].refresh
+    run[:monitor] = monitor_controlled_run(run)
+    unless run[:runtime].respond_to?(:activate_supervised) &&
+           run[:runtime].activate_supervised(valid: -> { run[:lease].valid? })
+      raise LabControllerControls::Invalid, 'Quick runtime refused supervised activation'
+    end
+    set_script_status(controller.script, "starting:#{action[:action_id]}")
+    publish_snapshot(force: true)
+    report_action(action, 'completed', 'Exact Quick child and runtime bound; terminal result remains unverified.')
+    run
+  rescue StandardError => error
+    if run
+      run[:failure] = 'controlled_startup_failed'
+      # A child which has not advertised its runtime cannot consume cooperative
+      # controls. Native lifecycle cancellation sets stopping? synchronously;
+      # compatible Quick startup/guards refuse that exact owner before sending.
+      # Never stop a successor by script name, and never call this extraction.
+      if run[:instance] && !run[:runtime] && run[:instance].respond_to?(:kill)
+        run[:instance].kill(async: true)
+        run[:failure] = 'forced_startup_cancelled'
+      end
+      cooperatively_close_controlled_run(run)
+      run[:monitor] ||= monitor_controlled_run(run) if run[:instance]&.respond_to?(:join)
+      @controlled_run_mutex.synchronize { @controlled_runs.delete(controller.name) if @controlled_runs[controller.name].equal?(run) && !run[:instance] }
+      if run[:preflight_receipt_allowed] && !run[:spawn_attempted]
+        result = { ok: false, code: 'controlled_start_rejected',
+          message: "Controlled startup rejected before child launch: #{error.class}: #{error.message}",
+          details: { run_id: action.fetch(:action_id), child_started: false,
+            cleanup_complete: true, effects_verified: false } }
+        begin
+          set_script_status(controller.script, "controlled_start_rejected:#{action.fetch(:action_id)}")
+          publish_snapshot(force: true)
+          publish_controller_result(controller, action.fetch(:action_id), result)
+        rescue StandardError => publish_error
+          Lich.log("lab controlled preflight result failed: #{publish_error.class}") if defined?(Lich)
+        end
+      end
+    end
+    report_action(action, 'failed', "Controlled startup failed: #{error.class}: #{error.message}")
+    nil
+  end
+
+  def self.execute_controlled_action(action, match)
+    raise LabControllerControls::Invalid, 'agent Quick controls require quick_refuge configuration' unless match.controller.safe_handoff['kind'] == 'quick_refuge'
+    run = @controlled_run_mutex.synchronize { @controlled_runs[match.controller.name] }
+    raise LabControllerControls::Invalid, 'no exact Quick runtime is bound' unless run && run[:binding]
+    result = run[:binding].request(action: action, match: match)
+    result[:details][:status] = quick_status_payload(result[:details][:status])
+    publish_controller_result(match.controller, action.fetch(:action_id), result)
+    report_action(action, 'sent_unverified', result[:message])
+  rescue StandardError => error
+    report_action(action, 'failed', "Control rejected: #{error.class}: #{error.message}")
+  end
+
   def self.execute_controller_action(broker_action, match)
     controller = match.controller
     controller_action = match.action
@@ -1654,7 +2165,14 @@ module LichAgentBridge
     end
 
     case controller_action.kind
+    when 'control'
+      execute_controlled_action(broker_action, match)
     when 'launch'
+      if controller.script == 'bigshot' && match.script_args.split.first.to_s.casecmp?('quick') &&
+          (controller.control_owner_scripts.empty? || controller.safe_handoff['kind'] != 'quick_refuge')
+        report_action(broker_action, 'failed', 'Agent Bigshot Quick requires native controls and quick_refuge safe start/return configuration.')
+        return
+      end
       owners = controller.owner_scripts.select { |name| Script.running?(name) }
       unless owners.empty?
         report_action(
@@ -1662,6 +2180,10 @@ module LichAgentBridge
           'failed',
           "another controller owner is already running: #{owners.join(', ')}"
         )
+        return
+      end
+      unless controller.control_owner_scripts.empty?
+        launch_controlled_controller(broker_action, match)
         return
       end
       clear_controller_result(controller)
@@ -1871,6 +2393,87 @@ module LichAgentBridge
     raise
   end
 
+  # One trusted native go2 child, not a pathfinder or arbitrary script runner.
+  # The native guard is installed before startup and remains active in cleanup.
+  def self.execute_go2(action, destination)
+    child = nil
+    closed = false
+    launching = false
+    unless destination.match?(/\A[1-9][0-9]{0,9}\z/) && destination != '4' && Map[destination.to_i]
+      raise ArgumentError, 'go2 requires an explicit mapped destination'
+    end
+    unless Script.const_defined?(:START_EXECUTION_GUARD_PROTOCOL) && Script::START_EXECUTION_GUARD_PROTOCOL == 1 &&
+           Script.const_defined?(:SCRIPT_START_RESTRICTION_PROTOCOL) && Script::SCRIPT_START_RESTRICTION_PROTOCOL == 1
+      raise ArgumentError, 'go2 requires native guarded child startup'
+    end
+    relative = Script.__send__(:__find_script_file, 'go2')
+    root = defined?(SCRIPT_DIR) ? SCRIPT_DIR : $script_dir
+    unless relative.is_a?(String) && root.is_a?(String) && File.read(File.join(root, relative)).include?('--preserve-scripts')
+      raise ArgumentError, 'go2 requires the one-trip preserve-scripts option'
+    end
+    prefix = $cmd_prefix
+    raise ArgumentError, 'game command prefix unavailable' unless prefix.is_a?(String)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + [action.fetch(:expires_at) - Time.now.to_f, 120].min
+    owner = Script.current
+    hands = -> { [GameObj.right_hand&.id&.to_s, GameObj.left_hand&.id&.to_s] }
+    original_hands = hands.call
+    available = lambda do |_request|
+      next false if closed || !@running || !@actions_enabled || @snapshot_generation_rejected || owner.stopping?
+      next false unless action[:generation] == session_generation && action[:character].to_s.casecmp?(character_name)
+      next false unless Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline && hands.call == original_hands
+      next false unless XMLData.indicator['IconDEAD'] == 'n' && XMLData.indicator['IconSTUNNED'] == 'n'
+      scripts = (Array(Script.running) + Array(Script.hidden)).uniq
+      scripts = scripts.reject { |candidate| child && candidate.equal?(child) && owner.child_scripts.any? { |owned| owned.equal?(child) } }
+      names = scripts.map { |script| script.name.to_s }
+      owners = script_owners(names)
+      %i[movement combat inventory].all? { |lane| owners[lane].nil? }
+    end
+    lease = LabControllerControls::Lease.new(action: action, available: available,
+      authority: method(:controlled_action_authority), clock: -> { Time.now.to_f })
+    raise ArgumentError, 'go2 authority or ownership unavailable' unless lease.refresh
+    sends = 0
+    lock = Mutex.new
+    command_pattern = /\A(?:(?:n|ne|e|se|s|sw|w|nw|u|d|o|north|northeast|east|southeast|south|southwest|west|northwest|up|down|out|stand|unhide|look)|(?:go|climb|swim|crawl|jump|open|close) [a-z0-9][a-z0-9 '\-]*)\z/i
+    guard = lambda do |wire|
+      sleep 0.001 while launching && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
+      lock.synchronize do
+        next false unless child && lease.valid?
+        if wire
+          command = wire.delete_prefix(prefix) if wire.is_a?(String) && wire.start_with?(prefix)
+          next false unless command && command_pattern.match?(command) && room_fingerprint != 'unknown' && sends < 256
+          sends += 1
+        end
+        true
+      end
+    end
+    launching = true
+    child = Script.start_child('go2', "#{destination} --disable-confirm --typeahead=0 --get-silvers=off --stop-for-dead=off --preserve-scripts",
+                               {quiet: true, execution_guard: guard, allow_script_starts: false})
+    launching = false
+    raise ArgumentError, 'go2 native child startup failed' unless child && owner.child_scripts.any? { |owned| owned.equal?(child) }
+    until child.join(0)
+      raise ArgumentError, 'go2 authority, deadline or ownership lost' unless lease.refresh
+      sleep 0.05
+    end
+    unless child.completed_successfully? && lease.valid? && room_fingerprint == destination && hands.call == original_hands &&
+           XMLData.indicator['IconSTANDING'] == 'y'
+      raise ArgumentError, 'go2 arrival, survival or equipment handoff unverified'
+    end
+    set_script_status('go2', "completed:#{action.fetch(:action_id)}")
+    publish_snapshot(force: true)
+    report_action(action, 'completed', "go2 destination arrival and exact child exit verified (#{sends} sends)")
+  rescue StandardError => error
+    set_script_status('go2', "failed:#{action.fetch(:action_id)}")
+    report_action(action, 'failed', "go2 travel failed: #{error.message}")
+  ensure
+    launching, closed = false, true
+    lease&.revoke
+    if child && !child.join(0) && !child.kill_sync(timeout: 2)
+      display('go2 cleanup incomplete; do not start another operation until its owner has exited.')
+    end
+    publish_snapshot(force: true)
+  end
+
   def self.execute_action(action)
     @execution_mutex.synchronize do
       commands = action_commands(action)
@@ -1927,6 +2530,9 @@ module LichAgentBridge
         return
       elsif (exact_examination = command.match(/\A(look|inspect) #([0-9]+)\z/i))
         examine_exact_id(action, exact_examination[1].downcase, exact_examination[2])
+        return
+      elsif (go2_match = command.match(/\Ago2 supervised ([1-9][0-9]{0,9})\z/i))
+        execute_go2(action, go2_match[1])
         return
       elsif (go2_match = command.match(/\Ago2 ([0-9]+)\z/i))
         destination = go2_match[1]
@@ -2060,6 +2666,7 @@ module LichAgentBridge
     case request.downcase
     when '', 'help'
       display('usage: , QUESTION | ;lab status|state|scripts|inventory|last|alerts|sources|context|forget | ;lab do item audit #ID | ;lab do hunt prepare | ;lab do room loot | ;lab operation stop | ;lab actions on|off | ;lab approve [ID] | ;lab approve auto [off] | ;lab stop')
+      display('recovery: ;lab recover lists failed Quick runs; ;lab recover RUN_ID confirm verifies one safe handoff without changing its test result')
     when 'status'
       run_command_async { status }
     when 'state'
@@ -2095,6 +2702,11 @@ module LichAgentBridge
       end
     when 'operation stop'
       run_command_async { stop_capability }
+    when 'recover'
+      run_command_async { recover_controlled_handoff }
+    when /\Arecover ([0-9a-f]{16}) confirm\z/
+      action_id = Regexp.last_match(1)
+      run_command_async { recover_controlled_handoff(action_id, confirm: true) }
     when 'actions on'
       run_command_async { set_actions(true) }
     when 'actions off'

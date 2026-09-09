@@ -43,6 +43,21 @@ class ScriptTestCliTests(unittest.TestCase):
             "character": "Testmage", "operation_id": "op-test",
             "expected_generation": "generation-test"})
 
+    def test_outing_budget_is_forwarded_separately_from_watch_timeout(self):
+        with patch.object(labctl, "_token", return_value="test-token"), \
+                patch.object(labctl, "_post", return_value={"operation_id": "op-test"}) as post, \
+                redirect_stdout(io.StringIO()):
+            labctl.main(["perform", "Testmage", "controller.quick", "--expected-generation", "generation-test",
+                         "--operation-timeout", "90", "--timeout", "0"])
+        self.assertEqual(post.call_args.args[1]["timeout_seconds"], 90)
+
+    def test_invalid_outing_budget_does_not_reach_transport(self):
+        with patch.object(labctl, "_token", return_value="test-token"), patch.object(labctl, "_post") as post:
+            for value in ("0", "-1", "301", "inf", "nan"):
+                with self.subTest(value=value), self.assertRaises(SystemExit):
+                    labctl.main(["perform", "Testmage", "controller.quick", "--operation-timeout", value])
+        post.assert_not_called()
+
     def test_partial_stop_identity_fails_before_transport(self):
         with patch.object(labctl, "_post") as post, redirect_stdout(io.StringIO()):
             with self.assertRaises(SystemExit):

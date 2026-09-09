@@ -31,7 +31,8 @@ export class SessionHubClient implements SessionHubCaller {
   async call(routeName: SessionHubRoute, payload: Record<string, unknown>, metadata: BridgeMetadata = {}): Promise<unknown> {
     const result = await this.callOnce(routeName, payload, metadata);
     if (routeName !== 'perform') return result;
-    return this.waitForOperation(result, metadata);
+    const timeoutSeconds = typeof payload.timeout_seconds === 'number' ? payload.timeout_seconds : 30;
+    return this.waitForOperation(result, metadata, timeoutSeconds);
   }
 
   private async callOnce(routeName: SessionHubRoute, payload: Record<string, unknown>, metadata: BridgeMetadata = {}): Promise<unknown> {
@@ -80,7 +81,7 @@ export class SessionHubClient implements SessionHubCaller {
     return body;
   }
 
-  private async waitForOperation(started: unknown, metadata: BridgeMetadata): Promise<unknown> {
+  private async waitForOperation(started: unknown, metadata: BridgeMetadata, timeoutSeconds: number): Promise<unknown> {
     if (!started || typeof started !== 'object') {
       throw new SessionHubError('SessionHub perform returned an invalid operation', 0, 'invalid_operation', started);
     }
@@ -91,7 +92,7 @@ export class SessionHubClient implements SessionHubCaller {
     }
     const terminal = new Set(['succeeded', 'failed', 'timed_out', 'interrupted']);
     let cursor = '0';
-    const deadline = Date.now() + 35_000;
+    const deadline = Date.now() + (timeoutSeconds + 5) * 1_000;
     while (!terminal.has(String(operation.status))) {
       const remaining = deadline - Date.now();
       if (remaining <= 0) {

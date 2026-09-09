@@ -5,6 +5,79 @@ require 'tempfile'
 load File.expand_path('../lich/lab-controller-registry.rb', __dir__)
 
 class LabControllerRegistryTest < Minitest::Test
+  def test_quick_refuge_requires_exact_room_return_budget_and_native_area_contract
+    raw = JSON.parse(File.read(File.expand_path('fixtures/controller-controls.json', __dir__)))['controllers'].first
+    raw.merge!('script' => 'bigshot', 'control_owner_scripts' => ['bigshot'],
+      'safe_handoff' => { 'kind' => 'quick_refuge', 'room_id' => '1000', 'return_seconds' => 30 })
+    raw['actions'].first['script_args_template'] = 'quick seek --area profile'
+    assert LabControllerRegistry::Controller.new(raw, 'test')
+    changes = [
+      ->(c) { c['safe_handoff'].delete('return_seconds') },
+      ->(c) { c['safe_handoff']['return_seconds'] = 9 },
+      ->(c) { c['safe_handoff']['return_seconds'] = 121 },
+      ->(c) { c['safe_handoff']['return_seconds'] = '30' },
+      ->(c) { c['safe_handoff']['room_id'] = 0 },
+      ->(c) { c['safe_handoff']['room_id'] = '4' },
+      ->(c) { c['safe_handoff']['room_id'] = 1.5 },
+      ->(c) { c['safe_handoff']['rooms'] = {} },
+      ->(c) { c['lanes'] = ['combat'] },
+      ->(c) { c['script'] = 'lab-test-quick' },
+      ->(c) { c['actions'].first['script_args_template'] = 'quick clear' },
+      ->(c) { c['actions'].first['script_args_template'] = 'quick seek --area profile --supervised-refuge-v1 1,2' }
+    ]
+    changes.each do |change|
+      invalid = JSON.parse(JSON.generate(raw))
+      change.call(invalid)
+      assert_raises(LabControllerRegistry::ManifestError) { LabControllerRegistry::Controller.new(invalid, 'test') }
+    end
+  end
+
+  def test_seek_requires_profile_area_and_both_movement_and_combat_lanes
+    %w[seek SEEK {mode}].each do |mode|
+      raw = JSON.parse(File.read(File.expand_path('fixtures/controller-controls.json', __dir__)))['controllers'].first
+      raw.merge!('script' => 'bigshot', 'safe_handoff' => { 'kind' => 'quick_area' }, 'control_owner_scripts' => ['bigshot'])
+      launch = raw['actions'].first
+      launch.merge!('script_args_template' => "quick #{mode} --area profile", 'command_template' => "bigshot quick #{mode} --area profile")
+      launch['parameters'] = [{ 'name' => 'mode', 'type' => 'enum', 'values' => %w[clear seek] }] if mode == '{mode}'
+      assert LabControllerRegistry::Controller.new(raw, 'test')
+      [->(c) { c['lanes'] = ['combat'] }, ->(c) { c['lanes'] = ['movement'] },
+       ->(c) { c['safe_handoff'] = { 'kind' => 'room', 'room_id' => '1000' } }].each do |change|
+        changed = JSON.parse(JSON.generate(raw))
+        change.call(changed)
+        assert_raises(LabControllerRegistry::ManifestError) { LabControllerRegistry::Controller.new(changed, 'test') }
+      end
+    end
+  end
+
+  def test_quick_area_requires_native_controlled_explicit_profile_launch_without_room_lists
+    raw = JSON.parse(File.read(File.expand_path('fixtures/controller-controls.json', __dir__)))['controllers'].first
+    raw['script'] = 'bigshot'
+    raw['safe_handoff'] = { 'kind' => 'quick_area' }
+    raw['control_owner_scripts'] = ['bigshot']
+    raw['actions'].first['script_args_template'] = 'quick watch --area profile'
+    assert_equal 'quick_area', LabControllerRegistry::Controller.new(raw, 'test').safe_handoff['kind']
+    mutations = [
+      ->(c) { c['script'] = 'lab-test-quick' },
+      ->(c) { c['control_owner_scripts'] = [] },
+      ->(c) { c['safe_handoff']['rooms'] = { 'test' => '1000' } },
+      ->(c) { c['actions'].first['script_args_template'] = 'quick use reviewed' },
+      ->(c) { c['actions'].first['script_args_template'] = 'quick watch --area off' },
+      ->(c) { c['actions'].first['script_args_template'] = 'quick watch --area profile --area off' },
+      ->(c) { c['actions'].first['script_args_template'] = 'quick watch --area=profile' },
+      ->(c) { c['actions'].first['script_args_template'] = 'quick watch -- --area profile' },
+      lambda { |c|
+        c['actions'].first.merge!('command_template' => 'lab-test-quick start{extra}',
+          'script_args_template' => 'quick watch --area profile {extra}',
+          'parameters' => [{ 'name' => 'extra', 'type' => 'flag_suffix', 'true_value' => ' --area off' }])
+      }
+    ]
+    mutations.each do |mutation|
+      changed = JSON.parse(JSON.generate(raw))
+      mutation.call(changed)
+      assert_raises(LabControllerRegistry::ManifestError) { LabControllerRegistry::Controller.new(changed, 'test') }
+    end
+  end
+
   def test_test_registration_rejects_changed_command_policy_and_metadata
     raw = {
       'name' => 'test-probe', 'script' => 'lab-test-runner', 'summary' => 'Synthetic lifecycle test.',
