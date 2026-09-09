@@ -495,7 +495,7 @@ class LabBridgeTest < Minitest::Test
   end
 
   def test_area_watch_and_assist_follow_player_with_each_control_still_room_pinned
-    %w[watch assist].each do |mode|
+    %w[watch assist seek].each do |mode|
       with_controlled_quick(area: true) do |fixture|
         LichAgentBridge.execute_action(fixture[:action])
         run = LichAgentBridge.instance_variable_get(:@controlled_runs)['quick']

@@ -82,9 +82,27 @@ class QuickAreaTests(unittest.TestCase):
                 load_manifest(raw)
 
     def test_watch_assist_handoff_uses_terminal_membership_without_room_traversal(self):
-        for mode in ("watch", "assist"):
+        for mode in ("watch", "assist", "seek"):
             self.facts["details"]["runtime"]["mode"] = mode
             self.handoff()
+
+    def test_seek_registration_requires_explicit_area_and_movement_ownership(self):
+        for mode in ("seek", "SEEK", "{mode}"):
+            raw = area_manifest_raw()
+            controller = raw["controllers"][0]
+            launch = controller["actions"][0]
+            launch.update(script_args_template=f"quick {mode} --area profile",
+                          command_template=f"bigshot quick {mode} --area profile")
+            if mode == "{mode}":
+                launch["parameters"] = [{"name": "mode", "type": "enum", "values": ["clear", "seek"]}]
+            self.assertIsNotNone(load_manifest(raw))
+            for change in (lambda c: c.update(lanes=["combat"]),
+                           lambda c: c.update(lanes=["movement"]),
+                           lambda c: c.update(safe_handoff={"kind": "room", "room_id": "1000"})):
+                changed = deepcopy(raw)
+                change(changed["controllers"][0])
+                with self.subTest(mode=mode), self.assertRaisesRegex(ConfigurationError, "seek requires"):
+                    load_manifest(changed)
 
     def test_clear_trial_cannot_handoff_after_movement(self):
         for mode in ("clear", "trial"):
@@ -130,6 +148,25 @@ class QuickAreaTests(unittest.TestCase):
             setattr(self.state, field, old)
 
     def test_actual_runner_returns_bounded_field_result_after_correlated_evidence(self):
+        self.assert_runner_field_handoff()
+
+    def test_actual_seek_runner_hands_off_in_arrival_room_not_launch_room(self):
+        raw = area_manifest_raw()
+        raw["controllers"][0]["actions"][0].update(
+            command_template="bigshot quick seek --area profile",
+            script_args_template="quick seek --area profile")
+        self.manifest = load_manifest(raw)
+        self.controller = self.manifest.controller("quick")
+        self.facts["details"]["runtime"]["mode"] = "seek"
+        self.assert_runner_field_handoff()
+
+    def test_shipped_seek_example_is_opt_in_and_uses_a_finite_preset_enum(self):
+        manifest = ControllerManifest.load(Path(__file__).parents[1] / "examples/controllers/bigshot-quick-seek.json")
+        controller = manifest.controller("quick-seek")
+        self.assertEqual(controller.safe_handoff, {"kind": "quick_area"})
+        self.assertEqual(set(controller.lanes), {"movement", "combat", "inventory"})
+
+    def assert_runner_field_handoff(self):
         clock, evidence = FakeClock(), FakeEvidence()
         self.state.room_id = "1000"
         broker = ActionBroker(policy=CommandPolicy(self.manifest), clock=clock)

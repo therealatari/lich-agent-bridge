@@ -1161,7 +1161,7 @@ class CapabilityRunner:
             if (evidence is None or details.get("run_id") != evidence.action_id
                     or details.get("cleanup_complete") is not True
                     or not isinstance(runtime, Mapping) or runtime.get("state") not in {"completed", "stopped"}
-                    or runtime.get("mode") not in {"watch", "assist", "clear", "trial"}
+                    or runtime.get("mode") not in {"watch", "assist", "seek", "clear", "trial"}
                     or not isinstance(area, Mapping) or area.get("kind") != "profile"
                     or area.get("in_bounds") is not True
                     or type(area.get("room_id")) is not int or str(area["room_id"]) != snapshot.room_id

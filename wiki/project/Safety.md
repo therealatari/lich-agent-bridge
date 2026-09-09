@@ -93,7 +93,9 @@ The explicit native Bigshot `quick_area` registration is a bounded field-handoff
 contract, separately chosen by the player. It requires the exact child's
 correlated terminal profile-area proof matching fresh room state, alive and
 unstunned survival, completed cleanup, and released ownership. It does not
-claim safe-town arrival or authorize wandering. Ordinary area exit stops the
+claim safe-town arrival or implicitly authorize wandering. A separately reviewed
+`quick seek --area profile` registration grants only a bounded local search for
+one encounter, with movement/combat ownership and native per-send guards. Ordinary area exit stops the
 operation; an already admitted retreat retains its separate refuge authority.
 See [controller controls](Controller-Controls.md#optional-profile-area-field-handoff).
 

@@ -5,6 +5,23 @@ require 'tempfile'
 load File.expand_path('../lich/lab-controller-registry.rb', __dir__)
 
 class LabControllerRegistryTest < Minitest::Test
+  def test_seek_requires_profile_area_and_both_movement_and_combat_lanes
+    %w[seek SEEK {mode}].each do |mode|
+      raw = JSON.parse(File.read(File.expand_path('fixtures/controller-controls.json', __dir__)))['controllers'].first
+      raw.merge!('script' => 'bigshot', 'safe_handoff' => { 'kind' => 'quick_area' }, 'control_owner_scripts' => ['bigshot'])
+      launch = raw['actions'].first
+      launch.merge!('script_args_template' => "quick #{mode} --area profile", 'command_template' => "bigshot quick #{mode} --area profile")
+      launch['parameters'] = [{ 'name' => 'mode', 'type' => 'enum', 'values' => %w[clear seek] }] if mode == '{mode}'
+      assert LabControllerRegistry::Controller.new(raw, 'test')
+      [->(c) { c['lanes'] = ['combat'] }, ->(c) { c['lanes'] = ['movement'] },
+       ->(c) { c['safe_handoff'] = { 'kind' => 'room', 'room_id' => '1000' } }].each do |change|
+        changed = JSON.parse(JSON.generate(raw))
+        change.call(changed)
+        assert_raises(LabControllerRegistry::ManifestError) { LabControllerRegistry::Controller.new(changed, 'test') }
+      end
+    end
+  end
+
   def test_quick_area_requires_native_controlled_explicit_profile_launch_without_room_lists
     raw = JSON.parse(File.read(File.expand_path('fixtures/controller-controls.json', __dir__)))['controllers'].first
     raw['script'] = 'bigshot'

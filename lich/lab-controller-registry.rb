@@ -255,6 +255,16 @@ module LabControllerRegistry
       elsif !@control_owner_scripts.empty?
         raise ManifestError, "#{context}.control_owner_scripts requires registered controls"
       end
+      @actions.select { |item| item.kind == 'launch' }.each do |launch|
+        tokens = launch.script_args_template.split
+        mode = tokens.first.to_s.downcase == 'quick' ? tokens[1].to_s : ''
+        may_seek = mode.downcase == 'seek' || launch.parameters.any? do |parameter|
+          mode == "{#{parameter.name}}" && parameter.values.map(&:downcase).include?('seek')
+        end
+        if @script == 'bigshot' && may_seek && (@safe_handoff['kind'] != 'quick_area' || !(%w[movement combat] - @lanes).empty?)
+          raise ManifestError, "#{context}.seek requires quick_area and movement/combat lanes"
+        end
+      end
       if @safe_handoff['kind'] == 'quick_area'
         launches = @actions.select { |item| item.kind == 'launch' }
         unless @safe_handoff.keys == ['kind'] && @script == 'bigshot' && !@control_owner_scripts.empty? && !launches.empty?

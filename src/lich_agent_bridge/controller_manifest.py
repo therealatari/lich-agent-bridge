@@ -526,6 +526,15 @@ def _controller_from_mapping(raw: Any, label: str) -> ControllerDefinition:
             raise ConfigurationError(f"{label} requires explicit control_owner_scripts within owner_scripts")
     elif control_owners:
         raise ConfigurationError(f"{label}.control_owner_scripts requires registered controls")
+    for launch in (item for item in actions if item.kind == "launch"):
+        tokens = launch.script_args_template.split()
+        mode = tokens[1] if len(tokens) >= 2 and tokens[0].casefold() == "quick" else ""
+        may_seek = mode.casefold() == "seek" or any(
+            mode == "{" + parameter.name + "}" and "seek" in {v.casefold() for v in parameter.values}
+            for parameter in launch.parameters)
+        if script == "bigshot" and may_seek and (
+                kind != "quick_area" or not {"movement", "combat"}.issubset(lanes)):
+            raise ConfigurationError(f"{label}.seek requires quick_area and movement/combat lanes")
     if kind == "quick_area":
         launches = [item for item in actions if item.kind == "launch"]
         if (set(safe) != {"kind"} or script != "bigshot" or not control_owners

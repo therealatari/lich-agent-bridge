@@ -146,8 +146,39 @@ Successful field handoff requires the exact correlated launch result to contain
 terminal runtime area proof matching a fresh same-generation snapshot, completed
 child cleanup, known alive and unstunned state, released lanes, and exited owner
 scripts. For `clear` and `trial`, that room must also match the launch room. This
-verifies a bounded field handoff; it does not claim safe-town arrival, verified
-combat effects, or permission to wander.
+verifies a bounded field handoff; it does not claim safe-town arrival or verified
+combat effects. Movement requires the separate explicit seek opt-in below.
+
+### Find one encounter without agent round trips
+
+An opt-in registration can launch `bigshot quick seek --area profile --preset NAME`
+using a finite, locally reviewed preset enum. See the synthetic
+[seek registration](../../examples/controllers/bigshot-quick-seek.json).
+The public registry remains empty. Seek requires a compatible native Bigshot
+build, `quick_area` handoff, and declared movement/combat lanes. Include the
+inventory lane and eLoot owner exclusion when the preset permits cleanup.
+
+Bigshot locally searches ordinary mapped exits within its frozen profile area,
+at most 12 steps/30 seconds or the preset's smaller action/time limits, then
+clears the first eligible encounter and optionally calls eLoot. Each movement
+allows one direction send with a three-second arrival limit, not arbitrary
+commands or scripted exits. A target already present skips search. Once found,
+the combat room is pinned; search never resumes after a clear or departing target.
+No full hunting, follower, upkeep, sell/rest cycle, or model-driven per-room loop
+is introduced. Existing modes retain their previous movement behavior.
+
+LAB controls and cancellation remain bound to the exact operation/generation and
+fresh current room. Native guards enforce the area during each search send;
+terminal handoff requires the same correlated cleanup, survival and area proof
+as watch/assist, rather than requiring the launch room. Search usage is published
+under runtime `search`; dispatch and clean handoff do not prove combat effects.
+The existing operation deadline still applies to the whole request. Offline
+tests are not a live pass; deployment and supervised testing remain separate.
+Verification: 1,157 Bigshot tests with native guards/real GTK; 719 tests in the
+full LAB Python run plus all 9 tests in the expanded seek/area subset; 139 focused
+Ruby tests / 754 assertions, run in separate processes for isolated fake Lich
+globals. This covers native search-to-combat wiring, cancellation before sends,
+arrival/target races, denied callbacks/exits, and separate field-handoff evidence.
 
 ### Bounded status presentation
 

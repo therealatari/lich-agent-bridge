@@ -1,4 +1,21 @@
-# Optional Bigshot Quick trial
+# Optional Bigshot Quick controllers
+
+For bounded target finding rather than a room-pinned trial, use the opt-in
+[`bigshot-quick-seek.json`](bigshot-quick-seek.json) example. Replace the synthetic
+character and preset with reviewed local settings, including the profile's
+starting room/boundaries, attack routines, safety limits and eLoot choice. Load
+the same private manifest on both sides after authorized deployment. It requests
+one local search-to-encounter operation, not a continuous hunt:
+
+```text
+labctl perform Testmage controller.quick-seek --arg 'preset="Reviewed-Encounter"' --expected-generation GENERATION --wait
+```
+
+Review the [seek contract](../../wiki/project/Controller-Controls.md#find-one-encounter-without-agent-round-trips).
+No capability is installed by copying this example into a source checkout.
+Live verification remains pending.
+
+## Room-pinned trial
 
 This is an opt-in registration example, not an installed capability or proof of
 live compatibility. The shipped `lich/lab-controllers.json` remains empty.
