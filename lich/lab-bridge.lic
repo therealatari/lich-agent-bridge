@@ -1825,21 +1825,26 @@ module LichAgentBridge
 
   # Read native state now, not a prior HTTP snapshot. Empty hands are known only
   # when the native hand readers exist; unknown item identity is not restoration.
-  def self.controlled_refuge_hands(run, expected_generation: run[:action][:generation])
+  def self.controlled_refuge_hands!(run, expected_generation: run[:action][:generation])
     state = snapshot_state
-    return nil unless state[:character].to_s.casecmp?(run[:action][:character]) &&
-      state[:generation] == session_generation && state[:generation] == expected_generation &&
-      state.dig(:room, :id).to_s == run[:controller].safe_handoff['room_id'].to_i.to_s &&
-      state[:dead] == false && state[:stunned] == false && state.dig(:vitals, :health, :current).to_f.positive? &&
-      XMLData.indicator['IconSTANDING'] == 'y' &&
-      GameObj.respond_to?(:right_hand) && GameObj.respond_to?(:left_hand)
+    raise LabControllerControls::Invalid, 'current character does not match the controlled action' unless state[:character].to_s.casecmp?(run[:action][:character])
+    raise LabControllerControls::Invalid, 'current session generation does not match the controlled action' unless state[:generation] == session_generation && state[:generation] == expected_generation
+    raise LabControllerControls::Invalid, 'current room is not the configured Quick refuge' unless state.dig(:room, :id).to_s == run[:controller].safe_handoff['room_id'].to_i.to_s
+    raise LabControllerControls::Invalid, 'character must be alive before Quick starts' unless state[:dead] == false && state.dig(:vitals, :health, :current).to_f.positive?
+    raise LabControllerControls::Invalid, 'character must be unstunned before Quick starts' unless state[:stunned] == false
+    raise LabControllerControls::Invalid, 'character must be standing before Quick starts' unless XMLData.indicator['IconSTANDING'] == 'y'
+    raise LabControllerControls::Invalid, 'native hand readers are unavailable' unless GameObj.respond_to?(:right_hand) && GameObj.respond_to?(:left_hand)
     hands = state[:hands]
-    return nil unless hands.is_a?(Hash) && %i[right left].all? { |side| hands.key?(side) }
+    raise LabControllerControls::Invalid, 'both hand identities must be known before Quick starts' unless hands.is_a?(Hash) && %i[right left].all? { |side| hands.key?(side) }
     hands.transform_values do |item|
       next nil if item.nil?
-      return nil unless item.is_a?(Hash) && item[:id].to_s.match?(/\A[0-9]+\z/)
+      raise LabControllerControls::Invalid, 'held-item identity must be known before Quick starts' unless item.is_a?(Hash) && item[:id].to_s.match?(/\A[0-9]+\z/)
       item[:id].to_s
     end
+  end
+
+  def self.controlled_refuge_hands(run, expected_generation: run[:action][:generation])
+    controlled_refuge_hands!(run, expected_generation: expected_generation)
   rescue StandardError
     nil
   end
@@ -2028,10 +2033,13 @@ module LichAgentBridge
 
   def self.launch_controlled_controller(action, match, startup_timeout: 3)
     controller = match.controller
+    run = { controller: controller, action: action.transform_values { |value| value.is_a?(String) ? value.dup.freeze : value }.freeze,
+      spawn_attempted: false, preflight_receipt_allowed: false }
     unless controller.safe_handoff['kind'] == 'quick_refuge'
       raise LabControllerControls::Invalid, 'agent Quick requires quick_refuge safe start/return configuration; migrate the old handoff registration'
     end
     raise LabControllerControls::Invalid, 'previous Quick has unresolved unsafe handoff' if unresolved_controlled_handoff?
+    run[:preflight_receipt_allowed] = true
     deadline = action[:controller_deadline]
     raise LabControllerControls::Invalid, 'controlled launch requires an operation deadline within 300 seconds' unless deadline.is_a?(Numeric) && deadline.finite? && (deadline - Time.now.to_f).between?(0.001, 300)
     raise LabControllerControls::Invalid, 'controlled launch requires exact current session and room' unless
@@ -2051,14 +2059,16 @@ module LichAgentBridge
     raise LabControllerControls::Invalid, 'insufficient time for controlled startup' unless work_deadline > Process.clock_gettime(Process::CLOCK_MONOTONIC)
     window = format('%.9f,%.9f', work_deadline, cleanup_deadline)
     arguments = "#{match.script_args} --supervised-start-v1 #{window} --supervised-refuge-v1 #{controller.safe_handoff['room_id'].to_i},#{format('%.9f', monotonic_deadline - 2)}"
-    run = { controller: controller, action: action.transform_values { |value| value.is_a?(String) ? value.dup.freeze : value }.freeze }
-    run[:start_hands] = controlled_refuge_hands(run)
-    raise LabControllerControls::Invalid, 'Quick must start alive and standing with known equipment in its configured refuge' unless run[:start_hands]
+    run[:start_hands] = controlled_refuge_hands!(run)
     @controlled_run_mutex.synchronize do
       previous = @controlled_runs[controller.name]
-      raise LabControllerControls::Invalid, 'previous controlled child cleanup is incomplete' if previous && (!previous[:instance] || !previous[:instance].join(0))
+      if previous && (!previous[:instance] || !previous[:instance].join(0))
+        run[:preflight_receipt_allowed] = false
+        raise LabControllerControls::Invalid, 'previous controlled child cleanup is incomplete'
+      end
       @controlled_runs[controller.name] = run
     end
+    run[:spawn_attempted] = true
     instance = Script.start_child(controller.script, arguments, { quiet: true })
     raise LabControllerControls::Invalid, 'controlled child did not start' unless instance
     run[:instance] = instance
@@ -2106,6 +2116,19 @@ module LichAgentBridge
       cooperatively_close_controlled_run(run)
       run[:monitor] ||= monitor_controlled_run(run) if run[:instance]&.respond_to?(:join)
       @controlled_run_mutex.synchronize { @controlled_runs.delete(controller.name) if @controlled_runs[controller.name].equal?(run) && !run[:instance] }
+      if run[:preflight_receipt_allowed] && !run[:spawn_attempted]
+        result = { ok: false, code: 'controlled_start_rejected',
+          message: "Controlled startup rejected before child launch: #{error.class}: #{error.message}",
+          details: { run_id: action.fetch(:action_id), child_started: false,
+            cleanup_complete: true, effects_verified: false } }
+        begin
+          set_script_status(controller.script, "controlled_start_rejected:#{action.fetch(:action_id)}")
+          publish_snapshot(force: true)
+          publish_controller_result(controller, action.fetch(:action_id), result)
+        rescue StandardError => publish_error
+          Lich.log("lab controlled preflight result failed: #{publish_error.class}") if defined?(Lich)
+        end
+      end
     end
     report_action(action, 'failed', "Controlled startup failed: #{error.class}: #{error.message}")
     nil

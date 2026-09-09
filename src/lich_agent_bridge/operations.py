@@ -1200,6 +1200,23 @@ class CapabilityRunner:
         end = self._require_fresh_session(operation, expected_generation=before.generation,
                                           after_sequence=before.sequence)
         operation.end_state = end
+        facts = evidence.facts
+        details = facts["details"]
+        if (broker_error is not None and facts["ok"] is False
+                and facts["code"] == "controlled_start_rejected"
+                and details.get("run_id") == action_id
+                and details.get("child_started") is False
+                and details.get("cleanup_complete") is True
+                and details.get("effects_verified") is False):
+            self._validate_controller_start(end, controller)
+            if self._hand_ids(end) != self._hand_ids(before):
+                raise _OperationAbort("failed", "native preflight rejected but held equipment changed")
+            with self._lock:
+                pending = self._refuge_pending.get(operation.character.casefold())
+                if pending is not None and pending[0] == operation.operation_id:
+                    self._refuge_pending.pop(operation.character.casefold())
+            self._progress(operation, "native preflight rejection and unchanged refuge state verified")
+            raise _OperationAbort("failed", f"controller preflight rejected before child launch: {facts['message']}")
         self._verify_controller_handoff(end, controller, operation.arguments, evidence=evidence)
         if self._hand_ids(end) != self._hand_ids(before):
             raise _OperationAbort("failed", "refuge reached but original hand equipment was not restored")

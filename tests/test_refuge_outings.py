@@ -134,6 +134,29 @@ class RefugeOutingTests(unittest.TestCase):
         self.assertFalse(result.alerts)
         self.assertFalse(self.runner._refuge_pending)
 
+    def test_verified_native_preflight_rejection_does_not_claim_an_unsafe_handoff(self):
+        self.driver.fail_for.add("bigshot quick watch --area profile")
+        self.facts = {
+            "ok": False,
+            "code": "controlled_start_rejected",
+            "message": "native preflight rejected before child launch",
+            "details": {
+                "run_id": "set by verify hook",
+                "child_started": False,
+                "cleanup_complete": True,
+                "effects_verified": False,
+            },
+        }
+        self.evidence.controller_result = self.facts
+
+        result = self.run_outing()
+
+        self.assertEqual(result.status, "failed")
+        self.assertIn("before child launch", result.explanation)
+        self.assertEqual(len(result.evidence), 1)
+        self.assertEqual(result.alerts, [])
+        self.assertFalse(self.runner._refuge_pending)
+
     def test_success_claim_cannot_hide_stopped_or_unknown_work(self):
         for state in ("stopped", None, "running"):
             self.facts["details"]["runtime"]["work_result"]["state"] = state

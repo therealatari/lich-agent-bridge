@@ -952,6 +952,26 @@ class LabBridgeTest < Minitest::Test
     end
   end
 
+  def test_refuge_preflight_rejection_publishes_proof_that_no_child_started
+    with_controlled_quick do |fixture|
+      fixture[:standing] = false
+
+      LichAgentBridge.execute_action(fixture[:action])
+
+      assert_empty fixture[:starts]
+      assert_equal 'failed', fixture[:results].last.last[:outcome]
+      event = fixture[:http].find do |entry|
+        entry[1] == '/v1/event' && entry[2].dig(:data, :code) == 'controlled_start_rejected'
+      end
+      refute_nil event
+      assert_equal fixture[:action][:action_id], event[2].dig(:data, :action_id)
+      assert_includes event[2].dig(:data, :message), 'must be standing'
+      assert_equal false, event[2].dig(:data, :details, :child_started)
+      assert_equal true, event[2].dig(:data, :details, :cleanup_complete)
+      assert_equal false, event[2].dig(:data, :details, :effects_verified)
+    end
+  end
+
   def test_ordinary_return_request_keeps_cached_authority_and_is_queued_once
     with_controlled_quick do |fixture|
       fixture[:runtime].auto_stop = false
