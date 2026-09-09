@@ -827,10 +827,6 @@ class CapabilityRunner:
             raise _OperationAbort("failed", "unresolved test handoff permits travel only to its original refuge in the same session")
         self._admit_and_start(operation, admitted_detail="exact-destination travel admitted",
                              running_detail="native go2 travel running")
-        if start.room_id == destination:
-            self._resolve_prior_refuge(operation, start)
-            operation.end_state = start
-            return "already at destination with original equipment and released owners; no commands sent"
         action = self._run_broker_step(operation, start, GO2_ADAPTER.command("supervised_travel", destination=destination),
                                        "traveling to the authorized destination")
         end = self._require_fresh_session(operation, expected_generation=start.generation,

@@ -65,7 +65,7 @@ export const DIRECT_TOOL_REGISTRY = {
       capability: z.string().trim().regex(/^[a-z][a-z0-9_.-]{0,63}$/).describe('Registered SessionHub capability name.'),
       args: z.record(z.string(), z.unknown()).optional().describe('Capability-specific JSON arguments.'),
       expected_generation: z.string().trim().min(1).max(128).optional().describe('Observed session generation; required for trusted script tests.'),
-      timeout_seconds: z.number().positive().max(300).optional().describe('Total operation budget in seconds, including recovery and return; default 30. Only configured refuge outings may exceed 30.'),
+      timeout_seconds: z.number().positive().max(300).optional().describe('Total operation budget in seconds, including recovery and return; default 30. Configured refuge outings may use up to 300 seconds; direct travel may use up to 120.'),
     }),
     returnType: 'OperationResult',
   },

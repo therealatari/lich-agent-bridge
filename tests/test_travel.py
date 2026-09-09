@@ -46,10 +46,16 @@ class TravelTests(unittest.TestCase):
         self.assertEqual(self.driver.commands, ["go2 supervised 1000"])
         self.assertEqual(result.end_state.room_id, "1000")
 
-    def test_noop_at_destination_sends_nothing(self):
+    def test_noop_at_destination_uses_native_verification(self):
         self.state.room_id = "1000"
         self.assertEqual(self.travel().status, "succeeded")
-        self.assertEqual(self.driver.commands, [])
+        self.assertEqual(self.driver.commands, ["go2 supervised 1000"])
+
+    def test_noop_at_destination_requires_attributed_native_completion(self):
+        self.state.room_id = "1000"
+        self.arrive = False
+        self.assertEqual(self.travel().status, "failed")
+        self.assertEqual(self.driver.commands, ["go2 supervised 1000"])
 
     def test_dispatch_is_not_arrival(self):
         self.arrive = False
