@@ -82,9 +82,25 @@ def strip_xml(value, type: nil) = value
 def waitrt? = (($roundtime_waits ||= []) << :roundtime)
 def waitcastrt? = (($roundtime_waits ||= []) << :cast_roundtime)
 
+CONTROLLER_REGISTRY_SOURCE = File.realpath(File.expand_path('../lich/lab-controller-registry.rb', __dir__))
+module LabControllerRegistry
+  class ManifestError < StandardError; end
+
+  class Registry
+    def self.load(_path)
+      raise ManifestError, 'controllers[6].safe_handoff has unsupported field(s): return_seconds'
+    end
+  end
+end
+$LOADED_FEATURES << CONTROLLER_REGISTRY_SOURCE unless $LOADED_FEATURES.include?(CONTROLLER_REGISTRY_SOURCE)
 load File.expand_path('../lich/lab-bridge.lic', __dir__)
+$LOADED_FEATURES.delete(CONTROLLER_REGISTRY_SOURCE)
 
 class LabBridgeTest < Minitest::Test
+  def test_runtime_load_replaces_a_cached_controller_registry
+    assert_equal CONTROLLER_REGISTRY_SOURCE, LabControllerRegistry::Registry.method(:load).source_location.first
+  end
+
   class OwnedTestScript
     attr_accessor :thread, :exit_error, :cleanup_blocked
     attr_reader :file_name, :vars, :kills
