@@ -2464,14 +2464,18 @@ module LichAgentBridge
     raise ArgumentError, 'go2 authority or ownership unavailable' unless lease.refresh
     sends = 0
     lock = Mutex.new
-    command_pattern = /\A(?:(?:n|ne|e|se|s|sw|w|nw|u|d|o|north|northeast|east|southeast|south|southwest|west|northwest|up|down|out|stand|unhide|look)|(?:go|climb|swim|crawl|jump|open|close) [a-z0-9][a-z0-9 '\-]*)\z/i
     guard = lambda do |wire|
       sleep 0.001 while launching && Process.clock_gettime(Process::CLOCK_MONOTONIC) < deadline
       lock.synchronize do
         next false unless child && lease.valid?
         if wire
           command = wire.delete_prefix(prefix) if wire.is_a?(String) && wire.start_with?(prefix)
-          next false unless command && command_pattern.match?(command) && room_fingerprint != 'unknown' && sends < 256
+          # A mapped go2 edge may legitimately prepare/cast a spell, operate an
+          # obstacle, pay a fare, or perform another transition-specific game
+          # command. The authority boundary is the exact guarded go2 child and
+          # approved destination, not a second, inevitably incomplete verb list.
+          next false unless command && !command.empty? && command.bytesize <= 1024 &&
+                            !command.match?(/[\r\n]/) && room_fingerprint != 'unknown' && sends < 256
           sends += 1
         end
         true
