@@ -467,6 +467,38 @@ class LabBridgeTest < Minitest::Test
     assert result.success?, "Actual event validator rejected refuge result: #{output} #{error}"
   end
 
+  def test_refuge_trial_results_are_projected_within_the_event_depth_contract
+    source = synthetic_large_quick_status(command: 'incant 702', count: 2)
+    source[:observations] = [{ sequence: 1, type: 'engine_started', at: 1.0,
+                              data: { 'behaviors' => '["survival", "engage"]' } }]
+    source[:reason] = :completed
+    source[:work_result] = { state: :completed, reason: :objective_complete, observations: [] }
+    source[:refuge] = { room_id: 26_109, phase: 'finished', returned: true, equipment_restored: true }
+    source[:objective] = {
+      state: 'complete', planned: ['e'], current: nil, failure: nil, active: nil,
+      results: [{ index: 1, routine: 'e', target_id: '154405112',
+                  creature: { id: '154405112', name: 'a wraith', noun: 'wraith', type: 'undead', status: 'dead' },
+                  actions: [{ at: 1.0, command: 'incant 702', status: 'resolved', reason: nil,
+                              line: 'The wraith is struck.', spent: { mana: 4 } }],
+                  samples: [{ at: 1.0, resources: { mana: 293 }, creature: { id: '154405112' }, state: { status: 'dead' } }],
+                  outcome: 'killed', elapsed_seconds: 1.25 }]
+    }
+
+    compact = LichAgentBridge.quick_status_payload(source)
+    assert_equal 1, compact[:objective][:results_count]
+    refute compact[:objective].key?(:results)
+    assert_equal [{ index: 1, routine: 'e', target_id: '154405112', creature: 'a wraith',
+                    outcome: 'killed', actions: 1, samples: 1, elapsed_seconds: 1.25 }], compact[:trial_results]
+    assert_equal '{"behaviors":"[\\"survival\\", \\"engage\\"]"}', compact[:observations].first[:data]
+    assert_equal 'json', compact[:observations].first[:data_presentation]
+    payload = { character: 'Testmage', generation: 'synthetic-generation', observed_at: '2026-09-09T00:00:00Z',
+                kind: 'controller_result', summary: 'Synthetic trial result', data: { details: { runtime: compact } } }
+    root = File.expand_path('..', __dir__)
+    output, error, result = Open3.capture3({ 'PYTHONPATH' => File.join(root, 'src') }, 'python3', '-c',
+      'import json,sys; from lich_agent_bridge.protocol import MeaningfulEvent; MeaningfulEvent.from_mapping(json.load(sys.stdin)); print("validated")', stdin_data: JSON.generate(payload))
+    assert result.success?, "Actual event validator rejected trial result: #{output} #{error}"
+  end
+
   def with_controlled_quick(inventory: false, area: false, legacy: nil, uncontrolled: false, script_args: nil)
     originals = {}
     replace = lambda do |object, name, &implementation|
@@ -1094,6 +1126,26 @@ class LabBridgeTest < Minitest::Test
       event = fixture[:http].find { |entry| entry[1] == '/v1/event' && entry[2][:data][:code] == 'controller_monitor_failed' }
       refute_nil event
     end
+  end
+
+  def test_unacknowledged_safe_terminal_result_retains_recoverable_run_and_original_result
+    original_publisher = LichAgentBridge.method(:publish_controller_result)
+    with_controlled_quick do |fixture|
+      LichAgentBridge.execute_action(fixture[:action])
+      run = LichAgentBridge.instance_variable_get(:@controlled_runs)['quick']
+      LichAgentBridge.define_singleton_method(:publish_controller_result) { |_controller, _id, _result| false }
+      fixture[:runtime].current_status = { state: :completed, reason: 'room_clear' }
+      fixture[:child].alive = false
+
+      assert run[:monitor].join(1)
+      assert run[:result][:ok]
+      assert_equal 'quick_room_clear', run[:result][:code]
+      assert run[:unsafe_handoff]
+      assert_equal true, run[:result_publication_failed]
+      assert_same run, LichAgentBridge.instance_variable_get(:@controlled_runs)['quick']
+    end
+  ensure
+    LichAgentBridge.define_singleton_method(:publish_controller_result, original_publisher) if original_publisher
   end
 
   def test_controlled_launch_binds_fixed_work_and_cleanup_deadlines

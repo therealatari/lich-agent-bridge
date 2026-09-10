@@ -2,6 +2,30 @@
 require_relative 'lab_bridge_test'
 
 class LabBridgeTest
+  def test_controlled_recovery_ledger_survives_bridge_store_rebinding
+    original_global_runs = $lab_controlled_runs
+    original_global_mutex = $lab_controlled_run_mutex
+    retained = { 'quick' => { unsafe_handoff: true, action: { action_id: '0123456789abcdef' } } }
+    retained_mutex = Mutex.new
+    $lab_controlled_runs = retained
+    $lab_controlled_run_mutex = retained_mutex
+
+    LichAgentBridge.bind_controlled_run_store
+    assert_same retained, LichAgentBridge.instance_variable_get(:@controlled_runs)
+    assert_same retained_mutex, LichAgentBridge.instance_variable_get(:@controlled_run_mutex)
+
+    LichAgentBridge.instance_variable_set(:@controlled_runs, {})
+    LichAgentBridge.instance_variable_set(:@controlled_run_mutex, Mutex.new)
+    LichAgentBridge.bind_controlled_run_store
+    assert_same retained, LichAgentBridge.instance_variable_get(:@controlled_runs)
+    assert_same retained_mutex, LichAgentBridge.instance_variable_get(:@controlled_run_mutex)
+    assert_equal '0123456789abcdef', LichAgentBridge.instance_variable_get(:@controlled_runs).dig('quick', :action, :action_id)
+  ensure
+    $lab_controlled_runs = original_global_runs
+    $lab_controlled_run_mutex = original_global_mutex
+    LichAgentBridge.bind_controlled_run_store if LichAgentBridge.respond_to?(:bind_controlled_run_store)
+  end
+
   def with_failed_old_quick
     with_controlled_quick do |fixture|
       LichAgentBridge.execute_action(fixture[:action])
@@ -25,6 +49,7 @@ class LabBridgeTest
     with_failed_old_quick do |fixture, run|
       old_result = Marshal.load(Marshal.dump(run[:result]))
       assert LichAgentBridge.unresolved_controlled_handoff?
+      LichAgentBridge.define_singleton_method(:run_command_async) { raise 'recovery must not use the command queue' }
       LichAgentBridge.handle_command("recover #{fixture[:action][:action_id]} confirm")
       refute run[:unsafe_handoff], 'confirmed safe recovery must release this exact old-generation lock'
       assert_equal old_result, run[:result], 'recovery must not rewrite the failed test result'

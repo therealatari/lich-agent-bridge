@@ -29,8 +29,9 @@ outcomes. Do not add retries that might repeat a non-idempotent game action.
    a guarantee that admission will succeed.
 4. Resolve any target through current inventory/state. Use its exact current
    numeric object ID, not a remembered noun or an ID from a previous session.
-5. Call `lab.perform` once. Direct MCP perform follows the operation to a
-   terminal result. CLI `labctl perform --wait` supports the same workflow.
+5. Call `lab.perform` once. Direct MCP perform returns the stable operation
+   ticket immediately; poll that ticket with `lab.operation_watch` until it is
+   terminal. CLI `labctl perform --wait` supports a synchronous shell workflow.
    Do not repeat a request just because the caller lost its connection.
 6. Inspect `status`, `explanation`, `evidence`, `start_state`, and `end_state`.
    Require the capability's postconditions, not simply a transport success.
@@ -131,6 +132,15 @@ Controller verification now repeats bounded watches, carrying its cursor
 forward, until matching terminal evidence or the operation's remaining deadline.
 This does not extend execution authority or change native go2 routing.
 
+Native controller status is projected into the bounded event contract before it
+crosses the bridge. Detailed trial actions remain summarized as shallow result
+records, and nested observation payloads are carried as bounded JSON text; the
+authoritative native runtime remains local. If SessionHub rejects a terminal
+result, the bridge retains that exact run as an unresolved handoff even when the
+character returned safely. After verifying the refuge, original equipment, and
+released owners, the player can acknowledge it with `;lab recover RUN_ID confirm`.
+The original test outcome is never rewritten by recovery.
+
 The virtual-time regression exercises the real broker, operation runner and
 evidence adapter: a return after 40 seconds succeeds within a 90-second budget;
 missing evidence still fails and revokes at 90 seconds. Additional tests use
@@ -141,6 +151,11 @@ return and a full post-combat seek outing: four game-confirmed kills, return to
 the configured refuge, original equipment restored, all controller owners
 released, and no alerts. Loot cleanup remains a separate live acceptance case;
 the no-loot combat pass does not establish it.
+Follow-up acceptance on 2026-09-11 verified the asynchronous MCP ticket/watch
+flow and the bounded controller-result projection end to end: one wraith was
+killed with the selected trial routine, final loot completed, native travel
+returned to room 26109, the original staff was restored, all owners were
+released, and SessionHub accepted the terminal result without alerts.
 
 ## Trusted script-test pilot
 
@@ -175,9 +190,10 @@ labctl stop Testmage --operation-id OPERATION_ID --expected-generation GENERATIO
 ```
 
 Perform without `--wait` returns the operation ID immediately; `--wait` instead
-streams progress to a terminal result. MCP offers the same capability through
-`lab.perform` and exact cancellation through `lab.stop`. Watch the operation's
-terminal evidence after requesting stop: stop acceptance is not cleanup proof.
+streams progress to a terminal result. MCP returns the same ticket through
+`lab.perform`; use `lab.operation_watch` for bounded progress polling and
+`lab.stop` for exact cancellation. Watch the operation's terminal evidence after
+requesting stop: stop acceptance is not cleanup proof.
 Do not retry an ambiguous launch. Tests also stop new steps when local control
 is revoked, the session changes, or control cannot be verified.
 

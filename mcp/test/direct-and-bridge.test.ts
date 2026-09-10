@@ -53,6 +53,24 @@ test('SessionHub client applies bearer auth, central route mapping, and operatio
   assert.equal(request?.headers.get('x-lab-step-id'), '2');
 });
 
+test('perform returns the SessionHub operation ticket without waiting inside one MCP call', async () => {
+  const paths: string[] = [];
+  const fakeFetch: typeof fetch = async (input) => {
+    const request = new Request(input);
+    paths.push(new URL(request.url).pathname);
+    if (paths.length > 1) throw new Error('MCP transport budget exceeded');
+    return new Response(JSON.stringify({ operation_id: 'op-long', status: 'requested' }), { status: 202 });
+  };
+  const client = new SessionHubClient(new URL('http://127.0.0.1:18765'), 'secret-token', fakeFetch);
+
+  const result = await client.call('perform', {
+    character: 'Testwarrior', capability: 'controller.refuge-test', timeout_seconds: 180,
+  });
+
+  assert.deepEqual(result, { operation_id: 'op-long', status: 'requested' });
+  assert.deepEqual(paths, ['/v1/session/perform']);
+});
+
 test('perform accepts only a positive finite operation budget up to 300 seconds', async () => {
   const hub = new FakeHub();
   const request = { character: 'Testmage', capability: 'controller.refuge-test' };
@@ -80,100 +98,54 @@ test('execute-code bridge forwards the validated operation budget', async () => 
   assert.equal(hub.calls[0].payload.timeout_seconds, 120);
 });
 
-for (const { timeoutSeconds, completionAt } of [
-  { timeoutSeconds: undefined, completionAt: 50_000 },
-  { timeoutSeconds: 120, completionAt: 50_000 },
-  { timeoutSeconds: 120, completionAt: 150_000 },
-]) {
-  test(`perform budget ${timeoutSeconds ?? 'default 30'} seconds bounds a ${completionAt / 1_000}-second outcome`, async (context) => {
-    let now = 0;
-    context.mock.method(Date, 'now', () => now);
-    const transportTimeouts: number[] = [];
-    context.mock.method(AbortSignal, 'timeout', (milliseconds: number) => {
-      transportTimeouts.push(milliseconds);
-      return new AbortController().signal;
-    });
-    const payloads: Array<Record<string, unknown>> = [];
-    const fakeFetch: typeof fetch = async (_input, init) => {
-      payloads.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
-      if (payloads.length === 1) {
-        return new Response(JSON.stringify({ operation_id: 'op-refuge', status: 'requested' }), { status: 202 });
-      }
-      now += 10_000;
-      return new Response(JSON.stringify({
-        operation: { operation_id: 'op-refuge', status: now >= completionAt ? 'succeeded' : 'running' },
-        cursor: String(payloads.length), items: [],
-      }), { status: 200 });
-    };
-    const client = new SessionHubClient(new URL('http://127.0.0.1:18765'), 'test-token', fakeFetch);
-    const outcome = client.call('perform', {
-      character: 'Testmage', capability: 'controller.refuge-test',
-      ...(timeoutSeconds === undefined ? {} : { timeout_seconds: timeoutSeconds }),
-    });
-    if (completionAt > ((timeoutSeconds ?? 30) + 5) * 1_000) {
-      await assert.rejects(outcome, (error: unknown) => error instanceof SessionHubError && error.code === 'operation_timeout');
-      assert.equal(payloads.at(-1)?.timeout_ms, 5_000);
-    } else {
-      assert.equal((await outcome as { status: string }).status, 'succeeded');
-      assert.equal(payloads[0].timeout_seconds, 120);
-    }
-    assert.ok(payloads.slice(1).every((payload) => Number(payload.timeout_ms) <= 10_000));
-    assert.ok(transportTimeouts.every((milliseconds) => milliseconds === 12_000));
+test('operation watch is an explicit bounded request over the returned ticket', async (context) => {
+  let request: Request | undefined;
+  const transportTimeouts: number[] = [];
+  context.mock.method(AbortSignal, 'timeout', (milliseconds: number) => {
+    transportTimeouts.push(milliseconds);
+    return new AbortController().signal;
   });
-}
-
-test('SessionHub client turns perform ticket into one terminal outcome', async () => {
-  const paths: string[] = [];
-  let watches = 0;
-  const fakeFetch: typeof fetch = async (input) => {
-    const request = new Request(input);
-    paths.push(new URL(request.url).pathname);
-    if (paths.length === 1) {
-      return new Response(JSON.stringify({ operation_id: 'op-7', status: 'requested' }), { status: 202 });
-    }
-    watches += 1;
+  const fakeFetch: typeof fetch = async (input, init) => {
+    request = new Request(input, init);
     return new Response(JSON.stringify({
-      operation: {
-        operation_id: 'op-7',
-        status: watches === 1 ? 'running' : 'succeeded',
-        explanation: watches === 1 ? '' : 'verified',
-      },
-      cursor: String(watches),
-      items: [],
+      operation: { operation_id: 'op-refuge', status: 'running' },
+      items: [], total: 0, cursor: '7', timed_out: true,
     }), { status: 200 });
   };
-  const client = new SessionHubClient(new URL('http://127.0.0.1:18765'), 'secret-token', fakeFetch);
-  const result = await client.call('perform', { character: 'Testwarrior', capability: 'hunt.prepare' });
-  assert.equal((result as { status: string }).status, 'succeeded');
-  assert.deepEqual(paths, [
-    '/v1/session/perform',
-    '/v1/session/operation/watch',
-    '/v1/session/operation/watch',
-  ]);
+  const client = new SessionHubClient(new URL('http://127.0.0.1:18765'), 'test-token', fakeFetch);
+
+  const page = await client.call('operationWatch', {
+    operation_id: 'op-refuge', cursor: '4', timeout_ms: 30_000,
+  });
+
+  assert.equal(request && new URL(request.url).pathname, '/v1/session/operation/watch');
+  assert.deepEqual(JSON.parse(String(await request?.clone().text())), {
+    operation_id: 'op-refuge', cursor: '4', timeout_ms: 30_000,
+  });
+  assert.equal((page as { cursor: string }).cursor, '7');
+  assert.deepEqual(transportTimeouts, [32_000]);
 });
 
-test('perform uses an asynchronous ticket route before any bounded operation watch', async () => {
-  const calls: Array<{ path: string; signal: AbortSignal | null | undefined }> = [];
-  const fakeFetch: typeof fetch = async (input, init) => {
-    const request = new Request(input, init);
-    calls.push({ path: new URL(request.url).pathname, signal: request.signal });
-    if (calls.length === 1) {
-      return new Response(JSON.stringify({ operation_id: 'op-ticket', status: 'requested' }), { status: 202 });
-    }
-    return new Response(JSON.stringify({
-      operation: { operation_id: 'op-ticket', status: 'succeeded' },
-      cursor: '1', items: [],
-    }), { status: 200 });
-  };
-  const client = new SessionHubClient(new URL('http://127.0.0.1:18765'), 'secret-token', fakeFetch);
-
-  const result = await client.call('perform', { character: 'Testwarrior', capability: 'hunt.prepare' });
-
-  assert.equal((result as { status: string }).status, 'succeeded');
-  assert.deepEqual(calls.map((call) => call.path), [
-    '/v1/session/perform',
-    '/v1/session/operation/watch',
-  ]);
+test('operation watch validates its cursor and timeout before calling SessionHub', async () => {
+  const hub = new FakeHub();
+  await invokeDirectTool(hub, 'lab.operation_watch', {
+    operation_id: 'op-7', cursor: '0', timeout_ms: 10_000,
+  });
+  assert.deepEqual(hub.calls[0]?.payload, {
+    operation_id: 'op-7', cursor: '0', timeout_ms: 10_000,
+  });
+  for (const invalid of [
+    { operation_id: '', cursor: '0' },
+    { operation_id: 'op-7', cursor: '-1' },
+    { operation_id: 'op-7', cursor: '1.5' },
+    { operation_id: 'op-7', timeout_ms: 30_001 },
+  ]) {
+    await assert.rejects(
+      invokeDirectTool(hub, 'lab.operation_watch', invalid),
+      /Invalid params for 'lab.operation_watch'/,
+    );
+  }
+  assert.equal(hub.calls.length, 1);
 });
 
 test('bridge validates calls, preserves hub throws, and records ordered step metadata', async () => {

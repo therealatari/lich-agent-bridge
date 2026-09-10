@@ -1655,8 +1655,18 @@ module LichAgentBridge
 
   # Opted-in Quick controllers retain exact native Script/runtime identities.
   # These are bridge-local lifecycle records, never a public global registry.
-  @controlled_run_mutex ||= Mutex.new
-  @controlled_runs ||= {}
+  # Lich reloads a script into a fresh script module. Process globals are the
+  # narrow persistence seam that lets a player acknowledge an already-finished
+  # unsafe handoff after restarting only lab-bridge; no active authority or
+  # lease is reconstructed from this ledger.
+  def self.bind_controlled_run_store
+    $lab_controlled_run_mutex ||= Mutex.new
+    $lab_controlled_runs ||= {}
+    @controlled_run_mutex = $lab_controlled_run_mutex
+    @controlled_runs = $lab_controlled_runs
+  end
+
+  bind_controlled_run_store
 
   def self.controlled_action_authority(action_id)
     request(:post, '/v1/actions/status', { action_id: action_id }, authorized: true, read_timeout: 0.2)
@@ -1692,11 +1702,40 @@ module LichAgentBridge
   # Presentation only: retain summaries/identity and newest outcome records
   # within the existing result budget. Never mutate the owner's cached status
   # or turn transport completion into evidence that game effects occurred.
+  def self.quick_trial_result_summary(result)
+    return {} unless result.is_a?(Hash)
+    creature = result[:creature]
+    creature_label = if creature.is_a?(Hash)
+                       creature[:name] || creature[:noun] || creature[:id]
+                     else
+                       creature
+                     end
+    {
+      index: result[:index], routine: result[:routine], target_id: result[:target_id],
+      creature: creature_label, outcome: result[:outcome],
+      actions: Array(result[:actions]).length, samples: Array(result[:samples]).length,
+      elapsed_seconds: result[:elapsed_seconds]
+    }.reject { |_key, value| value.nil? }
+  end
+
   def self.quick_status_payload(value)
     return {} unless value.is_a?(Hash)
     copy = JSON.parse(JSON.generate(value), symbolize_names: true)
     observations = copy[:observations]
     projected = false
+    objective = copy[:objective]
+    if objective.is_a?(Hash)
+      results = objective.delete(:results)
+      if results.is_a?(Array)
+        objective[:results_count] = results.length
+        copy[:trial_results] = results.map { |result| quick_trial_result_summary(result) }
+        projected = true
+      end
+      if objective[:active].is_a?(Hash)
+        objective[:active] = quick_trial_result_summary(objective[:active])
+        projected = true
+      end
+    end
     work = copy[:work_result]
     if work.is_a?(Hash) && work[:observations].is_a?(Array)
       work[:observation_transport] = { omitted_entries: work.delete(:observations).length,
@@ -1706,6 +1745,19 @@ module LichAgentBridge
     if observations.is_a?(Array)
       observations.each do |entry|
         next unless entry.is_a?(Hash)
+        data = entry[:data]
+        if data.is_a?(Hash) || data.is_a?(Array)
+          data = JSON.generate(data)
+          if data.length > 4000
+            entry[:data_omitted_characters] = data.length - 4000
+            data = data[0, 4000]
+            entry[:data_presentation] = 'json-prefix'
+          else
+            entry[:data_presentation] = 'json'
+          end
+          entry[:data] = data
+          projected = true
+        end
         command = entry[:command]
         if command.is_a?(Array)
           # An array inside an outcome exceeds the event envelope's depth cap.
@@ -2017,7 +2069,16 @@ module LichAgentBridge
       if run[:action][:generation] == session_generation && run[:action][:character].to_s.casecmp?(character_name)
         set_script_status(run[:controller].script, "#{result[:code]}:#{run[:action][:action_id]}")
         publish_snapshot(force: true)
-        publish_controller_result(run[:controller], run[:action][:action_id], result)
+        acknowledged = publish_controller_result(run[:controller], run[:action][:action_id], result)
+        unless acknowledged
+          # publish_event deliberately reports transport/validation rejection as
+          # false. A locally safe result is not complete until SessionHub has
+          # accepted its action-attributed evidence, so retain the exact run for
+          # explicit player recovery instead of silently releasing exclusion.
+          run[:result_publication_failed] = true
+          run[:unsafe_handoff] = true
+          display("Controller result for #{run[:action][:action_id]} was not acknowledged; safe handoff remains locked. Use ;lab recover #{run[:action][:action_id]} confirm after verifying refuge and equipment.")
+        end
       end
     rescue StandardError => error
       run[:failure] ||= 'controller_monitor_failed'
@@ -2738,10 +2799,10 @@ module LichAgentBridge
     when 'operation stop'
       run_command_async { stop_capability }
     when 'recover'
-      run_command_async { recover_controlled_handoff }
+      recover_controlled_handoff
     when /\Arecover ([0-9a-f]{16}) confirm\z/
       action_id = Regexp.last_match(1)
-      run_command_async { recover_controlled_handoff(action_id, confirm: true) }
+      recover_controlled_handoff(action_id, confirm: true)
     when 'actions on'
       run_command_async { set_actions(true) }
     when 'actions off'
