@@ -59,7 +59,7 @@ export const DIRECT_TOOL_REGISTRY = {
     toolName: 'lab.perform',
     sdkMethod: 'perform',
     route: 'perform',
-    description: 'Request one outcome-oriented SessionHub capability. SessionHub remains the policy authority.',
+    description: 'Start one outcome-oriented SessionHub capability and return its operation ticket immediately. Poll it with lab.operation_watch.',
     input: z.strictObject({
       character,
       capability: z.string().trim().regex(/^[a-z][a-z0-9_.-]{0,63}$/).describe('Registered SessionHub capability name.'),
@@ -68,6 +68,18 @@ export const DIRECT_TOOL_REGISTRY = {
       timeout_seconds: z.number().positive().max(300).optional().describe('Total operation budget in seconds, including recovery and return; default 30. Configured refuge outings may use up to 300 seconds; direct travel may use up to 120.'),
     }),
     returnType: 'OperationResult',
+  },
+  operationWatch: {
+    toolName: 'lab.operation_watch',
+    sdkMethod: 'operationWatch',
+    route: 'operationWatch',
+    description: 'Read progress after a cursor for one operation ticket. Repeat until the returned operation is terminal.',
+    input: z.strictObject({
+      operation_id: z.string().trim().min(1).max(64),
+      cursor: z.string().regex(/^\d+$/).max(32).optional().describe('Progress cursor from a prior operation watch; default 0.'),
+      timeout_ms: z.number().int().min(0).max(30_000).optional().describe('Long-poll timeout in milliseconds, up to 30000.'),
+    }),
+    returnType: 'OperationPage',
   },
   stop: {
     toolName: 'lab.stop',

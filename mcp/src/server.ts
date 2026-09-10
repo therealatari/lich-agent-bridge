@@ -8,7 +8,7 @@ import { executeCode } from './executor.js';
 import { SDK_TYPE_DECLARATIONS } from './sdk-types.generated.js';
 import { SessionHubClient } from './session-hub-client.js';
 
-export const SERVER_INSTRUCTIONS = `LAB exposes one local GemStone IV session authority. Read lab.snapshot before acting; it is current live state and costs no game command. lab.inventory_find locations are historical observations, never proof of current possession. Use lab.watch for meaningful changes. Use lab.perform only for registered outcome-oriented capabilities; the Python SessionHub and ActionBroker remain final policy authorities. Prefer direct tools for one call and lab.execute_code for three or more dependent reads or compact filtering. Never infer success from command dispatch.`;
+export const SERVER_INSTRUCTIONS = `LAB exposes one local GemStone IV session authority. Read lab.snapshot before acting; it is current live state and costs no game command. lab.inventory_find locations are historical observations, never proof of current possession. Use lab.watch for meaningful changes. Use lab.perform only for registered outcome-oriented capabilities; it returns a stable operation ticket immediately. Poll that ticket with lab.operation_watch until terminal, then verify its evidence and a fresh snapshot. The Python SessionHub and ActionBroker remain final policy authorities. Prefer direct tools for one call and lab.execute_code for three or more dependent reads or compact filtering. Never infer success from command dispatch.`;
 
 function connectionId(req: Request): string {
   const explicit = req.header('x-lab-connection-id') ?? req.header('mcp-session-id');

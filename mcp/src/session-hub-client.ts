@@ -29,10 +29,7 @@ export class SessionHubClient implements SessionHubCaller {
   ) {}
 
   async call(routeName: SessionHubRoute, payload: Record<string, unknown>, metadata: BridgeMetadata = {}): Promise<unknown> {
-    const result = await this.callOnce(routeName, payload, metadata);
-    if (routeName !== 'perform') return result;
-    const timeoutSeconds = typeof payload.timeout_seconds === 'number' ? payload.timeout_seconds : 30;
-    return this.waitForOperation(result, metadata, timeoutSeconds);
+    return this.callOnce(routeName, payload, metadata);
   }
 
   private async callOnce(routeName: SessionHubRoute, payload: Record<string, unknown>, metadata: BridgeMetadata = {}): Promise<unknown> {
@@ -81,42 +78,4 @@ export class SessionHubClient implements SessionHubCaller {
     return body;
   }
 
-  private async waitForOperation(started: unknown, metadata: BridgeMetadata, timeoutSeconds: number): Promise<unknown> {
-    if (!started || typeof started !== 'object') {
-      throw new SessionHubError('SessionHub perform returned an invalid operation', 0, 'invalid_operation', started);
-    }
-    let operation = started as Record<string, unknown>;
-    const operationId = operation.operation_id;
-    if (typeof operationId !== 'string' || !operationId) {
-      throw new SessionHubError('SessionHub perform omitted operation_id', 0, 'invalid_operation', started);
-    }
-    const terminal = new Set(['succeeded', 'failed', 'timed_out', 'interrupted']);
-    let cursor = '0';
-    const deadline = Date.now() + (timeoutSeconds + 5) * 1_000;
-    while (!terminal.has(String(operation.status))) {
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) {
-        throw new SessionHubError('SessionHub operation outcome timed out', 0, 'operation_timeout', operation);
-      }
-      const page = await this.callOnce(
-        'operationWatch',
-        {
-          operation_id: operationId,
-          cursor,
-          timeout_ms: Math.min(10_000, remaining),
-        },
-        { ...metadata, operationId },
-      );
-      if (!page || typeof page !== 'object') {
-        throw new SessionHubError('SessionHub operation watch returned invalid data', 0, 'invalid_operation', page);
-      }
-      const record = page as Record<string, unknown>;
-      if (!record.operation || typeof record.operation !== 'object') {
-        throw new SessionHubError('SessionHub operation watch omitted operation', 0, 'invalid_operation', page);
-      }
-      operation = record.operation as Record<string, unknown>;
-      if (typeof record.cursor === 'string') cursor = record.cursor;
-    }
-    return operation;
-  }
 }

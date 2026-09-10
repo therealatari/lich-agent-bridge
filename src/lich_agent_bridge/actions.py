@@ -424,7 +424,7 @@ class CommandPolicy:
         matched = self._controller_manifest.match_command(command)
         return (matched is not None and matched.action.kind == "launch"
                 and bool(matched.controller.control_owner_scripts)
-                and matched.controller.safe_handoff["kind"] == "quick_refuge")
+                and matched.controller.safe_handoff["kind"] in {"quick_refuge", "controller_refuge"})
 
     def evaluate(self, command: str) -> tuple[str, PolicyDecision]:
         if any(character in command for character in ("\r", "\n", ";", "|", "&")):

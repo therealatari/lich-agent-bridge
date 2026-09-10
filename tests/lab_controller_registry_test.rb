@@ -5,6 +5,18 @@ require 'tempfile'
 load File.expand_path('../lich/lab-controller-registry.rb', __dir__)
 
 class LabControllerRegistryTest < Minitest::Test
+  def test_eohunter_example_is_opt_in_bounded_and_exact
+    path = File.expand_path('../examples/controllers/eohunter-trial-campaign.json', __dir__)
+    controller = LabControllerRegistry.load(path).controller('eohunter-trial')
+    assert_equal 'controller_refuge', controller.safe_handoff['kind']
+    built = controller.action('start').build('profile' => 'Reviewed-Trial', 'trial' => 'a-b-c')
+    assert_equal 'eohunter Reviewed-Trial trial a-b-c', built[:command]
+    assert_equal 'Reviewed-Trial trial a-b-c', built[:script_args]
+    assert_raises(LabControllerRegistry::ManifestError) do
+      controller.action('start').build('profile' => 'Reviewed-Trial', 'trial' => 'a-b-d')
+    end
+  end
+
   def test_quick_refuge_requires_exact_room_return_budget_and_native_area_contract
     raw = JSON.parse(File.read(File.expand_path('fixtures/controller-controls.json', __dir__)))['controllers'].first
     raw.merge!('script' => 'bigshot', 'control_owner_scripts' => ['bigshot'],

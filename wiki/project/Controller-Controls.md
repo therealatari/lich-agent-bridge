@@ -1,10 +1,12 @@
 # Exact-operation controller controls
 
-Status: authenticated HTTP/CLI control admission and exact-child Quick runtime
-binding are implemented with offline tests. No controller is registered by the
-public distribution. This work does not deploy scripts or establish live
-compatibility. The [direct Bigshot trial example](../../examples/controllers/README.md)
-requires explicit local review and registration.
+Status: authenticated HTTP/CLI control admission and exact-child native runtime
+binding are implemented with offline tests. Bigshot Quick remains supported,
+and the generic `controller_refuge` contract admits EO Hunter's bounded trial
+runtime. No controller is registered by the public distribution. This work does
+not deploy scripts or establish live compatibility. The
+[controller examples](../../examples/controllers/README.md) require explicit
+local review and registration.
 
 ## Implemented interface
 
@@ -88,7 +90,21 @@ while retaining the launch lease. Pending controls are revoked. Actions-off,
 explicit hard revocation, missing authority and generation loss still deny all
 further commands, including travel. Neither kind of stop proves safe arrival.
 
-## Optional native Quick binding
+## Optional native controller binding
+
+Generic native controllers publish `controller_runtime` and, after exit,
+`controller_result` on their exact Script instance. LAB prefers those methods
+and retains compatibility with Bigshot's `quick_combat_runtime` and
+`quick_combat_result`. A generic script declares
+`SUPERVISED_CONTROLLER_PROTOCOL = 1` and `REFUGE_START_PROTOCOL = 1`; Bigshot's
+historical `SUPERVISED_START_PROTOCOL` declaration remains accepted. The
+generic refuge child predicate is `controller_refuge_travel_child?`, with the
+Bigshot-specific predicate retained as a compatibility fallback.
+
+All remaining identity, lease, control, deadline, restoration, and evidence
+requirements in this section apply equally to both interfaces. Method-name
+compatibility is not authority: LAB still pins the exact native child, original
+action, character, generation, runtime object, and owned go2 child.
 
 The bridge launches opted-in controllers with native `Script.start_child`, pins
 its exact returned Script object, original launch, character, and session, then
@@ -209,6 +225,34 @@ with `quick` cannot bypass this rule by omitting controls; the bridge refuses
 that generic launch path too. Other registered non-Quick Bigshot launches are
 unchanged. Manual standalone Quick and the noncombat room-bound test
 pilot retain their separate contracts. The shipped controller registry is empty.
+
+### EO Hunter bounded trial campaigns
+
+EO Hunter's native controller performs a finite sequence of reviewed profile
+routines while its ordinary engine continues to own target selection, combat,
+movement, looting, flee policy, equipment handling, and return-to-rest logic.
+LAB supplies only the selected profile and a manifest-enumerated sequence such
+as `a-b-c`; it does not construct spell commands in the field.
+
+Each letter selects one existing profile routine for one creature. EO Hunter
+records the creature identity and state changes, each resolved routine action,
+resource deltas, elapsed time, and terminal outcome. The sequence is capped at
+five creatures, 12 actions and 45 seconds per creature. A target that disappears
+without a confirmed death fails the campaign. Completing the sequence requests
+native final looting and safe return. Failure also requests safe return while
+preserving the failed work result.
+
+This makes a low-danger empirical comparison possible without model latency in
+combat: prepare several complete recipes at the refuge, let the runtime execute
+and measure them at game speed, then interpret their evidence after it has
+returned. Lethality alone is insufficient; evaluation should prioritize safe
+and reliable completion, then resource cost and elapsed time. Results apply to
+the observed creature, build, and state and do not establish a universal
+optimal rotation.
+
+Use `safe_handoff: {"kind": "controller_refuge", ...}` and the synthetic
+[EO Hunter registration](../../examples/controllers/eohunter-trial-campaign.json).
+The public registry remains empty, and real character profiles remain private.
 
 ### Find one encounter without agent round trips
 

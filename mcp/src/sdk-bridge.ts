@@ -38,10 +38,11 @@ export function createBridge(client: SessionHubCaller, state: BridgeState) {
         if (!parsed.success) {
           throw new Error(`Invalid params for SDK method '${method}' (${entry.toolName}): ${formatZodError(parsed.error)}`);
         }
-        if (entry.route === 'watch') {
+        if (entry.route === 'watch' || entry.route === 'operationWatch') {
           const timeout = (parsed.data as { timeout_ms?: number }).timeout_ms ?? 0;
           if (timeout > MAX_ISOLATE_WATCH_MS) {
-            throw new Error(`Isolate watch timeout is capped at ${MAX_ISOLATE_WATCH_MS}ms; use direct lab.watch for blocking watches`);
+            const directTool = entry.route === 'watch' ? 'lab.watch' : 'lab.operation_watch';
+            throw new Error(`Isolate watch timeout is capped at ${MAX_ISOLATE_WATCH_MS}ms; use direct ${directTool} for blocking watches`);
           }
         }
         const result = await client.call(entry.route, parsed.data, { operationId: state.operationId, stepId });

@@ -82,9 +82,25 @@ def strip_xml(value, type: nil) = value
 def waitrt? = (($roundtime_waits ||= []) << :roundtime)
 def waitcastrt? = (($roundtime_waits ||= []) << :cast_roundtime)
 
+CONTROLLER_REGISTRY_SOURCE = File.realpath(File.expand_path('../lich/lab-controller-registry.rb', __dir__))
+module LabControllerRegistry
+  class ManifestError < StandardError; end
+
+  class Registry
+    def self.load(_path)
+      raise ManifestError, 'controllers[6].safe_handoff has unsupported field(s): return_seconds'
+    end
+  end
+end
+$LOADED_FEATURES << CONTROLLER_REGISTRY_SOURCE unless $LOADED_FEATURES.include?(CONTROLLER_REGISTRY_SOURCE)
 load File.expand_path('../lich/lab-bridge.lic', __dir__)
+$LOADED_FEATURES.delete(CONTROLLER_REGISTRY_SOURCE)
 
 class LabBridgeTest < Minitest::Test
+  def test_runtime_load_replaces_a_cached_controller_registry
+    assert_equal CONTROLLER_REGISTRY_SOURCE, LabControllerRegistry::Registry.method(:load).source_location.first
+  end
+
   class OwnedTestScript
     attr_accessor :thread, :exit_error, :cleanup_blocked
     attr_reader :file_name, :vars, :kills
@@ -308,7 +324,8 @@ class LabBridgeTest < Minitest::Test
   end
 
   class SyntheticQuickChild
-    attr_accessor :alive, :cleanup_blocked, :quick_combat_runtime, :quick_combat_result
+    attr_accessor :alive, :cleanup_blocked, :quick_combat_runtime, :quick_combat_result,
+                  :controller_runtime, :controller_result
     attr_reader :name, :kills
     def initialize(name)
       @name, @alive, @cleanup_blocked, @kills = name, true, false, []
@@ -450,6 +467,38 @@ class LabBridgeTest < Minitest::Test
     assert result.success?, "Actual event validator rejected refuge result: #{output} #{error}"
   end
 
+  def test_refuge_trial_results_are_projected_within_the_event_depth_contract
+    source = synthetic_large_quick_status(command: 'incant 702', count: 2)
+    source[:observations] = [{ sequence: 1, type: 'engine_started', at: 1.0,
+                              data: { 'behaviors' => '["survival", "engage"]' } }]
+    source[:reason] = :completed
+    source[:work_result] = { state: :completed, reason: :objective_complete, observations: [] }
+    source[:refuge] = { room_id: 26_109, phase: 'finished', returned: true, equipment_restored: true }
+    source[:objective] = {
+      state: 'complete', planned: ['e'], current: nil, failure: nil, active: nil,
+      results: [{ index: 1, routine: 'e', target_id: '154405112',
+                  creature: { id: '154405112', name: 'a wraith', noun: 'wraith', type: 'undead', status: 'dead' },
+                  actions: [{ at: 1.0, command: 'incant 702', status: 'resolved', reason: nil,
+                              line: 'The wraith is struck.', spent: { mana: 4 } }],
+                  samples: [{ at: 1.0, resources: { mana: 293 }, creature: { id: '154405112' }, state: { status: 'dead' } }],
+                  outcome: 'killed', elapsed_seconds: 1.25 }]
+    }
+
+    compact = LichAgentBridge.quick_status_payload(source)
+    assert_equal 1, compact[:objective][:results_count]
+    refute compact[:objective].key?(:results)
+    assert_equal [{ index: 1, routine: 'e', target_id: '154405112', creature: 'a wraith',
+                    outcome: 'killed', actions: 1, samples: 1, elapsed_seconds: 1.25 }], compact[:trial_results]
+    assert_equal '{"behaviors":"[\\"survival\\", \\"engage\\"]"}', compact[:observations].first[:data]
+    assert_equal 'json', compact[:observations].first[:data_presentation]
+    payload = { character: 'Testmage', generation: 'synthetic-generation', observed_at: '2026-09-09T00:00:00Z',
+                kind: 'controller_result', summary: 'Synthetic trial result', data: { details: { runtime: compact } } }
+    root = File.expand_path('..', __dir__)
+    output, error, result = Open3.capture3({ 'PYTHONPATH' => File.join(root, 'src') }, 'python3', '-c',
+      'import json,sys; from lich_agent_bridge.protocol import MeaningfulEvent; MeaningfulEvent.from_mapping(json.load(sys.stdin)); print("validated")', stdin_data: JSON.generate(payload))
+    assert result.success?, "Actual event validator rejected trial result: #{output} #{error}"
+  end
+
   def with_controlled_quick(inventory: false, area: false, legacy: nil, uncontrolled: false, script_args: nil)
     originals = {}
     replace = lambda do |object, name, &implementation|
@@ -489,7 +538,7 @@ class LabBridgeTest < Minitest::Test
     fixture[:authority] = { action[:action_id] => action.merge(status: 'dispatched', stop_requested: false, return_requested: false) }
     replace.call(Script, :running) { child.alive ? [child] : [] }
     replace.call(Script, :running?) { |name| fixture[:started] && child.alive && child.name == name }
-    replace.call(LichAgentBridge, :supervised_quick_supported?) { |_name| true }
+    replace.call(LichAgentBridge, :supervised_controller_supported?) { |_name| true }
     replace.call(LichAgentBridge, :launch_controller) do |controller, action, arguments|
       fixture[:ordinary_launches] << [controller.name, action.name, arguments]
       false
@@ -1079,6 +1128,26 @@ class LabBridgeTest < Minitest::Test
     end
   end
 
+  def test_unacknowledged_safe_terminal_result_retains_recoverable_run_and_original_result
+    original_publisher = LichAgentBridge.method(:publish_controller_result)
+    with_controlled_quick do |fixture|
+      LichAgentBridge.execute_action(fixture[:action])
+      run = LichAgentBridge.instance_variable_get(:@controlled_runs)['quick']
+      LichAgentBridge.define_singleton_method(:publish_controller_result) { |_controller, _id, _result| false }
+      fixture[:runtime].current_status = { state: :completed, reason: 'room_clear' }
+      fixture[:child].alive = false
+
+      assert run[:monitor].join(1)
+      assert run[:result][:ok]
+      assert_equal 'quick_room_clear', run[:result][:code]
+      assert run[:unsafe_handoff]
+      assert_equal true, run[:result_publication_failed]
+      assert_same run, LichAgentBridge.instance_variable_get(:@controlled_runs)['quick']
+    end
+  ensure
+    LichAgentBridge.define_singleton_method(:publish_controller_result, original_publisher) if original_publisher
+  end
+
   def test_controlled_launch_binds_fixed_work_and_cleanup_deadlines
     with_controlled_quick do |fixture|
       fixture[:action][:controller_deadline] = Time.now.to_f + 30
@@ -1095,7 +1164,7 @@ class LabBridgeTest < Minitest::Test
 
   def test_controlled_launch_refuses_unsupported_historical_script_before_spawning
     with_controlled_quick do |fixture|
-      LichAgentBridge.define_singleton_method(:supervised_quick_supported?) { |_| false }
+      LichAgentBridge.define_singleton_method(:supervised_controller_supported?) { |_| false }
       LichAgentBridge.execute_action(fixture[:action])
       assert_empty fixture[:starts]
       assert_equal 'failed', fixture[:results].last.last[:outcome]
@@ -1116,6 +1185,8 @@ class LabBridgeTest < Minitest::Test
       refute LichAgentBridge.supervised_quick_supported?('bigshot')
       File.write(path, "    SUPERVISED_START_PROTOCOL = 1\r\n    REFUGE_START_PROTOCOL = 1\r\nraise 'never evaluate preflight source'\n")
       assert LichAgentBridge.supervised_quick_supported?('bigshot')
+      File.write(path, "    SUPERVISED_CONTROLLER_PROTOCOL = 1\r\n    REFUGE_START_PROTOCOL = 1\r\nraise 'never evaluate preflight source'\n")
+      assert LichAgentBridge.supervised_controller_supported?('eohunter')
     end
   ensure
     $script_dir = previous_root
@@ -1124,6 +1195,19 @@ class LabBridgeTest < Minitest::Test
     elsif Script.respond_to?(:__find_script_file, true)
       Script.singleton_class.remove_method(:__find_script_file)
     end
+  end
+
+  def test_generic_controller_publications_take_precedence_over_quick_compatibility
+    child = SyntheticQuickChild.new('eohunter')
+    generic_runtime = Object.new
+    generic_result = { state: :completed }.freeze
+    child.controller_runtime = generic_runtime
+    child.controller_result = generic_result
+    child.quick_combat_runtime = Object.new
+    child.quick_combat_result = { state: :stopped }.freeze
+
+    assert_same generic_runtime, LichAgentBridge.controlled_runtime(child)
+    assert_same generic_result, LichAgentBridge.controlled_terminal_status(child)
   end
 
   def test_controlled_launch_stops_a_runtime_that_refuses_deadline_coordination

@@ -29,8 +29,9 @@ outcomes. Do not add retries that might repeat a non-idempotent game action.
    a guarantee that admission will succeed.
 4. Resolve any target through current inventory/state. Use its exact current
    numeric object ID, not a remembered noun or an ID from a previous session.
-5. Call `lab.perform` once. Direct MCP perform follows the operation to a
-   terminal result. CLI `labctl perform --wait` supports the same workflow.
+5. Call `lab.perform` once. Direct MCP perform returns the stable operation
+   ticket immediately; poll that ticket with `lab.operation_watch` until it is
+   terminal. CLI `labctl perform --wait` supports a synchronous shell workflow.
    Do not repeat a request just because the caller lost its connection.
 6. Inspect `status`, `explanation`, `evidence`, `start_state`, and `end_state`.
    Require the capability's postconditions, not simply a transport success.
@@ -45,6 +46,12 @@ outcomes. Do not add retries that might repeat a non-idempotent game action.
    [safe-refuge implementation](Agent-Test-Safe-Refuge.md) still requires
    coordinated deployment and an explicitly authorized acceptance test before
    routine live testing resumes.
+
+For a controlled combat campaign, do all model planning at the refuge. Use a
+native controller to travel, select targets, execute already reviewed routines,
+collect evidence, loot, and return at game speed. Interpret and revise the
+configuration only after verified safe handoff. Do not leave a character in a
+hunting area while waiting for an answer-model round trip.
 
 MCP tools and their exact types are documented in the generated
 [SDK declarations](../../mcp/src/sdk-types.generated.ts). For example, after
@@ -125,6 +132,15 @@ Controller verification now repeats bounded watches, carrying its cursor
 forward, until matching terminal evidence or the operation's remaining deadline.
 This does not extend execution authority or change native go2 routing.
 
+Native controller status is projected into the bounded event contract before it
+crosses the bridge. Detailed trial actions remain summarized as shallow result
+records, and nested observation payloads are carried as bounded JSON text; the
+authoritative native runtime remains local. If SessionHub rejects a terminal
+result, the bridge retains that exact run as an unresolved handoff even when the
+character returned safely. After verifying the refuge, original equipment, and
+released owners, the player can acknowledge it with `;lab recover RUN_ID confirm`.
+The original test outcome is never rewritten by recovery.
+
 The virtual-time regression exercises the real broker, operation runner and
 evidence adapter: a return after 40 seconds succeeds within a 90-second budget;
 missing evidence still fails and revokes at 90 seconds. Additional tests use
@@ -135,6 +151,11 @@ return and a full post-combat seek outing: four game-confirmed kills, return to
 the configured refuge, original equipment restored, all controller owners
 released, and no alerts. Loot cleanup remains a separate live acceptance case;
 the no-loot combat pass does not establish it.
+Follow-up acceptance on 2026-09-11 verified the asynchronous MCP ticket/watch
+flow and the bounded controller-result projection end to end: one wraith was
+killed with the selected trial routine, final loot completed, native travel
+returned to room 26109, the original staff was restored, all owners were
+released, and SessionHub accepted the terminal result without alerts.
 
 ## Trusted script-test pilot
 
@@ -169,9 +190,10 @@ labctl stop Testmage --operation-id OPERATION_ID --expected-generation GENERATIO
 ```
 
 Perform without `--wait` returns the operation ID immediately; `--wait` instead
-streams progress to a terminal result. MCP offers the same capability through
-`lab.perform` and exact cancellation through `lab.stop`. Watch the operation's
-terminal evidence after requesting stop: stop acceptance is not cleanup proof.
+streams progress to a terminal result. MCP returns the same ticket through
+`lab.perform`; use `lab.operation_watch` for bounded progress polling and
+`lab.stop` for exact cancellation. Watch the operation's terminal evidence after
+requesting stop: stop acceptance is not cleanup proof.
 Do not retry an ambiguous launch. Tests also stop new steps when local control
 is revoked, the session changes, or control cannot be verified.
 
@@ -261,10 +283,17 @@ timeout is an explicit error, not permission to enqueue endless retries.
 
 The [exact-operation controller controls](Controller-Controls.md) document
 authenticated HTTP/CLI admission for typed controls of a registered active
-controller. The bridge binds opted-in Quick controllers to the exact native
-child/runtime; public installation alone does not register a capability. The
-[direct trial example](../../examples/controllers/README.md) is opt-in and
-requires separately authorized live verification.
+controller. The bridge binds opted-in native controllers to the exact child and
+runtime; public installation alone does not register a capability. The
+[Bigshot and EO Hunter examples](../../examples/controllers/README.md) are
+opt-in and require separately authorized live verification.
+
+EO Hunter's bounded trial campaign is intended for questions such as “which of
+these three reviewed combat recipes is safest and most resource-efficient for
+this creature?” It executes one recipe per selected creature, measures actions,
+resources, state changes and elapsed time, then performs native cleanup and
+return. It is not an unrestricted command planner, continuous autonomous hunt,
+or proof that a result generalizes beyond the observed setup.
 
 If discovery has no suitable operation, propose the smallest capability needed
 with its admission checks, exact target binding, evidence, restoration, and

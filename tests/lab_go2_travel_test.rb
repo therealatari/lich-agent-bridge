@@ -111,8 +111,16 @@ class LabGo2TravelTest < Minitest::Test
     end
   end
 
-  def test_forbidden_commands_fail_before_any_send
-    ['<c>sell sword', '<c>;go2 2000', '<c>north\nsouth', '<c>get coins'].each do |wire|
+  def test_map_edge_commands_are_delegated_to_the_exact_go2_child
+    wires = ['<c>go gate', '<c>prepare 407', '<c>cast gate', '<c>push bronze gate']
+    with_travel(wires: wires) do |sent, reports|
+      assert_equal wires, sent
+      assert_equal 'completed', reports.last.first, reports.inspect
+    end
+  end
+
+  def test_malformed_wire_commands_fail_before_any_send
+    ['', 'north', '<c>', "<c>north\nsouth", "<c>north\rsouth", "<c>#{'x' * 1025}"].each do |wire|
       with_travel(wires: [wire]) do |sent, reports|
         assert_empty sent, wire
         assert_equal 'failed', reports.last.first, reports.inspect

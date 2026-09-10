@@ -1,4 +1,65 @@
-# Optional Bigshot Quick controllers
+# Optional controlled outings
+
+The public controller registry is intentionally empty. These files are
+synthetic, opt-in registrations that demonstrate how a player can connect a
+reviewed native hunting configuration to LAB without granting arbitrary script
+or command execution.
+
+## EO Hunter trial campaign
+
+[`eohunter-trial-campaign.json`](eohunter-trial-campaign.json) demonstrates a
+short evidence-gathering campaign. Replace `Testmage`, room `1000`, profile
+`Reviewed-Trial`, and the allowed trial values with private, player-reviewed
+settings. The EO Hunter profile—not LAB—defines the bounded hunting area,
+refuge, eligible creatures, flee limits, looting policy, and routines `a`
+through `j`.
+
+The trial value is an ordered list of routine letters. For example, `a-b-c`
+uses routine `a` for the first selected creature, `b` for the second, and `c`
+for the third. EO Hunter selects and follows creatures at game speed, executes
+each complete profile routine, records attributed action/resource/creature
+observations, performs native final looting, and returns to the configured
+refuge. LAB admits and supervises the exact runtime; it evaluates the evidence
+only after safe return. The model is never left thinking between combat rounds.
+
+A campaign admits at most five trials. Each creature is bounded to 12 routine
+actions and 45 seconds, inside LAB's overall operation limit of 300 seconds.
+Losing the target, reaching either per-creature limit, failing combat, or
+failing restoration makes the operation fail. A failed combat case may still
+return safely, but safe return does not turn it into a pass. Terminal success
+requires survival, the exact refuge, original hand identities, owner exit, and
+released movement/combat/inventory lanes.
+
+After deploying compatible EO Hunter and Lich builds, set
+`LAB_CONTROLLER_MANIFEST` to the same private manifest for the sidecar and the
+in-game bridge. Begin in the reviewed refuge and use the generation from a fresh
+snapshot:
+
+```text
+labctl perform Testmage controller.eohunter-trial --arg 'profile="Reviewed-Trial"' --arg 'trial="a-b-c"' --expected-generation GENERATION --operation-timeout 180 --wait
+```
+
+An active operation can be inspected or asked to return using its operation ID:
+
+```text
+labctl control Testmage status --operation-id OPERATION_ID --expected-generation GENERATION
+labctl control Testmage retreat --operation-id OPERATION_ID --expected-generation GENERATION
+```
+
+Ordinary operation stop requests the same cooperative return. Actions-off,
+expired authority, session change, and other hard revocations deny all further
+commands, including return travel. Do not use hard revocation as an extraction
+button. An unresolved refuge/equipment handoff blocks the next controlled test
+until the player restores state and acknowledges it with `;lab recover`.
+
+This first version compares complete, pre-reviewed combat recipes rather than
+inventing commands during a hunt. A routine can represent an instant kill, a
+multi-cast sequence, a damage-over-time setup followed by waits, or a
+creature-specific attack. Compare reliability and safety first, then mana or
+other resource cost and elapsed time. Keep character builds and real hunting
+profiles outside the public repository.
+
+## Bigshot Quick seek
 
 For bounded target finding rather than a room-pinned trial, use the opt-in
 [`bigshot-quick-seek.json`](bigshot-quick-seek.json) example. Replace the synthetic
@@ -16,7 +77,7 @@ Review the [seek contract](../../wiki/project/Controller-Controls.md#find-one-en
 No capability is installed by copying this example into a source checkout.
 Live verification remains pending.
 
-## Bounded named trial
+## Bigshot bounded named trial
 
 This is an opt-in registration example, not an installed capability or proof of
 live compatibility. The shipped `lich/lab-controllers.json` remains empty.
