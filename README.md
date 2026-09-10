@@ -45,8 +45,9 @@ See [Architecture](wiki/project/Architecture.md), [Protocol](wiki/project/Protoc
 - A configured answer backend
 - The Ruby `sqlite3` gem for durable inventory tracking
 
-Optional Quick controllers require the companion native Lich support described
-in [controller setup](examples/controllers/README.md). With a valid, explicitly
+Optional Bigshot Quick and EO Hunter controllers require the companion native
+Lich support described in [controller setup](examples/controllers/README.md).
+With a valid, explicitly
 empty controller registry, older Lich builds can still run explicit inventory
 refreshes using initial ownership checks; native per-command guards are used
 whenever available. See [inventory compatibility](wiki/project/Setup-and-Operations.md#install-lich-dependencies).
@@ -145,7 +146,7 @@ Management:
 ;lab stop
 ```
 
-For a retained failed Quick handoff, `;lab recover` lists the exact run ID.
+For a retained failed controlled-outing handoff, `;lab recover` lists the exact run ID.
 After restoring the character, `;lab recover RUN_ID confirm` verifies refuge,
 original equipment and released ownership before acknowledging that one run.
 It sends no game commands and does not turn the failed test into a pass.
@@ -174,6 +175,12 @@ it does not install or enable one. The example is a harmless lifecycle probe,
 not a sandbox or an unattended gameplay test campaign.
 For that pilot, also install `lich/lab-test-runner.lic` as a real file alongside
 the helper and reviewed suite files; suite pinning rejects symlink substitutions.
+
+An optional [EO Hunter trial campaign](examples/controllers/README.md#eo-hunter-trial-campaign)
+can execute a short sequence of private, reviewed combat routines at game speed,
+record structured evidence, and return to a player-selected refuge before the
+agent evaluates results. Installing LAB alone does not enable it; the shipped
+controller registry remains empty.
 
 Questions use a bounded evidence loop, not a list of question keywords. The model
 can answer from the supplied context or request current state, character

@@ -1035,7 +1035,7 @@ class CapabilityRunner:
         action = controller.action(controller.capability_action)
         command, _script_args, normalized = action.build(operation.arguments)
         operation.arguments = normalized
-        refuge = controller.safe_handoff["kind"] == "quick_refuge"
+        refuge = controller.safe_handoff["kind"] in {"quick_refuge", "controller_refuge"}
         quick_launch = controller.script == "bigshot" and (
             bool(controller.control_owner_scripts) or _script_args.casefold().split()[:1] == ["quick"])
         if controller.safe_handoff["kind"] == "quick_area" or (quick_launch and not refuge):
@@ -1158,7 +1158,7 @@ class CapabilityRunner:
         if not operation.capability.startswith("controller."):
             return None
         controller = self._controller_manifest.controller(operation.capability.removeprefix("controller."))
-        return controller if controller.safe_handoff["kind"] == "quick_refuge" else None
+        return controller if controller.safe_handoff["kind"] in {"quick_refuge", "controller_refuge"} else None
 
     @staticmethod
     def _hand_ids(snapshot):
@@ -1234,7 +1234,7 @@ class CapabilityRunner:
         if (evidence.facts["ok"] is not True or runtime["state"] != "completed"
                 or runtime["work_result"].get("state") != "completed"):
             raise _OperationAbort("failed", f"test work failed; safe return verified: {evidence.facts['code']}")
-        return "Quick test completed; return to refuge, original equipment and owner release verified"
+        return "Controlled outing completed; return to refuge, original equipment and owner release verified"
 
     def _complete_test_controller(self, operation, controller, evidence, action_id, before):
         # Retain attributed terminal reports even when assertions, cleanup, or
@@ -1297,7 +1297,7 @@ class CapabilityRunner:
                 raise _OperationAbort(
                     "failed", f"ownership conflict in {lane}: {owner}"
                 )
-        if controller.safe_handoff["kind"] == "quick_refuge":
+        if controller.safe_handoff["kind"] in {"quick_refuge", "controller_refuge"}:
             if snapshot.room_id != controller.safe_room({}):
                 raise _OperationAbort("failed", "refuge test must begin in the registered safe room")
             CapabilityRunner._hand_ids(snapshot)
@@ -1362,7 +1362,7 @@ class CapabilityRunner:
                 "failed",
                 f"controller did not return to safe room {safe_room}",
             )
-        if controller.safe_handoff["kind"] == "quick_refuge":
+        if controller.safe_handoff["kind"] in {"quick_refuge", "controller_refuge"}:
             CapabilityRunner._validate_controller_start(snapshot, controller)
             details = evidence.facts.get("details", {}) if evidence is not None else {}
             runtime = details.get("runtime")
@@ -1804,7 +1804,7 @@ class CapabilityRunner:
                 and operation.capability == f"controller.{controller_match.controller.name}"):
             with self._lock:
                 self._controller_actions.setdefault(operation.operation_id, (str(action["action_id"]), snapshot.generation))
-                if controller_match.controller.safe_handoff["kind"] == "quick_refuge":
+                if controller_match.controller.safe_handoff["kind"] in {"quick_refuge", "controller_refuge"}:
                     self._refuge_pending[operation.character.casefold()] = (
                         operation.operation_id, controller_match.controller, snapshot, str(action["action_id"]))
                 if operation.operation_id in self._interruptions or self._clock() >= operation.deadline:

@@ -367,7 +367,7 @@ class ControllerDefinition:
 
     def safe_room(self, arguments: Mapping[str, object]) -> str | None:
         kind = self.safe_handoff["kind"]
-        if kind in {"room", "quick_refuge"}:
+        if kind in {"room", "quick_refuge", "controller_refuge"}:
             return str(self.safe_handoff["room_id"])
         if kind == "profile_room":
             profile = str(arguments.get("profile", ""))
@@ -493,11 +493,12 @@ def _controller_from_mapping(raw: Any, label: str) -> ControllerDefinition:
         required={"kind"},
     )
     kind = str(safe["kind"])
-    if kind not in {"owners_released", "room", "profile_room", "quick_area", "quick_refuge"}:
+    refuge_kinds = {"quick_refuge", "controller_refuge"}
+    if kind not in {"owners_released", "room", "profile_room", "quick_area", *refuge_kinds}:
         raise ConfigurationError(f"{label}.safe_handoff.kind is unsupported")
-    if "return_seconds" in safe and kind != "quick_refuge":
-        raise ConfigurationError(f"{label}.return_seconds requires quick_refuge")
-    if kind == "quick_refuge":
+    if "return_seconds" in safe and kind not in refuge_kinds:
+        raise ConfigurationError(f"{label}.return_seconds requires a refuge handoff")
+    if kind in refuge_kinds:
         room = safe.get("room_id")
         seconds = safe.get("return_seconds")
         if (set(safe) != {"kind", "room_id", "return_seconds"}
@@ -505,7 +506,7 @@ def _controller_from_mapping(raw: Any, label: str) -> ControllerDefinition:
                 or str(room) == "4" or len(str(room)) > 12
                 or type(seconds) is not int or not 10 <= seconds <= 120
                 or not {"movement", "combat"}.issubset(lanes)):
-            raise ConfigurationError(f"{label}.quick_refuge requires an exact refuge and 10–120 return seconds")
+            raise ConfigurationError(f"{label}.{kind} requires an exact refuge and 10–120 return seconds")
     if kind == "room" and not str(safe.get("room_id", "")).isdigit():
         raise ConfigurationError(f"{label}.safe_handoff.room_id must be numeric")
     if kind == "profile_room":
@@ -560,6 +561,19 @@ def _controller_from_mapping(raw: Any, label: str) -> ControllerDefinition:
                     or any(token.startswith("--") and "{" in token for token in tokens)
                     or "--" in tokens):
                 raise ConfigurationError(f"{label}.{kind} launches require explicit --area profile")
+    if kind == "controller_refuge":
+        launches = [item for item in actions if item.kind == "launch"]
+        if not control_owners or not launches:
+            raise ConfigurationError(f"{label}.controller_refuge requires a native controlled script")
+        for launch in launches:
+            tokens = launch.script_args_template.split()
+            if (not tokens or any(parameter.type == "flag_suffix" for parameter in launch.parameters)
+                    or any(token.startswith("--supervised-") for token in tokens)
+                    or any(token.startswith("--") and "{" in token for token in tokens)
+                    or "--" in tokens):
+                raise ConfigurationError(
+                    f"{label}.controller_refuge launches cannot supply private supervisor flags"
+                )
     if any(item.kind == "signal" for item in actions) and signal_global is None:
         raise ConfigurationError(f"{label}.signal_global is required")
     controller = ControllerDefinition(

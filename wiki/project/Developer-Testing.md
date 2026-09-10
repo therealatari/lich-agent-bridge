@@ -46,6 +46,12 @@ outcomes. Do not add retries that might repeat a non-idempotent game action.
    coordinated deployment and an explicitly authorized acceptance test before
    routine live testing resumes.
 
+For a controlled combat campaign, do all model planning at the refuge. Use a
+native controller to travel, select targets, execute already reviewed routines,
+collect evidence, loot, and return at game speed. Interpret and revise the
+configuration only after verified safe handoff. Do not leave a character in a
+hunting area while waiting for an answer-model round trip.
+
 MCP tools and their exact types are documented in the generated
 [SDK declarations](../../mcp/src/sdk-types.generated.ts). For example, after
 separate authorization and replacing the placeholder with a verified current ID:
@@ -261,10 +267,17 @@ timeout is an explicit error, not permission to enqueue endless retries.
 
 The [exact-operation controller controls](Controller-Controls.md) document
 authenticated HTTP/CLI admission for typed controls of a registered active
-controller. The bridge binds opted-in Quick controllers to the exact native
-child/runtime; public installation alone does not register a capability. The
-[direct trial example](../../examples/controllers/README.md) is opt-in and
-requires separately authorized live verification.
+controller. The bridge binds opted-in native controllers to the exact child and
+runtime; public installation alone does not register a capability. The
+[Bigshot and EO Hunter examples](../../examples/controllers/README.md) are
+opt-in and require separately authorized live verification.
+
+EO Hunter's bounded trial campaign is intended for questions such as “which of
+these three reviewed combat recipes is safest and most resource-efficient for
+this creature?” It executes one recipe per selected creature, measures actions,
+resources, state changes and elapsed time, then performs native cleanup and
+return. It is not an unrestricted command planner, continuous autonomous hunt,
+or proof that a result generalizes beyond the observed setup.
 
 If discovery has no suitable operation, propose the smallest capability needed
 with its admission checks, exact target binding, evidence, restoration, and

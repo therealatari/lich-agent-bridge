@@ -308,7 +308,8 @@ class LabBridgeTest < Minitest::Test
   end
 
   class SyntheticQuickChild
-    attr_accessor :alive, :cleanup_blocked, :quick_combat_runtime, :quick_combat_result
+    attr_accessor :alive, :cleanup_blocked, :quick_combat_runtime, :quick_combat_result,
+                  :controller_runtime, :controller_result
     attr_reader :name, :kills
     def initialize(name)
       @name, @alive, @cleanup_blocked, @kills = name, true, false, []
@@ -489,7 +490,7 @@ class LabBridgeTest < Minitest::Test
     fixture[:authority] = { action[:action_id] => action.merge(status: 'dispatched', stop_requested: false, return_requested: false) }
     replace.call(Script, :running) { child.alive ? [child] : [] }
     replace.call(Script, :running?) { |name| fixture[:started] && child.alive && child.name == name }
-    replace.call(LichAgentBridge, :supervised_quick_supported?) { |_name| true }
+    replace.call(LichAgentBridge, :supervised_controller_supported?) { |_name| true }
     replace.call(LichAgentBridge, :launch_controller) do |controller, action, arguments|
       fixture[:ordinary_launches] << [controller.name, action.name, arguments]
       false
@@ -1095,7 +1096,7 @@ class LabBridgeTest < Minitest::Test
 
   def test_controlled_launch_refuses_unsupported_historical_script_before_spawning
     with_controlled_quick do |fixture|
-      LichAgentBridge.define_singleton_method(:supervised_quick_supported?) { |_| false }
+      LichAgentBridge.define_singleton_method(:supervised_controller_supported?) { |_| false }
       LichAgentBridge.execute_action(fixture[:action])
       assert_empty fixture[:starts]
       assert_equal 'failed', fixture[:results].last.last[:outcome]
@@ -1116,6 +1117,8 @@ class LabBridgeTest < Minitest::Test
       refute LichAgentBridge.supervised_quick_supported?('bigshot')
       File.write(path, "    SUPERVISED_START_PROTOCOL = 1\r\n    REFUGE_START_PROTOCOL = 1\r\nraise 'never evaluate preflight source'\n")
       assert LichAgentBridge.supervised_quick_supported?('bigshot')
+      File.write(path, "    SUPERVISED_CONTROLLER_PROTOCOL = 1\r\n    REFUGE_START_PROTOCOL = 1\r\nraise 'never evaluate preflight source'\n")
+      assert LichAgentBridge.supervised_controller_supported?('eohunter')
     end
   ensure
     $script_dir = previous_root
@@ -1124,6 +1127,19 @@ class LabBridgeTest < Minitest::Test
     elsif Script.respond_to?(:__find_script_file, true)
       Script.singleton_class.remove_method(:__find_script_file)
     end
+  end
+
+  def test_generic_controller_publications_take_precedence_over_quick_compatibility
+    child = SyntheticQuickChild.new('eohunter')
+    generic_runtime = Object.new
+    generic_result = { state: :completed }.freeze
+    child.controller_runtime = generic_runtime
+    child.controller_result = generic_result
+    child.quick_combat_runtime = Object.new
+    child.quick_combat_result = { state: :stopped }.freeze
+
+    assert_same generic_runtime, LichAgentBridge.controlled_runtime(child)
+    assert_same generic_result, LichAgentBridge.controlled_terminal_status(child)
   end
 
   def test_controlled_launch_stops_a_runtime_that_refuses_deadline_coordination

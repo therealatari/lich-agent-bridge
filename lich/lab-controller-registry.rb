@@ -284,6 +284,19 @@ module LabControllerRegistry
           end
         end
       end
+      if @safe_handoff['kind'] == 'controller_refuge'
+        launches = @actions.select { |item| item.kind == 'launch' }
+        unless !@control_owner_scripts.empty? && !launches.empty? && (%w[movement combat] - @lanes).empty?
+          raise ManifestError, "#{context}.controller_refuge requires a native controlled script and movement/combat lanes"
+        end
+        launches.each do |launch|
+          tokens = launch.script_args_template.split
+          unless !tokens.empty? && launch.parameters.none? { |parameter| parameter.type == 'flag_suffix' } &&
+              tokens.none? { |token| token.start_with?('--supervised-') || (token.start_with?('--') && token.include?('{')) } && !tokens.include?('--')
+            raise ManifestError, "#{context}.controller_refuge launches cannot supply private supervisor flags"
+          end
+        end
+      end
       raise ManifestError, "#{context}.signal_global is required by signal action" if @actions.any? { |item| item.kind == 'signal' } && !@signal_global
       if raw.key?('test_suite')
         begin
@@ -421,7 +434,7 @@ module LabControllerRegistry
       end
 
       def validate_safe_handoff(raw, context)
-        if raw.is_a?(Hash) && raw['kind'] == 'quick_refuge'
+        if raw.is_a?(Hash) && %w[quick_refuge controller_refuge].include?(raw['kind'])
           strict_keys(raw, %w[kind room_id return_seconds], %w[kind room_id return_seconds], context)
           room = raw['room_id']
           unless (room.is_a?(Integer) || room.is_a?(String)) && room.to_s.match?(/\A[0-9]+\z/) && room.to_i.positive? && room.to_i != 4

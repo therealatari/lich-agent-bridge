@@ -69,6 +69,25 @@ class RefugeOutingTests(unittest.TestCase):
         self.assertEqual(result.alerts, [])
         self.assertFalse(self.runner._refuge_pending)
 
+    def test_generic_controller_refuge_uses_the_same_verified_handoff(self):
+        raw = refuge_manifest_raw()
+        raw["controllers"][0]["safe_handoff"]["kind"] = "controller_refuge"
+        manifest = load_manifest(raw)
+        broker = ActionBroker(policy=CommandPolicy(manifest), clock=self.clock)
+        broker.admit_generation("Testmage", "generation-1")
+        broker.control(ActionControl(character="Testmage", enabled=True))
+        driver = BrokerDriver(broker, self.state)
+        runner = CapabilityRunner(actions=broker, state=self.state, evidence=self.evidence,
+                                  controller_manifest=manifest, clock=self.clock,
+                                  sleeper=self.clock.sleep, step_hook=driver, history_limit=1)
+
+        result = runner.perform("Testmage", "controller.quick",
+                                expected_generation="generation-1", timeout_seconds=90)
+
+        self.assertEqual(result.status, "succeeded", result.explanation)
+        self.assertIn("Controlled outing completed", result.explanation)
+        self.assertFalse(runner._refuge_pending)
+
     def test_hub_forwards_explicit_outing_budget_for_sync_and_async_calls(self):
         hub = SessionHub(world_state=Mock(), actions=self.broker, inventory=Mock(), knowledge=Mock(), capabilities=self.runner)
         payload = {"character": "Testmage", "capability": "controller.quick",
